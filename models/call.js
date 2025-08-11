@@ -30,6 +30,16 @@ const Call = sequelize.define('Call', {
     defaultValue: false,
     field: 'pressed_one'
   },
+  pressedDigit: {
+    type: DataTypes.STRING(1),
+    allowNull: true,
+    field: 'pressed_digit'
+  },
+  campaignId: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+    field: 'campaign_id'
+  },
   callStarted: {
     type: DataTypes.DATE,
     allowNull: true,
@@ -39,6 +49,11 @@ const Call = sequelize.define('Call', {
     type: DataTypes.DATE,
     allowNull: true,
     field: 'call_ended'
+  },
+  callStatus: {
+    type: DataTypes.ENUM('pending', 'calling', 'success', 'failed'),
+    defaultValue: 'pending',
+    field: 'call_status'
   },
   createdAt: {
     type: DataTypes.DATE,

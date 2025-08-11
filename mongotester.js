@@ -84,5 +84,5 @@ async function truncateCollectionDirect() {
 }
 
 // Run the function
-//showCollections();
-truncateCollectionDirect();
+showCollections();
+//truncateCollectionDirect();

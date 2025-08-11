@@ -1,7 +1,7 @@
 module.exports = {
   mongodb_uri: "mongodb+srv://topcadefx:0TdElmVAYYo3mHN6@cluster0.us9wzbh.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0",
-  telegram_bot_token: "8187617880:AAFu-8KVH2TQnMwhn4c2PoZ0zDX3yehIhMI",
-  creator_telegram_id: "7008195080",
+  telegram_bot_token: "8480265093:AAE6EBVZXGZWF62rV3PeFzHXKuHOfC__pII",
+  creator_telegram_id: "8050705931",
   concurrent_calls: 30,
   agents: ["coinbase", "google"],
   asterisk: {

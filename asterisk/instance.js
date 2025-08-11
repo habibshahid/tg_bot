@@ -1,11 +1,13 @@
 const AMI = require("asterisk-manager");
 const config = require("../config");
+const Campaign = require("../models/campaign");
 const {
   add_entry_to_database,
   call_started,
   call_ended,
   pop_unprocessed_line,
 } = require("../utils/entries");
+const { get_settings } = require("../utils/settings");
 const pressedNumbers = new Set();
 
 const ami = new AMI(
@@ -25,41 +27,59 @@ ami.on("error", (err) => {
   console.error("AMI Connection Error:", err);
 });
 
-ami.on("managerevent", (data) => {
-  if (data?.event == "DTMFEnd" && data?.digit == "1") {
-	if (!pressedNumbers.has(data?.exten)) {
-      console.log(`+${data?.exten} has pressed 1`);
+ami.on("clear_pressed_numbers", () => {
+  pressedNumbers.clear();
+  console.log("Cleared pressed numbers set for new campaign");
+});
+
+ami.on("managerevent", async (data) => {
+  const settings = get_settings();
+  const dtmfDigit = settings.dtmf_digit || '1';
+  
+  if (data?.event == "DTMFEnd" && data?.digit == dtmfDigit) {
+    if (!pressedNumbers.has(data?.exten)) {
+      console.log(`+${data?.exten} has pressed ${dtmfDigit}`);
 
       pressedNumbers.add(data?.exten);
       add_entry_to_database(data?.exten);
+      
+      // Update DTMF responses counter
+      if (settings.campaign_id) {
+        Campaign.increment('dtmfResponses', { where: { id: settings.campaign_id } });
+      }
     } else {
-      console.log(`+${data?.exten} has already pressed 1, ignoring duplicate`);
+      console.log(`+${data?.exten} has already pressed ${dtmfDigit}, ignoring duplicate`);
     }
   }
   
   if(data?.event === 'OriginateResponse'){
-	  if(data.response == 'Success'){
-	    const phoneNumner = data.exten == '' ? data.calleridnum : data.exten;
-	    console.log(`Call answered on channel: ${data?.channel} ${phoneNumner}`);
-	    call_started(phoneNumner);
-	  }
-	  else{
-		console.log(
-		  `Call to ${data?.exten} with +${data?.calleridnum} has ended with failed with reason ${data?.reason}`
-		);
-		require("./call")(pop_unprocessed_line());
-	  }
+    if(data.response == 'Success'){
+      const phoneNumber = data.exten == '' ? data.calleridnum : data.exten;
+      console.log(`Call answered on channel: ${data?.channel} ${phoneNumber}`);
+      call_started(phoneNumber);
+      
+      // Update successful calls counter
+      if (settings.campaign_id) {
+        Campaign.increment('successfulCalls', { where: { id: settings.campaign_id } });
+      }
+    }
+    else{
+      console.log(
+        `Call to ${data?.exten} with +${data?.calleridnum} has ended with failed with reason ${data?.reason}`
+      );
+      
+      // Update failed calls counter
+      if (settings.campaign_id) {
+        Campaign.increment('failedCalls', { where: { id: settings.campaign_id } });
+      }
+      
+      require("./call")(pop_unprocessed_line());
+    }
   }
-  
-  /*if (data?.event == "Newstate" && data?.channelstatedesc == "Up") {
-    console.log(data)
-	const phoneNumner = data.exten == '' ? data.calleridnum : data.exten;
-	console.log(`Call answered on channel: ${data?.channel} ${phoneNumner}`);
-	call_started(phoneNumner);
-  }*/
 
   if (data?.event === "Hangup") {
-	call_ended(data?.exten);
+	  console.log(data)
+    call_ended(data?.exten);
     console.log(
       `Call to ${data?.exten} from +${data?.calleridnum} has ended with reason ${data["cause-txt"]}`
     );

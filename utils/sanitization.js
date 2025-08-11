@@ -3,7 +3,7 @@
 exports.sanitize_phoneNumber = (phoneNumber) => {
   if (typeof phoneNumber !== "string") return "";
 
-  // Remove all non-numeric characters (including parentheses, spaces, hyphens, etc.)
+  /*// Remove all non-numeric characters (including parentheses, spaces, hyphens, etc.)
   let cleaned = phoneNumber.trim().replace(/\D/g, "");
 
   // Check if the number starts with a '+' and remove it
@@ -16,10 +16,17 @@ exports.sanitize_phoneNumber = (phoneNumber) => {
     cleaned = "1" + cleaned;
   }
 
+  if (cleaned.length === 12 && cleaned.startsWith("9")) {
+    cleaned = cleaned;
+  }
+  
   // If it's an 11-digit number and starts with '1', it's valid
   if (cleaned.length !== 11 || !cleaned.startsWith("1")) {
-    return ""; // Invalid number
+	if (cleaned.length !== 12 || !cleaned.startsWith("9")) {
+      return ""; // Invalid number
+	}
   }
-
-  return cleaned;
+   
+  return cleaned;*/
+  return phoneNumber;
 };

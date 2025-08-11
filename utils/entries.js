@@ -12,31 +12,38 @@ const get_entry_by_number = (phoneNumber) => {
 exports.add_entry_to_database = async (phoneNumber) => {
   const entry = get_entry_by_number(phoneNumber);
   const settings = get_settings();
+  const dtmfDigit = settings.dtmf_digit || '1';
 
   const existingCall = await Call.findOne({
+	  where: {
     phoneNumber: `+${phoneNumber}`,
+    campaignId: settings.campaign_id
+	  }
   });
 
   if (existingCall) {
-    console.log(`Call entry for +${entry.phoneNumber} already exists.`);
-    //return;
+    // Update the existing call with DTMF response
+    await existingCall.update({
+      pressedOne: true,
+      pressedDigit: dtmfDigit
+    });
+    console.log(`Updated call entry for +${phoneNumber} - pressed ${dtmfDigit}`);
+  } else {
+    // Create new call entry (shouldn't happen in normal flow)
+    const newCall = await Call.create({
+      phoneNumber: `+${phoneNumber}`,
+      rawLine: entry?.rawLine || '',
+      pressedOne: true,
+      pressedDigit: dtmfDigit,
+      campaignId: settings.campaign_id,
+      callStatus: 'success'
+    });
   }
-
-  if (!entry?.phoneNumber) {
-    console.log("Failed to add entry: ", entry);
-  }
-
-  const newCall = new Call({
-    phoneNumber: `+${entry?.phoneNumber}` || "",
-    rawLine: entry.rawLine,
-  });
-
-  await newCall.save();
 
   const bot = get_bot();
   bot.sendMessage(
     settings.notifications_chat_id,
-    `✅ ${entry.phoneNumber} pressed 1. Do /line to retrieve their info.`,
+    `✅ ${phoneNumber} pressed ${dtmfDigit}. Do /line to retrieve their info.`,
     { parse_mode: "HTML" }
   );
 };
@@ -45,17 +52,37 @@ exports.call_started = async (phoneNumber) => {
   const entry = get_entry_by_number(phoneNumber);
   const settings = get_settings();
   
-  const newCall = new Call({
-    phoneNumber: `+${entry?.phoneNumber}` || phoneNumber,
-    rawLine: entry?.rawLine,
+  // Check if call already exists for this campaign
+  let call = await Call.findOne({
+	  where:{
+    phoneNumber: `+${phoneNumber}`,
+    campaignId: settings.campaign_id
+	  }
   });
-
-  await newCall.save();
+  
+  if (call) {
+    // Update existing call
+    await call.update({
+      callStarted: new Date(),
+      callStatus: 'calling',
+      used: true
+    });
+  } else {
+    // Create new call
+    call = await Call.create({
+      phoneNumber: `+${phoneNumber}`,
+      rawLine: entry?.rawLine || '',
+      campaignId: settings.campaign_id,
+      callStarted: new Date(),
+      callStatus: 'calling',
+      used: true
+    });
+  }
 
   const bot = get_bot();
   bot.sendMessage(
     settings.notifications_chat_id,
-    `✅ ${phoneNumber} Call Started. Do /line to retrieve their info.`,
+    `📞 Call Started: ${phoneNumber}`,
     { parse_mode: "HTML" }
   );
 };
@@ -65,13 +92,23 @@ exports.call_ended = async (phoneNumber) => {
   const settings = get_settings();
 
   const existingCall = await Call.findOne({
+	  where:{
     phoneNumber: `+${phoneNumber}`,
+    campaignId: settings.campaign_id
+	  }
   });
+
+  if (existingCall) {
+    await existingCall.update({
+      callEnded: new Date(),
+      callStatus: existingCall.pressedOne ? 'success' : 'failed'
+    });
+  }
 
   const bot = get_bot();
   bot.sendMessage(
     settings.notifications_chat_id,
-    `✅ ${entry.phoneNumber} Call Ended. Do /line to retrieve their info.`,
+    `📴 Call Ended: ${phoneNumber}`,
     { parse_mode: "HTML" }
   );
 };

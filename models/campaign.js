@@ -51,6 +51,36 @@ const Campaign = sequelize.define('Campaign', {
     allowNull: true,
     field: 'ivr_outro_file'
   },
+  dtmfDigit: {
+    type: DataTypes.STRING(1),
+    defaultValue: '1',
+    field: 'dtmf_digit'
+  },
+  totalCalls: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    field: 'total_calls'
+  },
+  successfulCalls: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    field: 'successful_calls'
+  },
+  failedCalls: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    field: 'failed_calls'
+  },
+  dtmfResponses: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    field: 'dtmf_responses'
+  },
+  callCounter: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    field: 'call_counter'
+  },
   isActive: {
     type: DataTypes.BOOLEAN,
     defaultValue: true,
