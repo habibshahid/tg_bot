@@ -26,8 +26,8 @@ ami.on("error", (err) => {
 });
 
 ami.on("managerevent", (data) => {
-  if (data?.event == "DTMFBegin" && data?.digit == "1") {
-    if (!pressedNumbers.has(data?.exten)) {
+  if (data?.event == "DTMFEnd" && data?.digit == "1") {
+	if (!pressedNumbers.has(data?.exten)) {
       console.log(`+${data?.exten} has pressed 1`);
 
       pressedNumbers.add(data?.exten);
@@ -36,17 +36,32 @@ ami.on("managerevent", (data) => {
       console.log(`+${data?.exten} has already pressed 1, ignoring duplicate`);
     }
   }
-
-  if (data?.event == "Newstate" && data?.channelstatedesc == "Up") {
+  
+  if(data?.event === 'OriginateResponse'){
+	  if(data.response == 'Success'){
+	    const phoneNumner = data.exten == '' ? data.calleridnum : data.exten;
+	    console.log(`Call answered on channel: ${data?.channel} ${phoneNumner}`);
+	    call_started(phoneNumner);
+	  }
+	  else{
+		console.log(
+		  `Call to ${data?.exten} with +${data?.calleridnum} has ended with failed with reason ${data?.reason}`
+		);
+		require("./call")(pop_unprocessed_line());
+	  }
+  }
+  
+  /*if (data?.event == "Newstate" && data?.channelstatedesc == "Up") {
+    console.log(data)
 	const phoneNumner = data.exten == '' ? data.calleridnum : data.exten;
 	console.log(`Call answered on channel: ${data?.channel} ${phoneNumner}`);
 	call_started(phoneNumner);
-  }
+  }*/
 
   if (data?.event === "Hangup") {
 	call_ended(data?.exten);
     console.log(
-      `Call with +${data?.calleridnum} has ended with reason ${data["cause-txt"]}`
+      `Call to ${data?.exten} from +${data?.calleridnum} has ended with reason ${data["cause-txt"]}`
     );
     require("./call")(pop_unprocessed_line());
   }

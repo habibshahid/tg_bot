@@ -1,5 +1,7 @@
 const config = require("../config");
 const Call = require("../models/call");
+const Campaign = require("../models/campaign");
+const SipPeer = require("../models/sippeer");
 const axios = require("axios");
 const Allowed = require("../models/allowed");
 const { get_settings, set_settings } = require("../utils/settings");
@@ -10,39 +12,177 @@ const {
   pop_unprocessed_line,
 } = require("../utils/entries");
 const { start_bot_instance } = require("./botInstance");
+const fs = require("fs");
+const path = require("path");
+const { Op } = require("sequelize");
+
+const { exec } = require('child_process');
+const util = require('util');
+const execPromise = util.promisify(exec);
+
+
+// State management for user interactions
+const userStates = {};
+
+function logUserState(userId, action, state) {
+  console.log(`[UserState] User: ${userId}, Action: ${action}, State:`, state);
+  console.log('[UserStates] All states:', Object.keys(userStates));
+}
+
+function sanitizeFilename(filename) {
+  // Remove extension first
+  const nameWithoutExt = filename.replace(/\.[^/.]+$/, "");
+  // Replace spaces and special characters with underscore
+  const sanitized = nameWithoutExt.replace(/[^a-zA-Z0-9]/g, '_');
+  // Remove multiple underscores
+  return sanitized.replace(/_+/g, '_').toLowerCase();
+}
+
+async function convertAudioFile(inputPath, outputPath) {
+  try {
+    // Using sox for conversion (install with: apt-get install sox libsox-fmt-all)
+    const command = `sox "${inputPath}" -r 8000 -c 1 -b 16 "${outputPath}" norm -3`;
+    
+    await execPromise(command);
+    console.log(`Audio converted successfully: ${outputPath}`);
+    return true;
+  } catch (error) {
+    console.error(`Audio conversion failed: ${error.message}`);
+    // Fallback to ffmpeg if sox fails
+    try {
+      const ffmpegCommand = `ffmpeg -i "${inputPath}" -acodec pcm_s16le -ar 8000 -ac 1 -f wav "${outputPath}" -y`;
+      await execPromise(ffmpegCommand);
+      console.log(`Audio converted with ffmpeg: ${outputPath}`);
+      return true;
+    } catch (ffmpegError) {
+      console.error(`FFmpeg conversion also failed: ${ffmpegError.message}`);
+      throw new Error('Audio conversion failed. Please ensure sox or ffmpeg is installed.');
+    }
+  }
+}
+
+// Get or create campaign for this bot
+async function getOrCreateCampaign() {
+  const botToken = config.telegram_bot_token;
+  
+  let campaign = await Campaign.findOne({
+    where: { botToken },
+    include: [{
+      model: SipPeer,
+      as: 'sipTrunk'
+    }]
+  });
+
+  if (!campaign) {
+    // Create default campaign
+    campaign = await Campaign.create({
+      botToken,
+      campaignName: 'Default Campaign',
+      concurrentCalls: config.concurrent_calls || 30,
+      isActive: true
+    });
+  }
+
+  return campaign;
+}
+
+// Validate caller ID format
+function validateCallerId(callerId) {
+  // Remove all non-numeric characters for validation
+  const cleaned = callerId.replace(/\D/g, '');
+  
+  // Check if it's a valid US number (10 or 11 digits)
+  if (cleaned.length === 10 || (cleaned.length === 11 && cleaned.startsWith('1'))) {
+    return { valid: true, formatted: cleaned };
+  }
+  
+  // Check if it's an international number (minimum 7 digits)
+  if (cleaned.length >= 7 && cleaned.length <= 15) {
+    return { valid: true, formatted: cleaned };
+  }
+  
+  return { valid: false, message: "Invalid caller ID format. Please use a valid phone number." };
+}
 
 // Helper function to read and parse the file buffer uploaded by the user
 function parseFileData(fileBuffer) {
-  const phoneRegex = /(?:\+?1\s?)?(?:\(?\d{3}\)?[\s.-]?)?\d{3}[\s.-]?\d{4}/;
+  // Combined regex for US and Pakistan phone numbers
+  const phoneRegexPatterns = [
+    // Pakistan formats
+    /(?:\+?92|0092|0)?[\s.-]?(?:3\d{2}|2\d|4\d|5\d|6\d|7\d|8\d|9\d)[\s.-]?\d{3}[\s.-]?\d{4}/,
+    // US formats
+    /(?:\+?1\s?)?(?:\(?\d{3}\)?[\s.-]?)?\d{3}[\s.-]?\d{4}/
+  ];
 
   return fileBuffer
     .toString("utf-8")
     .split("\n")
     .map((line) => {
-      const phoneNumberMatch = line.match(phoneRegex);
-      const phoneNumber = phoneNumberMatch
-        ? phoneNumberMatch[0].replace(/\D/g, "")
-        : null;
-
-      return phoneNumber ? { phoneNumber, rawLine: line.trim() } : null;
+      console.log('Processing line:', line);
+      
+      /*let phoneNumber = null;
+      let matchedNumber = null;
+      
+      // Try each regex pattern
+      for (const regex of phoneRegexPatterns) {
+        const match = line.match(regex);
+        if (match) {
+          matchedNumber = match[0];
+          break;
+        }
+      }
+      
+      if (matchedNumber) {
+        // Clean the number - remove all non-digits
+        phoneNumber = matchedNumber.replace(/\D/g, "");
+        
+        // Normalize Pakistan numbers
+        if (phoneNumber.startsWith('0092')) {
+          // Convert 0092 to 92
+          phoneNumber = phoneNumber.substring(2);
+        } else if (phoneNumber.length === 10 && phoneNumber.startsWith('3')) {
+          // Pakistan mobile without 0 prefix - add country code
+          phoneNumber = '92' + phoneNumber;
+        } else if (phoneNumber.length === 11 && phoneNumber.startsWith('03')) {
+          // Pakistan mobile with 0 prefix - replace 0 with 92
+          phoneNumber = '92' + phoneNumber.substring(1);
+        } else if (phoneNumber.length === 10 && phoneNumber.startsWith('2')) {
+          // Possible Pakistan landline without area code 0
+          phoneNumber = '92' + phoneNumber;
+        } else if (phoneNumber.length === 11 && phoneNumber.startsWith('0') && !phoneNumber.startsWith('03')) {
+          // Pakistan landline with 0 prefix
+          phoneNumber = '92' + phoneNumber.substring(1);
+        }
+        
+        console.log('Extracted number:', matchedNumber, '→ Normalized:', phoneNumber);
+      }
+      
+      return phoneNumber ? { phoneNumber, rawLine: line.trim() } : null;*/
+	  return { phoneNumber: line, rawLine: line.trim() };
     })
     .filter(Boolean);
 }
 
+
 // Function to filter out already processed phone numbers
 async function filterProcessedNumbers(data) {
-  const processedNumbers = await Call.find().select("phoneNumber");
+  const processedNumbers = await Call.findAll({
+    attributes: ['phoneNumber']
+  });
+  
   const usedNumbers = new Set(
     processedNumbers.map((record) => record.phoneNumber)
   );
+  
   return data.filter((entry) => {
     const sanitizedEntry = sanitize_phoneNumber(entry.phoneNumber);
     return !usedNumbers.has(`+${sanitizedEntry}`);
   });
 }
 
-async function startCallingProcess(data) {
-  const concurrentCalls = config.concurrent_calls;
+// Start calling process
+async function startCallingProcess(data, campaign) {
+  const concurrentCalls = campaign.concurrentCalls;
 
   await waitForConnection();
 
@@ -52,300 +192,826 @@ async function startCallingProcess(data) {
 
   for (let i = 0; i < concurrentCalls; i++) {
     const line = pop_unprocessed_line();
-
     callPromises.push(require("../asterisk/call")(line));
   }
 
   await Promise.all(callPromises);
-
   return;
 }
 
-// Initialize Telegram Bot
+// Get call statistics
+async function getCallStats() {
+  const totalCalls = await Call.count();
+  const completedCalls = await Call.count({ where: { used: true } });
+  const pendingCalls = await Call.count({ where: { used: false } });
+  const pressedOne = await Call.count({ where: { pressedOne: true } });
+  
+  return {
+    total: totalCalls,
+    completed: completedCalls,
+    pending: pendingCalls,
+    pressed_one: pressedOne,
+    success_rate: totalCalls > 0 ? ((pressedOne / totalCalls) * 100).toFixed(2) : 0
+  };
+}
+
+// Get SIP trunks from database
+async function getSipTrunks() {
+  return await SipPeer.findAll({
+    where: { 
+      category: 'trunk',
+      status: 1
+    },
+    order: [['id', 'ASC']]
+  });
+}
+
+// Validate SIP trunk
+async function validateSipTrunk(trunkId) {
+  const trunk = await SipPeer.findByPk(trunkId);
+  
+  if (!trunk) {
+    return { valid: false, message: "SIP trunk not found" };
+  }
+  
+  if (!trunk.status) {
+    return { valid: false, message: "SIP trunk is inactive" };
+  }
+  
+  if (trunk.category !== 'trunk') {
+    return { valid: false, message: "Selected SIP peer is not a trunk" };
+  }
+  
+  return { valid: true, trunk: trunk };
+}
+
 // Initialize Telegram Bot
 const initializeBot = () => {
   const bot = start_bot_instance();
   const adminId = config.creator_telegram_id;
 
+  // Main menu - Updated with Caller ID option
+  const mainMenu = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🚀 Start Campaign", callback_data: "start_campaign" },
+          { text: "📊 Check Call Status", callback_data: "call_status" }
+        ],
+        [
+          { text: "🆔 Get Your ID", callback_data: "get_id" },
+          { text: "📁 Upload Leads (TXT)", callback_data: "upload_leads" }
+        ],
+        [
+          { text: "⚙️ Set Concurrent Calls", callback_data: "set_concurrent" },
+          { text: "📞 Set Caller ID", callback_data: "set_caller_id" }
+        ],
+        [
+          { text: "🌐 Set SIP Trunk", callback_data: "set_sip" },
+          { text: "📢 Set Notifications", callback_data: "set_notifications" }
+        ],
+        [
+          { text: "🎵 Upload IVR", callback_data: "upload_ivr" },
+          { text: "👤 Permit User", callback_data: "permit_user" }
+        ],
+        [
+          { text: "📈 Campaign Stats", callback_data: "campaign_stats" }
+        ]
+      ]
+    }
+  };
+
+  // Start command - show main menu
   bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
-    bot.sendMessage(chatId, "Welcome! Use the options below:", {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "📞 Start Calling", callback_data: "call" },
-            { text: "📊 Check Remaining Lines", callback_data: "count" },
-          ],
-          [
-            { text: "🆔 Get Your ID", callback_data: "id" },
-            { text: "✅ Permit User", callback_data: "permit" },
-          ],
-          [
-            { text: "🚫 Unpermit User", callback_data: "unpermit" },
-            { text: "📞 Claim a Line", callback_data: "line" },
-          ],
-          [
-            {
-              text: "📍 Set Notifications Channel",
-              callback_data: "set_notifications",
-            },
-            {
-              text: "📃 Set P1 Script",
-              callback_data: "set_agent",
-            },
-          ],
-        ],
-      },
-    });
-  });
-
-  bot.onText(/\/permit (\d+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const userId = match[1];
-    if (msg.from.id != adminId)
-      return bot.sendMessage(
-        chatId,
-        "❌ You are not authorized to use this command."
-      );
-
-    try {
-      const existingUser = await Allowed.findOne({ telegram_id: userId });
-      if (existingUser)
-        return bot.sendMessage(chatId, `⚠️ This user is already permitted.`);
-      await new Allowed({ telegram_id: userId }).save();
-      bot.sendMessage(
-        chatId,
-        `✅ User with ID <code>${userId}</code> has been permitted.`,
-        { parse_mode: "HTML" }
-      );
-    } catch (error) {
-      bot.sendMessage(
-        chatId,
-        `❌ Failed to permit user with ID <code>${userId}</code>. Error: ${error.message}`,
-        { parse_mode: "HTML" }
-      );
-    }
-  });
-
-  bot.onText(/\/unpermit (\d+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const userId = match[1];
-    if (msg.from.id !== adminId)
-      return bot.sendMessage(
-        chatId,
-        "❌ You are not authorized to use this command."
-      );
-
-    try {
-      const user = await Allowed.findOneAndDelete({ telegram_id: userId });
-      if (!user)
-        return bot.sendMessage(chatId, `⚠️ This user is not permitted.`);
-      bot.sendMessage(
-        chatId,
-        `✅ User with ID <code>${userId}</code> has been unpermitted.`,
-        { parse_mode: "HTML" }
-      );
-    } catch (error) {
-      bot.sendMessage(
-        chatId,
-        `❌ Failed to unpermit user with ID <code>${userId}</code>. Error: ${error.message}`,
-        { parse_mode: "HTML" }
-      );
-    }
-  });
-
-  bot.onText(/\/count/, async (msg) => {
-    const chatId = msg.chat.id;
-    const linesAmount = await Call.countDocuments({ used: false });
-
-    return bot.sendMessage(
-      chatId,
-      `📊 <b>There are currently <u>${linesAmount}</u> lines left!</b>\n\n👤 <b>User:</b> <a href="tg://user?id=${msg.from.id}">@${msg.from.username}</a>`,
-      { parse_mode: "HTML" }
-    );
-  });
-
-  bot.onText(/\/line/, async (msg) => {
-    const chatId = msg.chat.id;
-    const isAllowed = await Allowed.findOne({ telegram_id: msg.from.id });
-    const callsLeft = await Call.countDocuments({ used: false });
-
-    if (!isAllowed) {
-      return bot.sendMessage(
-        chatId,
-        `🚫 You are not permitted to use this command!`,
-        { parse_mode: "HTML" }
-      );
-    }
-
-    if (callsLeft === 0) {
-      return bot.sendMessage(chatId, `❌ No lines left!`, {
-        parse_mode: "HTML",
-      });
-    }
-
-    const callData = await Call.findOneAndUpdate(
-      { used: false },
-      { used: true },
-      { new: true }
-    );
-
     bot.sendMessage(
-      chatId,
-      `✅ You have successfully claimed a line! \n\n` +
-        `📞 *Phone Number*: \`${callData.phoneNumber}\`\n` +
-        `🔲 *Raw Line*: \`${callData.rawLine}\``,
-      {
-        parse_mode: "Markdown",
+      chatId, 
+      "🤖 *Welcome to Call Campaign Bot!*\n\nSelect an option from the menu below:",
+      { 
+        ...mainMenu,
+        parse_mode: "Markdown"
       }
     );
   });
 
-  bot.onText(/\/call/, (msg) => {
-    const chatId = msg.chat.id;
-    bot.sendMessage(chatId, "📤 Reply with the file that contains your lines", {
-      parse_mode: "HTML",
-    });
-  });
-
-  bot.on("document", async (msg) => {
-    const chatId = msg.chat.id;
-    const fileId = msg.document.file_id;
-    const settings = get_settings();
-
-    if (!settings?.notifications_chat_id) {
-      set_settings({ notifications_chat_id: chatId, agent: config.agents[0] });
-    }
-
-    try {
-      const file = await bot.getFile(fileId);
-      const filePath = `https://api.telegram.org/file/bot${config.telegram_bot_token}/${file.file_path}`;
-      const fileBuffer = (
-        await axios.get(filePath, { responseType: "arraybuffer" })
-      ).data;
-      const data = parseFileData(fileBuffer);
-
-      if (data.length === 0) {
-        return bot.sendMessage(chatId, "No valid data found in the file.");
-      }
-
-      const unprocessedData = await filterProcessedNumbers(data);
-
-      if (unprocessedData.length === 0) {
-        return bot.sendMessage(
-          chatId,
-          "⚠️ All numbers have already been processed."
-        );
-      }
-
-      bot.sendMessage(
-        chatId,
-        `📊 Calling ${unprocessedData.length} phone numbers... Please wait.`
-      );
-
-      startCallingProcess(unprocessedData, chatId);
-    } catch (error) {
-      console.error(error);
-      bot.sendMessage(
-        chatId,
-        `❌ Failed to process the file: ${error.message}`
-      );
-    }
-  });
-
-  // Respond to agent selection
-  config.agents.forEach((agent) => {
-    bot.on("callback_query", (callbackQuery) => {
-      const chatId = callbackQuery.message.chat.id;
-      const callbackData = callbackQuery.data;
-
-      if (callbackData === `set_agent_${agent}`) {
-        set_settings({ agent });
-        bot.sendMessage(
-          chatId,
-          `✅ Successfully changed the script to <b>${
-            agent.charAt(0).toUpperCase() + agent.slice(1)
-          }</b>`,
-          { parse_mode: "HTML" }
-        );
-      }
-    });
-  });
-
+  // Handle callback queries
   bot.on("callback_query", async (query) => {
     const chatId = query.message.chat.id;
+    const userId = query.from.id;
     const callbackData = query.data;
 
+    // Answer callback to remove loading state
+    bot.answerCallbackQuery(query.id);
+
     switch (callbackData) {
-      case "call":
+      case "start_campaign":
+        // Check for campaign in database
+        const campaign = await getOrCreateCampaign();
+        
+        // Validate all required fields
+        const missingFields = [];
+        if (!campaign.sipTrunkId) missingFields.push("SIP Trunk");
+        if (!campaign.callerId) missingFields.push("Caller ID");
+        
+        if (missingFields.length > 0) {
+          bot.sendMessage(
+            chatId, 
+            `⚠️ *Cannot Start Campaign*\n\nThe following required fields are not configured:\n${missingFields.map(f => `• ${f}`).join('\n')}\n\nPlease configure all required fields before starting the campaign.`,
+            { parse_mode: "Markdown", ...mainMenu }
+          );
+          return;
+        }
+
+        // Validate the SIP trunk
+        const trunkValidation = await validateSipTrunk(campaign.sipTrunkId);
+        if (!trunkValidation.valid) {
+          bot.sendMessage(
+            chatId,
+            `⚠️ SIP Trunk Error: ${trunkValidation.message}\n\nPlease reconfigure your SIP trunk.`,
+            { parse_mode: "Markdown" }
+          );
+          return;
+        }
+
         bot.sendMessage(
           chatId,
-          "📤 Reply with the file that contains your lines",
-          { parse_mode: "HTML" }
+          `📤 *Start Campaign*\n\n` +
+          `Campaign: ${campaign.campaignName}\n` +
+          `SIP Trunk: ${trunkValidation.trunk.name}\n` +
+          `Caller ID: ${campaign.callerId}\n` +
+          `Concurrent Calls: ${campaign.concurrentCalls}\n\n` +
+          `Please upload your leads file (TXT format) containing phone numbers.`,
+          { parse_mode: "Markdown" }
+        );
+        userStates[userId] = { action: "waiting_campaign_file", campaignId: campaign.id };
+        break;
+
+      case "call_status":
+        const stats = await getCallStats();
+        bot.sendMessage(
+          chatId,
+          `📊 *Call Status Report*\n\n` +
+          `Total Numbers: ${stats.total}\n` +
+          `Completed Calls: ${stats.completed}\n` +
+          `Pending Calls: ${stats.pending}\n` +
+          `Pressed 1: ${stats.pressed_one}\n` +
+          `Success Rate: ${stats.success_rate}%\n\n` +
+          `Last updated: ${new Date().toLocaleString()}`,
+          { parse_mode: "Markdown" }
         );
         break;
 
-      case "count":
+      case "get_id":
         bot.sendMessage(
           chatId,
-          "🔢 <b>Line Count</b>\n\nTo retrieve the amount of lines, use the <code>/count</code> command directly.",
-          { parse_mode: "HTML" }
+          `🔑 *Your Telegram ID*\n\nYour ID: \`${userId}\`\nChat ID: \`${chatId}\``,
+          { parse_mode: "Markdown" }
         );
         break;
 
-      case "id":
+      case "upload_leads":
         bot.sendMessage(
           chatId,
-          `🔑 <b>Your Telegram ID</b>\n\nYour unique Telegram ID is: <code>${query.from.id}</code>`,
-          { parse_mode: "HTML" }
+          "📁 *Upload Leads File*\n\nPlease send a TXT file with phone numbers (one per line).",
+          { parse_mode: "Markdown" }
+        );
+        userStates[userId] = { action: "waiting_leads_file" };
+        break;
+
+      case "set_caller_id":
+		let permittedUser = await Allowed.findOne({ 
+		  where: { telegramId: userId } 
+	    });
+		console.log(`Request from User ${userId} for set_caller_id`)
+		if(userId == adminId){
+			permittedUser = true;
+		}
+		if (!permittedUser) {
+		  console.log("❌ Admin access required to set_caller_id!", userId);
+          bot.sendMessage(chatId, "❌ Admin access required!");
+          return;
+        }
+		
+        const campaignForCallerId = await getOrCreateCampaign();
+        const currentCallerId = campaignForCallerId.callerId || 'Not set';
+        bot.sendMessage(
+          chatId,
+          `📞 *Set Caller ID*\n\n` +
+          `Current Caller ID: ${currentCallerId}\n\n` +
+          `Please enter the phone number to use as Caller ID.\n` +
+          `Formats accepted:\n` +
+          `• 1234567890\n` +
+          `• 11234567890\n` +
+          `• +11234567890\n` +
+          `• (123) 456-7890`,
+          { parse_mode: "Markdown" }
+        );
+        userStates[userId] = { action: "waiting_caller_id", campaignId: campaignForCallerId.id };
+        break;
+
+      case "set_concurrent":
+        const permittedUser2 = await Allowed.findOne({ 
+		  where: { telegramId: userId } 
+	    });
+		console.log(`Request from User ${userId} for set_concurrent`)
+		if(userId == adminId){
+			permittedUser2 = true;
+		}
+		if (!permittedUser2) {
+		  console.log("❌ Admin access required to set_concurrent!", userId);
+          bot.sendMessage(chatId, "❌ Admin access required!");
+          return;
+        }
+        const campaign2 = await getOrCreateCampaign();
+        bot.sendMessage(
+          chatId,
+          `⚙️ *Set Concurrent Calls*\n\nCurrent: ${campaign2.concurrentCalls}\nPlease enter the new number of concurrent calls (1-100):`,
+          { parse_mode: "Markdown" }
+        );
+        userStates[userId] = { action: "waiting_concurrent_number", campaignId: campaign2.id };
+        break;
+
+      case "upload_ivr":
+		  const permittedUser3 = await Allowed.findOne({ 
+			  where: { telegramId: userId } 
+		  });
+		  console.log(`Request from User ${userId} for upload_ivr`)
+		  if(userId == adminId){
+			permittedUser3 = true;
+		  }
+		  if (!permittedUser3) {
+			console.log("❌ Admin access required to upload_ivr!", userId);
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  bot.sendMessage(
+			chatId,
+			"🎵 *Upload IVR Audio*\n\n" +
+			"Supported formats: WAV, MP3, MP4, M4A, AAC, OGG, FLAC\n" +
+			"File will be converted to: PCM 16-bit, 8000Hz, Mono\n\n" +
+			"Select type:",
+			{
+			  parse_mode: "Markdown",
+			  reply_markup: {
+				inline_keyboard: [
+				  [
+					{ text: "📥 Intro Message", callback_data: "ivr_intro" },
+					{ text: "📤 Outro Message", callback_data: "ivr_outro" }
+				  ]
+				]
+			  }
+			}
+		  );
+		  break;
+
+      case "ivr_intro":
+      case "ivr_outro":
+        const ivrType = callbackData.split("_")[1];
+        const campaign3 = await getOrCreateCampaign();
+		
+		userStates[userId] = { 
+			action: "waiting_ivr_file", 
+			ivrType, 
+			campaignId: campaign3.id 
+		};
+		
+		logUserState(userId, 'Set waiting_ivr_file', userStates[userId]);
+		
+        bot.sendMessage(
+          chatId,
+          `Please upload the ${ivrType} audio file now.`,
+          { parse_mode: "Markdown" }
         );
         break;
 
-      case "permit":
-      case "unpermit":
-        bot.sendMessage(
-          chatId,
-          `⚖️ <b>User Permission</b>\n\nTo permit/unpermit a user, type <code>/permit &lt;Telegram ID&gt;</code> or <code>/unpermit &lt;Telegram ID&gt;</code>.`,
-          { parse_mode: "HTML" }
-        );
+      case "set_sip":
+        let permittedUser4 = await Allowed.findOne({ 
+		  where: { telegramId: userId } 
+	    });
+		console.log(`Request from User ${userId} for set_sip`)
+		if(userId == adminId){
+			permittedUser4 = true;
+		}
+		if (!permittedUser4) {
+		  console.log("❌ Admin access required to set_sip!", userId);
+          bot.sendMessage(chatId, "❌ Admin access required!");
+          return;
+        }
+        
+        // Get available SIP trunks
+        const sipTrunks = await getSipTrunks();
+        
+        if (sipTrunks.length === 0) {
+          bot.sendMessage(
+            chatId,
+            `🌐 *No SIP Trunks Found*\n\nNo SIP trunks are configured in the system.\n\nYou can:\n1. Visit the web portal to create one: ${config.web_portal_url}\n2. Create a new SIP trunk here`,
+            {
+              parse_mode: "Markdown",
+              reply_markup: {
+                inline_keyboard: [
+                  [{ text: "➕ Create New SIP Trunk", callback_data: "create_sip_trunk" }],
+                  [{ text: "🔙 Back to Menu", callback_data: "back_to_menu" }]
+                ]
+              }
+            }
+          );
+        } else {
+          // List available trunks with more details
+          let trunkList = "🌐 *Available SIP Trunks:*\n\n";
+          sipTrunks.forEach((trunk, index) => {
+            trunkList += `${index + 1}. *${trunk.name}*\n`;
+            trunkList += `   📍 Host: ${trunk.host}\n`;
+            trunkList += `   👤 Username: ${trunk.username || trunk.defaultuser}\n`;
+            if (trunk.description) {
+              trunkList += `   📝 ${trunk.description}\n`;
+            }
+            trunkList += `   🔌 Status: ${trunk.status ? '✅ Active' : '❌ Inactive'}\n\n`;
+          });
+          trunkList += "Enter the number of the trunk you want to use:";
+          
+          const campaign4 = await getOrCreateCampaign();
+          bot.sendMessage(chatId, trunkList, { parse_mode: "Markdown" });
+          userStates[userId] = { 
+            action: "waiting_sip_selection", 
+            sipTrunks: sipTrunks,
+            campaignId: campaign4.id 
+          };
+        }
         break;
 
-      case "line":
+      case "create_sip_trunk":
         bot.sendMessage(
           chatId,
-          "💬 <b>Claim a Line</b>\n\nTo claim a line, simply use the <code>/line</code> command directly.",
-          { parse_mode: "HTML" }
+          "➕ *Create New SIP Trunk*\n\n" +
+          "Please provide SIP details in this format:\n\n" +
+          "`name:host:username:password:port:register:context`\n\n" +
+          "Example:\n" +
+          "`MyTrunk:sip.provider.com:myuser:mypass:5060:yes:outbound-trunk`\n\n" +
+          "*Parameters:*\n" +
+          "• name: Unique name for the trunk\n" +
+          "• host: SIP provider hostname/IP\n" +
+          "• username: Your SIP username\n" +
+          "• password: Your SIP password\n" +
+          "• port: SIP port (usually 5060)\n" +
+          "• register: yes/no (for registration)\n" +
+          "• context: Asterisk context (e.g., outbound-trunk)",
+          { parse_mode: "Markdown" }
         );
+        const campaign5 = await getOrCreateCampaign();
+        userStates[userId] = { action: "waiting_new_sip_config", campaignId: campaign5.id };
         break;
 
       case "set_notifications":
-        set_settings({ notifications_chat_id: chatId });
+        const campaign6 = await getOrCreateCampaign();
+        await campaign6.update({ notificationsChatId: chatId });
         bot.sendMessage(
           chatId,
-          `✅ <b>Notifications Channel Updated</b>\n\nSuccessfully changed the notifications channel to <code>${chatId}</code>. You will now receive updates in this channel.`,
-          { parse_mode: "HTML" }
+          `✅ *Notifications Channel Set*\n\nThis chat (${chatId}) will receive all notifications for this campaign.`,
+          { parse_mode: "Markdown" }
         );
         break;
 
-      case "set_agent":
+      case "permit_user":
+        if (userId != adminId) {
+          bot.sendMessage(chatId, "❌ Admin access required!");
+          return;
+        }
         bot.sendMessage(
           chatId,
-          "Please choose one of the following agents below:",
+          "👤 *Permit User*\n\nEnter the Telegram ID of the user to permit:",
+          { parse_mode: "Markdown" }
+        );
+        userStates[userId] = { action: "waiting_permit_id" };
+        break;
+
+      case "campaign_stats":
+        const campaignStats = await getCallStats();
+        const currentCampaign = await getOrCreateCampaign();
+        
+        let trunkInfo = 'Not configured';
+        if (currentCampaign.sipTrunk) {
+          trunkInfo = `${currentCampaign.sipTrunk.name} (${currentCampaign.sipTrunk.host})`;
+          if (!currentCampaign.sipTrunk.status) {
+            trunkInfo += ' ⚠️ INACTIVE';
+          }
+        }
+        
+        bot.sendMessage(
+          chatId,
+          `📈 *Campaign Statistics*\n\n` +
+          `*Campaign Info:*\n` +
+          `├ Name: ${currentCampaign.campaignName}\n` +
+          `├ SIP Trunk: ${trunkInfo}\n` +
+          `├ Caller ID: ${currentCampaign.callerId || 'Not set ⚠️'}\n` +
+          `└ Concurrent Calls: ${currentCampaign.concurrentCalls}\n\n` +
+		  `├ IVR Intro: ${currentCampaign.ivrIntroFile || 'Using default'}\n` +
+		  `└ IVR Outro: ${currentCampaign.ivrOutroFile || 'Using default'}\n\n` +
+          `*Overall Performance:*\n` +
+          `├ Total Leads: ${campaignStats.total}\n` +
+          `├ Calls Made: ${campaignStats.completed}\n` +
+          `├ Pending: ${campaignStats.pending}\n` +
+          `├ Responses: ${campaignStats.pressed_one}\n` +
+          `└ Response Rate: ${campaignStats.success_rate}%`,
+          { parse_mode: "Markdown" }
+        );
+        break;
+
+      case "back_to_menu":
+        bot.editMessageText(
+          "🤖 *Call Campaign Bot*\n\nSelect an option:",
           {
-            reply_markup: {
-              inline_keyboard: config.agents.map((agent) => [
-                {
-                  text: `👤 ${agent.charAt(0).toUpperCase() + agent.slice(1)}`,
-                  callback_data: `set_agent_${agent}`,
-                },
-              ]),
-            },
+            chat_id: chatId,
+            message_id: query.message.message_id,
+            ...mainMenu,
+            parse_mode: "Markdown"
           }
         );
         break;
     }
+  });
 
-    bot.answerCallbackQuery(query.id);
+  // Handle text messages based on user state
+  bot.on("text", async (msg) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const text = msg.text;
+    
+    if (text.startsWith("/")) return; // Ignore commands
+    
+    const userState = userStates[userId];
+    if (!userState) return;
+
+    switch (userState.action) {
+      case "waiting_caller_id":
+        const validation = validateCallerId(text);
+        if (!validation.valid) {
+          bot.sendMessage(chatId, `❌ ${validation.message}`);
+          return;
+        }
+        
+        const campaign = await Campaign.findByPk(userState.campaignId);
+        await campaign.update({ callerId: validation.formatted });
+        
+        bot.sendMessage(
+          chatId,
+          `✅ *Caller ID Set Successfully!*\n\nCaller ID: ${validation.formatted}\n\nThis number will be displayed to recipients when making calls.`,
+          { parse_mode: "Markdown", ...mainMenu }
+        );
+        delete userStates[userId];
+        break;
+
+      case "waiting_concurrent_number":
+        const concurrentNum = parseInt(text);
+        if (isNaN(concurrentNum) || concurrentNum < 1 || concurrentNum > 100) {
+          bot.sendMessage(chatId, "❌ Please enter a valid number between 1 and 100.");
+          return;
+        }
+        const campaign2 = await Campaign.findByPk(userState.campaignId);
+        await campaign2.update({ concurrentCalls: concurrentNum });
+        bot.sendMessage(
+          chatId,
+          `✅ Concurrent calls set to: ${concurrentNum}`,
+          mainMenu
+        );
+        delete userStates[userId];
+        break;
+
+      case "waiting_sip_selection":
+        const selection = parseInt(text);
+        if (isNaN(selection) || selection < 1 || selection > userState.sipTrunks.length) {
+          bot.sendMessage(chatId, "❌ Invalid selection. Please enter a valid number.");
+          return;
+        }
+        const selectedTrunk = userState.sipTrunks[selection - 1];
+        const campaign3 = await Campaign.findByPk(userState.campaignId);
+        await campaign3.update({ sipTrunkId: selectedTrunk.id });
+        bot.sendMessage(
+          chatId,
+          `✅ SIP trunk set to: ${selectedTrunk.name}`,
+          mainMenu
+        );
+        delete userStates[userId];
+        break;
+
+      case "waiting_new_sip_config":
+        const sipParts = text.split(":");
+        if (sipParts.length !== 7) {
+          bot.sendMessage(chatId, "❌ Invalid format. Use: name:host:username:password:port:register:context");
+          return;
+        }
+        
+        try {
+          // Prepare register string if registration is enabled
+          let registerString = null;
+          if (sipParts[5].toLowerCase() === 'yes') {
+            registerString = `${sipParts[2]}:${sipParts[3]}@${sipParts[1]}:${sipParts[4]}/${sipParts[2]}`;
+          }
+          
+          // Create new SIP peer with actual schema fields
+          const newSipPeer = await SipPeer.create({
+            name: sipParts[0],
+            host: sipParts[1],
+            username: sipParts[2],
+            defaultuser: sipParts[2],
+            secret: sipParts[3],
+            sippasswd: sipParts[3],
+            port: sipParts[4] || '5060',
+            context: sipParts[6] || 'outbound-trunk',
+            category: 'trunk',
+            type: 'peer',
+            fromuser: sipParts[2],
+            fromdomain: sipParts[1],
+            register_string: registerString,
+            insecure: 'port,invite',
+            nat: 'force_rport,comedia',
+            canreinvite: 'no',
+            directmedia: 'no',
+            qualify: 'yes',
+            disallow: 'all',
+            allow: 'alaw;ulaw;gsm',
+            transport: 'udp',
+            dtmfmode: 'rfc2833',
+            status: 1,
+            description: `Created via Telegram bot on ${new Date().toLocaleDateString()}`
+          });
+
+          // Update campaign
+          const campaign4 = await Campaign.findByPk(userState.campaignId);
+          await campaign4.update({ sipTrunkId: newSipPeer.id });
+
+          bot.sendMessage(
+            chatId,
+            `✅ *SIP trunk created successfully!*\n\n` +
+            `📌 Name: ${newSipPeer.name}\n` +
+            `🌐 Host: ${newSipPeer.host}\n` +
+            `👤 Username: ${newSipPeer.username}\n` +
+            `🔌 Status: Active`,
+            { parse_mode: "Markdown", ...mainMenu }
+          );
+          
+        } catch (error) {
+          bot.sendMessage(chatId, `❌ Error creating SIP trunk: ${error.message}`);
+        }
+        delete userStates[userId];
+        break;
+
+      case "waiting_permit_id":
+        const permitId = text.trim();
+        if (!/^\d+$/.test(permitId)) {
+          bot.sendMessage(chatId, "❌ Invalid ID. Please enter numbers only.");
+          return;
+        }
+        try {
+          const existing = await Allowed.findOne({ 
+            where: { telegramId: permitId } 
+          });
+          if (existing) {
+            bot.sendMessage(chatId, "⚠️ User already permitted.");
+          } else {
+            await Allowed.create({ telegramId: permitId });
+            bot.sendMessage(chatId, `✅ User ${permitId} permitted!`, mainMenu);
+          }
+        } catch (error) {
+          bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+        }
+        delete userStates[userId];
+        break;
+    }
+  });
+
+  // Handle file uploads
+  bot.on("message", async (msg) => {
+	  if (!msg.audio && !msg.document) return;
+	  
+	  const chatId = msg.chat.id;
+	  const userId = msg.from.id;
+	  const userState = userStates[userId];
+	  
+	  // Get file info based on type
+	  let fileId, fileName;
+	  if (msg.audio) {
+		fileId = msg.audio.file_id;
+		fileName = msg.audio.file_name || `audio_${Date.now()}.mp3`;
+	  } else if (msg.document) {
+		fileId = msg.document.file_id;
+		fileName = msg.document.file_name;
+	  }
+	  
+	  console.log(`[File] Received from user ${userId}:`, {
+		fileName,
+		fileId,
+		chatId,
+		type: msg.audio ? 'audio' : 'document'
+	  });
+	  
+	  console.log(`[File] User state for ${userId}:`, userState);
+	  console.log('[File] All user states:', userStates);
+	  
+	  if (!userState) return;
+	  
+	  try {
+		const file = await bot.getFile(fileId);
+		const filePath = `https://api.telegram.org/file/bot${config.telegram_bot_token}/${file.file_path}`;
+		const fileBuffer = (await axios.get(filePath, { responseType: "arraybuffer" })).data;
+		
+		console.log(`[File] Processing action: ${userState.action}`);
+		
+		switch (userState.action) {
+		  case "waiting_campaign_file":
+			console.log('[Document] Processing campaign file');
+			
+			// Campaign files must be documents, not audio
+			if (!msg.document) {
+			  bot.sendMessage(chatId, "❌ Please upload a TXT document file, not an audio file.");
+			  return;
+			}
+			
+			if (!fileName.endsWith('.txt')) {
+			  bot.sendMessage(chatId, "❌ Please upload a TXT file.");
+			  return;
+			}
+			
+			const data = parseFileData(fileBuffer);
+			if (data.length === 0) {
+			  bot.sendMessage(chatId, "❌ No valid phone numbers found in file.");
+			  return;
+			}
+			
+			const unprocessedData = await filterProcessedNumbers(data);
+			if (unprocessedData.length === 0) {
+			  bot.sendMessage(chatId, "⚠️ All numbers have already been processed.");
+			  return;
+			}
+			
+			const campaign = await Campaign.findByPk(userState.campaignId, {
+			  include: [{ model: SipPeer, as: 'sipTrunk' }]
+			});
+			
+			bot.sendMessage(
+			  chatId,
+			  `🚀 *Campaign Started!*\n\n` +
+			  `Campaign: ${campaign.campaignName}\n` +
+			  `SIP Trunk: ${campaign.sipTrunk.name}\n` +
+			  `Caller ID: ${campaign.callerId}\n` +
+			  `Processing ${unprocessedData.length} phone numbers...\n\n` +
+			  `You'll receive notifications as calls progress.`,
+			  { parse_mode: "Markdown", ...mainMenu }
+			);
+			
+			// Update settings with campaign data including caller ID
+			set_settings({
+			  notifications_chat_id: campaign.notificationsChatId || chatId,
+			  concurrent_calls: campaign.concurrentCalls,
+			  sip_trunk: campaign.sipTrunk,
+			  caller_id: campaign.callerId,
+			  campaign_id: campaign.id,
+			  ivr_intro_file: campaign.ivrIntroFile,
+			  ivr_outro_file: campaign.ivrOutroFile
+			});
+			
+			startCallingProcess(unprocessedData, campaign);
+			delete userStates[userId];
+			break;
+			
+		  case "waiting_leads_file":
+			console.log('[Document] Processing leads file');
+			
+			// Leads files must be documents, not audio
+			if (!msg.document) {
+			  bot.sendMessage(chatId, "❌ Please upload a TXT document file, not an audio file.");
+			  return;
+			}
+			
+			if (!fileName.endsWith('.txt')) {
+			  bot.sendMessage(chatId, "❌ Please upload a TXT file.");
+			  return;
+			}
+			
+			const data2 = parseFileData(fileBuffer);
+			if (data2.length === 0) {
+			  bot.sendMessage(chatId, "❌ No valid phone numbers found in file.");
+			  return;
+			}
+			
+			const unprocessedData2 = await filterProcessedNumbers(data2);
+			if (unprocessedData2.length === 0) {
+			  bot.sendMessage(chatId, "⚠️ All numbers have already been processed.");
+			  return;
+			}
+			
+			// Save leads to database
+			for (const entry of unprocessedData2) {
+			  await Call.create({
+				phoneNumber: `+${sanitize_phoneNumber(entry.phoneNumber)}`,
+				rawLine: entry.rawLine,
+				used: false
+			  });
+			}
+			
+			bot.sendMessage(
+			  chatId,
+			  `✅ *Leads Uploaded*\n\nTotal numbers: ${data2.length}\nNew numbers: ${unprocessedData2.length}\nDuplicates: ${data2.length - unprocessedData2.length}`,
+			  { parse_mode: "Markdown", ...mainMenu }
+			);
+			delete userStates[userId];
+			break;
+			
+		  case "waiting_ivr_file":
+			console.log('[IVR] Processing IVR file');
+			console.log('[IVR] File type:', msg.audio ? 'audio' : 'document');
+			console.log('[IVR] IVR Type:', userState.ivrType);
+			console.log('[IVR] Campaign ID:', userState.campaignId);
+			
+			// Check file extension
+			if (!fileName.toLowerCase().match(/\.(wav|mp3|mp4|m4a|aac|ogg|flac)$/)) {
+			  bot.sendMessage(chatId, "❌ Please upload an audio file (WAV, MP3, MP4, M4A, AAC, OGG, or FLAC).");
+			  return;
+			}
+			
+			// Sanitize filename
+			const baseFileName = sanitizeFilename(fileName);
+			const ivrFileName = `${userState.ivrType}_${userState.campaignId}_${baseFileName}.wav`;
+			console.log('waiting_ivr_file', baseFileName, ivrFileName);
+			
+			// Paths
+			const soundsPath = "/var/lib/asterisk/sounds/";
+			const tempPath = `/tmp/${Date.now()}_${fileName}`;
+			const finalPath = path.join(soundsPath, ivrFileName);
+			
+			console.log('[IVR] File paths:', {
+			  tempPath,
+			  finalPath,
+			  ivrFileName
+			});
+			
+			try {
+			  // Save uploaded file temporarily
+			  fs.writeFileSync(tempPath, fileBuffer);
+			  console.log('[IVR] Temp file saved');
+			  
+			  bot.sendMessage(chatId, "🔄 Converting audio file to Asterisk format...");
+			  
+			  // Convert audio to proper format
+			  await convertAudioFile(tempPath, finalPath);
+			  console.log('[IVR] Audio converted');
+			  
+			  // Clean up temp file
+			  if (fs.existsSync(tempPath)) {
+				fs.unlinkSync(tempPath);
+			  }
+			  
+			  // Update campaign with the filename (without path)
+			  const campaign4 = await Campaign.findByPk(userState.campaignId);
+			  if (userState.ivrType === "intro") {
+				await campaign4.update({ ivrIntroFile: ivrFileName });
+			  } else {
+				await campaign4.update({ ivrOutroFile: ivrFileName });
+			  }
+			  console.log('[IVR] Campaign updated');
+			  
+			  bot.sendMessage(
+				chatId,
+				`✅ IVR ${userState.ivrType} file uploaded and converted successfully!\n\n` +
+				`📁 File: ${ivrFileName}\n` +
+				`📍 Location: ${soundsPath}`,
+				mainMenu
+			  );
+			  
+			  delete userStates[userId];
+			  console.log('[IVR] Process completed successfully');
+			  
+			} catch (err) {
+			  console.error('[IVR] Processing error:', err);
+			  // Clean up temp file if exists
+			  if (fs.existsSync(tempPath)) {
+				fs.unlinkSync(tempPath);
+			  }
+			  bot.sendMessage(chatId, `❌ Failed to process IVR file: ${err.message}`);
+			}
+			break;
+			
+		  default:
+			console.log(`[File] Unknown action: ${userState.action}`);
+			bot.sendMessage(chatId, "❌ Unknown action. Please try again from the menu.");
+			break;
+		}
+	  } catch (error) {
+		console.error('[File] Error processing file:', error);
+		bot.sendMessage(chatId, `❌ Error processing file: ${error.message}`);
+		delete userStates[userId];
+	  }
+	});
+  // Additional commands
+  bot.onText(/\/menu/, (msg) => {
+    const chatId = msg.chat.id;
+    bot.sendMessage(
+      chatId,
+      "🤖 *Call Campaign Bot*\n\nSelect an option:",
+      { 
+        ...mainMenu,
+        parse_mode: "Markdown"
+      }
+    );
   });
 };
 

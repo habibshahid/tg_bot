@@ -3,8 +3,7 @@ const express = require("express");
 const path = require("path");
 const cookieParser = require("cookie-parser");
 const logger = require("morgan");
-const mongoose = require("mongoose");
-const config = require("./config/index");
+const sequelize = require("./config/database");
 const compression = require("compression");
 const cors = require("cors");
 const helmet = require("helmet");
@@ -12,17 +11,17 @@ const helmet = require("helmet");
 const indexRouter = require("./routes/index");
 const { initializeBot } = require("./telegram_bot");
 
+// Import all models
+const Call = require("./models/call");
+const Allowed = require("./models/allowed");
+const Campaign = require("./models/campaign");
+const SipPeer = require("./models/sippeer");
+
 const app = express();
-mongoose.set("strictQuery", true);
 
 // view engine setup
 app.set("views", path.join(__dirname, "views"));
 app.set("view engine", "jade");
-
-// Initialize database connection
-main().catch(function (err) { 
-	console.error("Failed to connect to database:", err); 
-});
 
 app.use(cors());
 app.use(helmet({ crossOriginResourcePolicy: false }));
@@ -35,15 +34,58 @@ app.use(express.static(path.join(__dirname, "public")));
 
 app.use("/", indexRouter);
 
-async function main() {
+// Initialize database
+async function initializeDatabase() {
   try {
-     await mongoose.connect(config.mongodb_uri);
-    console.log("Database connection established");
-  } catch (err) {
-    console.error("Database connection error:", err);
+    await sequelize.authenticate();
+    console.log('Database connection established');
+    
+    // For existing database, only sync new tables or columns
+    // Don't use force: true as it would drop existing tables
+    await sequelize.sync({ 
+      alter: false  // Set to false for production with existing tables
+    });
+    
+    console.log('Database models synchronized');
+    
+    // Check if there are any SIP trunks configured
+    const sipTrunkCount = await SipPeer.count({ 
+      where: { 
+        category: 'trunk',
+        status: 1 
+      } 
+    });
+    
+    if (sipTrunkCount === 0) {
+      console.log('⚠️  No active SIP trunks found in database.');
+      console.log('   Please configure SIP trunks via:');
+      console.log('   1. Telegram bot using /start');
+      console.log('   2. Web portal');
+      console.log('   3. Direct database insertion');
+    } else {
+      console.log(`✅ Found ${sipTrunkCount} active SIP trunk(s) in database`);
+    }
+    
+    // Log available SIP trunks for debugging
+    const trunks = await SipPeer.findAll({
+      where: { category: 'trunk', status: 1 },
+      attributes: ['id', 'name', 'host', 'username']
+    });
+    
+    if (trunks.length > 0) {
+      console.log('\nAvailable SIP Trunks:');
+      trunks.forEach(trunk => {
+        console.log(`  - ${trunk.name} (${trunk.host}) - ID: ${trunk.id}`);
+      });
+    }
+    
+  } catch (error) {
+    console.error('Unable to connect to the database:', error);
     process.exit(1);
   }
 }
+
+initializeDatabase();
 
 // catch 404 and forward to error handler
 app.use(function (req, res, next) {
@@ -52,11 +94,8 @@ app.use(function (req, res, next) {
 
 // error handler
 app.use(function (err, req, res, next) {
-  // set locals, only providing error in development
   res.locals.message = err.message;
   res.locals.error = req.app.get("env") === "development" ? err : {};
-
-  // render the error page
   res.status(err.status || 500);
   res.render("error");
 });
