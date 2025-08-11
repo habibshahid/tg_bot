@@ -1,10 +1,59 @@
-const mongoose = require("mongoose");
-const Schema = mongoose.Schema;
+// =====================================
+// CALL MODEL (models/call.js)
+// =====================================
 
-const callSchema = new Schema({
-  phoneNumber: { type: String },
-  rawLine: { type: String },
-  used: { type: Boolean, default: false },
+const { DataTypes } = require('sequelize');
+const sequelize = require('../config/database');
+
+const Call = sequelize.define('Call', {
+  id: {
+    type: DataTypes.INTEGER,
+    primaryKey: true,
+    autoIncrement: true
+  },
+  phoneNumber: {
+    type: DataTypes.STRING(50),
+    allowNull: false,
+    field: 'phone_number'
+  },
+  rawLine: {
+    type: DataTypes.TEXT,
+    allowNull: true,
+    field: 'raw_line'
+  },
+  used: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: false
+  },
+  pressedOne: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: false,
+    field: 'pressed_one'
+  },
+  callStarted: {
+    type: DataTypes.DATE,
+    allowNull: true,
+    field: 'call_started'
+  },
+  callEnded: {
+    type: DataTypes.DATE,
+    allowNull: true,
+    field: 'call_ended'
+  },
+  createdAt: {
+    type: DataTypes.DATE,
+    defaultValue: DataTypes.NOW,
+    field: 'created_at'
+  },
+  updatedAt: {
+    type: DataTypes.DATE,
+    defaultValue: DataTypes.NOW,
+    field: 'updated_at'
+  }
+}, {
+  tableName: 'calls',
+  timestamps: true,
+  underscored: true
 });
 
-module.exports = mongoose.model("Call", callSchema);
+module.exports = Call;
