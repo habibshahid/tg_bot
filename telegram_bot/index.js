@@ -333,7 +333,8 @@ const initializeBot = () => {
 			{ text: "📈 Campaign Stats", callback_data: "campaign_stats" }
 		  ],
 		  [
-			{ text: "➕ Set Dial Prefix", callback_data: "set_dial_prefix" }
+			{ text: "➕ Set Dial Prefix", callback_data: "set_dial_prefix" },
+			{ text: "- Remove Dial Prefix", callback_data: "remove_dial_prefix" }
 		  ]
 		]
 	  }
@@ -387,11 +388,35 @@ const initializeBot = () => {
 			`• 9 (for outbound access)\n` +
 			`• 011 (for international calls)\n` +
 			`• 1 (for long distance)\n` +
-			`• Leave empty to remove prefix\n\n` +
 			`The prefix will be added to all numbers when dialing.`,
 			{ parse_mode: "Markdown" }
 		  );
 		  userStates[userId] = { action: "waiting_dial_prefix", campaignId: campaignForPrefix.id };
+		  break;
+		  
+	  case "remove_dial_prefix":
+		  let permittedUserPrefix1 = await Allowed.findOne({ 
+			where: { telegramId: userId } 
+		  });
+		  console.log(`Request from User ${userId} for set_dial_prefix`)
+		  if(userId == adminId){
+			permittedUserPrefix1 = true;
+		  }
+		  if (!permittedUserPrefix1) {
+			console.log("❌ Admin access required to set_dial_prefix!", userId);
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const campaignPrefix = await getOrCreateCampaign();
+		  await campaignPrefix.update({ dialPrefix: '' });
+		  
+		  bot.sendMessage(
+			chatId,
+			`✅ *Dial Prefix Removed Successfully!*\n\n`,
+			{ parse_mode: "Markdown", ...mainMenu }
+		  );
+		  delete userStates[userId];
 		  break;
 		  
       case "start_campaign":
