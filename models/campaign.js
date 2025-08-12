@@ -36,6 +36,12 @@ const Campaign = sequelize.define('Campaign', {
     allowNull: true,
     field: 'caller_id'
   },
+  dialPrefix: {
+    type: DataTypes.STRING(20),
+    allowNull: true,
+    field: 'dial_prefix',
+    defaultValue: ''
+  },
   notificationsChatId: {
     type: DataTypes.STRING(50),
     allowNull: true,

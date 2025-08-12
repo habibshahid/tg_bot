@@ -53,6 +53,7 @@ ami.on("managerevent", async (data) => {
   }
   
   if(data?.event === 'OriginateResponse'){
+	//console.log('OriginateResponse', data)
     if(data.response == 'Success'){
       const phoneNumber = data.exten == '' ? data.calleridnum : data.exten;
       console.log(`Call answered on channel: ${data?.channel} ${phoneNumber}`);
@@ -67,7 +68,7 @@ ami.on("managerevent", async (data) => {
       console.log(
         `Call to ${data?.exten} with +${data?.calleridnum} has ended with failed with reason ${data?.reason}`
       );
-      
+      call_ended(data?.exten, 'Failure');
       // Update failed calls counter
       if (settings.campaign_id) {
         Campaign.increment('failedCalls', { where: { id: settings.campaign_id } });
@@ -78,12 +79,14 @@ ami.on("managerevent", async (data) => {
   }
 
   if (data?.event === "Hangup") {
-	  console.log(data)
-    call_ended(data?.exten);
-    console.log(
-      `Call to ${data?.exten} from +${data?.calleridnum} has ended with reason ${data["cause-txt"]}`
-    );
-    require("./call")(pop_unprocessed_line());
+	//console.log('Hangup', data)
+    if(data?.exten){
+		call_ended(data?.exten, 'Success');
+		console.log(
+		  `Call to ${data?.exten} from +${data?.calleridnum} has ended with reason ${data["cause-txt"]}`
+		);
+		require("./call")(pop_unprocessed_line());
+	}
   }
 });
 

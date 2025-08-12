@@ -331,6 +331,9 @@ const initializeBot = () => {
 		  [
 			{ text: "🔢 Set DTMF Digit", callback_data: "set_dtmf" },
 			{ text: "📈 Campaign Stats", callback_data: "campaign_stats" }
+		  ],
+		  [
+			{ text: "➕ Set Dial Prefix", callback_data: "set_dial_prefix" }
 		  ]
 		]
 	  }
@@ -359,6 +362,38 @@ const initializeBot = () => {
     bot.answerCallbackQuery(query.id);
 
     switch (callbackData) {
+	  case "set_dial_prefix":
+		  let permittedUserPrefix = await Allowed.findOne({ 
+			where: { telegramId: userId } 
+		  });
+		  console.log(`Request from User ${userId} for set_dial_prefix`)
+		  if(userId == adminId){
+			permittedUserPrefix = true;
+		  }
+		  if (!permittedUserPrefix) {
+			console.log("❌ Admin access required to set_dial_prefix!", userId);
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const campaignForPrefix = await getOrCreateCampaign();
+		  const currentPrefix = campaignForPrefix.dialPrefix || 'None';
+		  bot.sendMessage(
+			chatId,
+			`➕ *Set Dial Prefix*\n\n` +
+			`Current Dial Prefix: ${currentPrefix}\n\n` +
+			`Enter the prefix to add before all dialed numbers.\n` +
+			`Examples:\n` +
+			`• 9 (for outbound access)\n` +
+			`• 011 (for international calls)\n` +
+			`• 1 (for long distance)\n` +
+			`• Leave empty to remove prefix\n\n` +
+			`The prefix will be added to all numbers when dialing.`,
+			{ parse_mode: "Markdown" }
+		  );
+		  userStates[userId] = { action: "waiting_dial_prefix", campaignId: campaignForPrefix.id };
+		  break;
+		  
       case "start_campaign":
         // Check for campaign in database
         const campaign = await getOrCreateCampaign();
@@ -394,6 +429,7 @@ const initializeBot = () => {
 		  `Campaign: ${escapeMarkdown(campaign.campaignName)}\n` +
 		  `SIP Trunk: ${escapeMarkdown(trunkValidation.trunk.name)}\n` +
 		  `Caller ID: ${escapeMarkdown(campaign.callerId)}\n` +
+		  `Dial Prefix: ${campaign.dialPrefix || 'None'}\n` +
 		  `Concurrent Calls: ${campaign.concurrentCalls}\n\n` +
 		  `Please upload your leads file (TXT format) containing phone numbers.`,
 		  { parse_mode: "Markdown" }
@@ -687,6 +723,7 @@ const initializeBot = () => {
 			`• Caller ID: ${escapeMarkdown(currentCampaignStats.callerId || 'Not set ⚠️')}\n` +
 			`• Concurrent Calls: ${currentCampaignStats.concurrentCalls}\n` +
 			`• DTMF Digit: ${currentCampaignStats.dtmfDigit}\n` +
+			`• Dial Prefix: ${currentCampaign.dialPrefix || 'None'}\n` +
 			`• IVR Intro: ${escapeMarkdown(currentCampaignStats.ivrIntroFile || 'Using default')}\n` +
 			`• IVR Outro: ${escapeMarkdown(currentCampaignStats.ivrOutroFile || 'Using default')}\n\n` +
 			`*Campaign Performance:*\n` +
@@ -726,6 +763,26 @@ const initializeBot = () => {
     if (!userState) return;
 
     switch (userState.action) {
+	  case "waiting_dial_prefix":
+		  const prefix = text.trim();
+		  // Validate prefix - should only contain digits
+		  if (prefix && !/^\d*$/.test(prefix)) {
+			bot.sendMessage(chatId, "❌ Prefix should only contain numbers.");
+			return;
+		  }
+		  
+		  const campaignPrefix = await Campaign.findByPk(userState.campaignId);
+		  await campaignPrefix.update({ dialPrefix: prefix });
+		  
+		  bot.sendMessage(
+			chatId,
+			`✅ *Dial Prefix ${prefix ? 'Set' : 'Removed'} Successfully!*\n\n` +
+			`${prefix ? `Prefix: ${prefix}\n\nAll numbers will be dialed as: ${prefix} + [phone number]` : 'No prefix will be added to dialed numbers.'}`,
+			{ parse_mode: "Markdown", ...mainMenu }
+		  );
+		  delete userStates[userId];
+		  break;
+		  
       case "waiting_caller_id":
 		  const validation = validateCallerId(text);
 		  if (!validation.valid) {
@@ -978,6 +1035,7 @@ const initializeBot = () => {
 				concurrent_calls: campaign.concurrentCalls,
 				sip_trunk: campaign.sipTrunk,
 				caller_id: campaign.callerId,
+				dial_prefix: campaign.dialPrefix || '',
 				campaign_id: campaign.id,
 				dtmf_digit: campaign.dtmfDigit,
 				ivr_intro_file: campaign.ivrIntroFile,

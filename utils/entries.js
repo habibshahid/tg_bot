@@ -87,14 +87,14 @@ exports.call_started = async (phoneNumber) => {
   );
 };
 
-exports.call_ended = async (phoneNumber) => {
+exports.call_ended = async (phoneNumber, callStatus) => {
   const entry = get_entry_by_number(phoneNumber);
   const settings = get_settings();
 
   const existingCall = await Call.findOne({
 	  where:{
-    phoneNumber: `+${phoneNumber}`,
-    campaignId: settings.campaign_id
+		phoneNumber: `+${phoneNumber}`,
+		campaignId: settings.campaign_id
 	  }
   });
 
@@ -108,7 +108,7 @@ exports.call_ended = async (phoneNumber) => {
   const bot = get_bot();
   bot.sendMessage(
     settings.notifications_chat_id,
-    `📴 Call Ended: ${phoneNumber}`,
+    `📴 Call Ended: ${phoneNumber} with ${callStatus}`,
     { parse_mode: "HTML" }
   );
 };
