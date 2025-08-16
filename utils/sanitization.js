@@ -28,5 +28,5 @@ exports.sanitize_phoneNumber = (phoneNumber) => {
   }
    
   return cleaned;*/
-  return phoneNumber;
+  return cleaned;
 };

@@ -1,6 +1,7 @@
 const Call = require("../models/call");
 const { get_bot } = require("../telegram_bot/botInstance");
 const { get_settings } = require("./settings");
+const telegramQueue = require("./telegramQueue");
 
 let entries = [];
 let unprocessedData = [];
@@ -41,7 +42,7 @@ exports.add_entry_to_database = async (phoneNumber) => {
   }
 
   const bot = get_bot();
-  bot.sendMessage(
+  telegramQueue.sendMessage(
     settings.notifications_chat_id,
     `✅ ${phoneNumber} pressed ${dtmfDigit}. Do /line to retrieve their info.`,
     { parse_mode: "HTML" }
@@ -80,11 +81,11 @@ exports.call_started = async (phoneNumber) => {
   }
 
   const bot = get_bot();
-  bot.sendMessage(
+  /*telegramQueue.sendMessage(
     settings.notifications_chat_id,
     `📞 Call Started: ${phoneNumber}`,
     { parse_mode: "HTML" }
-  );
+  );*/
 };
 
 exports.call_ended = async (phoneNumber, callStatus) => {
@@ -106,11 +107,11 @@ exports.call_ended = async (phoneNumber, callStatus) => {
   }
 
   const bot = get_bot();
-  bot.sendMessage(
+  /*telegramQueue.sendMessage(
     settings.notifications_chat_id,
     `📴 Call Ended: ${phoneNumber} with ${callStatus}`,
     { parse_mode: "HTML" }
-  );
+  );*/
 };
 
 exports.add_entry_to_memory = (entry) => {

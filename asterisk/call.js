@@ -16,13 +16,13 @@ module.exports = async (entry) => {
       const bot = get_bot();
       const settings = get_settings();
       
-      bot.sendMessage(
+      /*bot.sendMessage(
         settings?.notifications_chat_id,
         `✅ All lines have been called`,
         {
           parse_mode: "HTML",
         }
-      );
+      );*/
       hasLoggedAllLines = true;
     }
     return;
@@ -39,7 +39,10 @@ module.exports = async (entry) => {
   const sipTrunk = settings.sip_trunk;
   const trunkName = sipTrunk ? sipTrunk.name : 'main';
   let callerId = settings.caller_id || number;
-
+  const dialPrefix = settings.dial_prefix || '';
+  
+  const dialedNumber = dialPrefix + number;
+   
   // ANI rotation logic
   if (settings.campaign_id && callerId && callerId.length >= 4) {
     const campaign = await Campaign.findByPk(settings.campaign_id);
@@ -77,21 +80,23 @@ module.exports = async (entry) => {
   if (settings.ivr_outro_file) {
     variables.__CAMPAIGN_OUTRO = settings.ivr_outro_file;
   }
+  
   console.log({
-      action: "Originate",
-      channel: `SIP/${trunkName}/${number}`,
-      context: `outbound-${settings?.agent || "coinbase"}`,
-      exten: number,
-      priority: 1,
-      actionid: actionId,
-      variable: Object.entries(variables).map(([key, value]) => `${key}=${value}`),
-      CallerID: callerId,
-      async: true,
-    })
+	action: "Originate",
+	channel: `SIP/${trunkName}/${dialedNumber}`,
+	context: `outbound-${settings?.agent || "coinbase"}`,
+	exten: number,
+	priority: 1,
+	actionid: actionId,
+	variable: Object.entries(variables).map(([key, value]) => `${key}=${value}`),
+	CallerID: callerId,
+	async: true,
+  })
+  
   ami.action(
     {
       action: "Originate",
-      channel: `SIP/${trunkName}/${number}`,
+      channel: `SIP/${trunkName}/${dialedNumber}`,
       context: `outbound-${settings?.agent || "coinbase"}`,
       exten: number,
       priority: 1,
@@ -115,6 +120,7 @@ module.exports = async (entry) => {
           `❌ Failed to call ${number}\n` +
           `Error: ${err.message}\n` +
           `Trunk: ${trunkName}\n` +
+		  `${dialPrefix ? `Prefix: ${dialPrefix}\n` : ''}` +
           `Caller ID: ${callerId}`,
           { parse_mode: "HTML" }
         );
@@ -123,14 +129,15 @@ module.exports = async (entry) => {
       } else {
         console.log("Originate Response:", res);
         
-        const bot = get_bot();
+        /*const bot = get_bot();
         bot.sendMessage(
           settings?.notifications_chat_id,
           `📞 Calling ${number}\n` +
           `Trunk: ${trunkName}\n` +
+		  `${dialPrefix ? `Prefix: ${dialPrefix}\n` : ''}` +
           `Caller ID: ${callerId}`,
           { parse_mode: "HTML" }
-        );
+        );*/
       }
     }
   );

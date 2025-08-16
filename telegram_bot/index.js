@@ -11,7 +11,7 @@ const {
   set_unprocessed_data,
   pop_unprocessed_line,
 } = require("../utils/entries");
-const { start_bot_instance } = require("./botInstance");
+const { start_bot_instance, get_bot } = require("./botInstance");
 const fs = require("fs");
 const path = require("path");
 const { Op } = require("sequelize");
@@ -68,7 +68,7 @@ async function convertAudioFile(inputPath, outputPath) {
   }
 }
 
-async function startCallingProcess(data, campaign) {
+/*async function startCallingProcess(data, campaign) {
   const concurrentCalls = campaign.concurrentCalls;
 
   // Save all leads to database with campaign ID before starting
@@ -108,6 +108,72 @@ async function startCallingProcess(data, campaign) {
   }
 
   await Promise.all(callPromises);
+  return;
+}*/
+
+async function startCallingProcess(data, campaign) {
+  const concurrentCalls = campaign.concurrentCalls;
+  const CALLS_PER_SECOND = 3; // Maximum 10 calls per second - adjust based on your asterisk server capacity
+  
+  // Save all leads to database with campaign ID before starting
+  for (const entry of data) {
+    const phoneNumber = `+${sanitize_phoneNumber(entry.phoneNumber)}`;
+    
+    // Check if this number already exists for this campaign
+    const existingCall = await Call.findOne({
+      where: {
+        phoneNumber: phoneNumber,
+        campaignId: campaign.id
+      }
+    });
+    
+    if (!existingCall) {
+      await Call.create({
+        phoneNumber: phoneNumber,
+        rawLine: entry.rawLine,
+        used: false,
+        campaignId: campaign.id,
+        callStatus: 'pending'
+      });
+    }
+  }
+  
+  await waitForConnection();
+  set_unprocessed_data(data);
+  const callPromises = [];
+  
+  for (let i = 0; i < concurrentCalls; i++) {
+    const line = pop_unprocessed_line();
+    if (line) {
+      const delayedCall = async () => {
+        // Calculate delay to ensure rate limiting
+        // For example with 10 calls/second:
+        // Calls 0-9: start at 0ms, 100ms, 200ms, ..., 900ms
+        // Calls 10-19: start at 1000ms, 1100ms, 1200ms, ..., 1900ms
+        // And so on...
+        const secondGroup = Math.floor(i / CALLS_PER_SECOND);
+        const positionInGroup = i % CALLS_PER_SECOND;
+        const delay = (secondGroup * 1500) + (positionInGroup * (1500 / CALLS_PER_SECOND));
+        
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return require("../asterisk/call")(line);
+      };
+      callPromises.push(delayedCall());
+    }
+  }
+  
+  // Wait for all calls to complete
+  await Promise.all(callPromises);
+  const bot = get_bot();
+  const settings = get_settings();
+  
+  bot.sendMessage(
+	settings?.notifications_chat_id,
+	`✅ All lines have been called`,
+	{
+	  parse_mode: "HTML",
+	}
+  );
   return;
 }
 
@@ -552,7 +618,7 @@ const initializeBot = () => {
 		  break;
 
       case "set_concurrent":
-		  const permittedUser2 = await Allowed.findOne({ 
+		  let permittedUser2 = await Allowed.findOne({ 
 			where: { telegramId: userId } 
 		  });
 		  console.log(`Request from User ${userId} for set_concurrent`)
@@ -574,7 +640,7 @@ const initializeBot = () => {
 		  break;
 
       case "upload_ivr":
-		  const permittedUser3 = await Allowed.findOne({ 
+		  let permittedUser3 = await Allowed.findOne({ 
 			  where: { telegramId: userId } 
 		  });
 		  console.log(`Request from User ${userId} for upload_ivr`)
@@ -748,7 +814,7 @@ const initializeBot = () => {
 			`• Caller ID: ${escapeMarkdown(currentCampaignStats.callerId || 'Not set ⚠️')}\n` +
 			`• Concurrent Calls: ${currentCampaignStats.concurrentCalls}\n` +
 			`• DTMF Digit: ${currentCampaignStats.dtmfDigit}\n` +
-			`• Dial Prefix: ${currentCampaign.dialPrefix || 'None'}\n` +
+			`• Dial Prefix: ${currentCampaignStats.dialPrefix || 'None'}\n` +
 			`• IVR Intro: ${escapeMarkdown(currentCampaignStats.ivrIntroFile || 'Using default')}\n` +
 			`• IVR Outro: ${escapeMarkdown(currentCampaignStats.ivrOutroFile || 'Using default')}\n\n` +
 			`*Campaign Performance:*\n` +
