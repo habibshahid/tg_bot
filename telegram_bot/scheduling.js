@@ -214,7 +214,34 @@ async function handleSchedulingCommands(bot, userStates) {
 	  return;
 	}
 	
-    // Handle scheduled campaign actions and IVR choices
+    if (callbackData.startsWith('cancel_sched_') || 
+		callbackData.startsWith('start_now_') || 
+		callbackData.startsWith('stop_sched_') || 
+		callbackData.startsWith('stats_')) {
+	  
+	  bot.answerCallbackQuery(query.id);
+	  
+	  const parts = callbackData.split('_');
+	  let action, campaignId;
+	  
+	  if (callbackData.startsWith('cancel_sched_')) {
+		action = 'cancel_sched';
+		campaignId = parts[2];
+	  } else if (callbackData.startsWith('start_now_')) {
+		action = 'start_now';
+		campaignId = parts[2];
+	  } else if (callbackData.startsWith('stop_sched_')) {
+		action = 'stop_sched';
+		campaignId = parts[2];
+	  } else if (callbackData.startsWith('stats_')) {
+		action = 'stats';
+		campaignId = parts[1];
+	  }
+	  
+	  await handleScheduledCampaignAction(bot, chatId, action, campaignId);
+	  return;
+	}
+
     if (callbackData.startsWith('sched_')) {
       bot.answerCallbackQuery(query.id);
       const parts = callbackData.split('_');
