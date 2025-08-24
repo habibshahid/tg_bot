@@ -30,46 +30,49 @@ class SimpleCampaignScheduler {
   }
 
   async checkScheduledCampaigns() {
-    const nowUTC = moment.utc();
-    
-    try {
-      // Find campaigns that should start
-      // Note: scheduledStart is stored in UTC, so we compare with UTC time
-      const campaignsToStart = await Campaign.findAll({
-        where: {
-          campaignStatus: 'scheduled',
-          scheduledStart: { [Op.lte]: nowUTC.toDate() }
-        },
-        include: [{ model: SipPeer, as: 'sipTrunk' }]
-      });
+	  // Use server's local time for comparison
+	  const nowServer = moment(); // This is in server's local timezone
+	  
+	  try {
+		// Find campaigns that should start
+		// The scheduledStart is stored in server's timezone
+		const campaignsToStart = await Campaign.findAll({
+		  where: {
+			campaignStatus: 'scheduled',
+			scheduledStart: { [Op.lte]: nowServer.toDate() }
+		  },
+		  include: [{ model: SipPeer, as: 'sipTrunk' }]
+		});
 
-      for (const campaign of campaignsToStart) {
-        // Log with timezone info
-        const startTimeInTz = moment.utc(campaign.scheduledStart).tz(campaign.timezone || 'UTC');
-        console.log(`Starting campaign "${campaign.campaignName}" - scheduled for ${startTimeInTz.format('YYYY-MM-DD HH:mm z')}`);
-        await this.startScheduledCampaign(campaign);
-      }
+		for (const campaign of campaignsToStart) {
+		  // Display time in user's original timezone for logging
+		  const userTz = campaign.timezone || moment.tz.guess();
+		  const startTimeInUserTz = moment(campaign.scheduledStart).tz(userTz);
+		  console.log(`Starting campaign "${campaign.campaignName}" - scheduled for ${startTimeInUserTz.format('YYYY-MM-DD HH:mm z')}`);
+		  await this.startScheduledCampaign(campaign);
+		}
 
-      // Find campaigns that should stop
-      const campaignsToStop = await Campaign.findAll({
-        where: {
-          campaignStatus: 'running',
-          scheduledEnd: { 
-            [Op.lte]: nowUTC.toDate(),
-            [Op.ne]: null 
-          }
-        }
-      });
+		// Find campaigns that should stop
+		const campaignsToStop = await Campaign.findAll({
+		  where: {
+			campaignStatus: 'running',
+			scheduledEnd: { 
+			  [Op.lte]: nowServer.toDate(),
+			  [Op.ne]: null 
+			}
+		  }
+		});
 
-      for (const campaign of campaignsToStop) {
-        const endTimeInTz = moment.utc(campaign.scheduledEnd).tz(campaign.timezone || 'UTC');
-        console.log(`Stopping campaign "${campaign.campaignName}" - end time ${endTimeInTz.format('YYYY-MM-DD HH:mm z')}`);
-        await this.stopScheduledCampaign(campaign);
-      }
-    } catch (error) {
-      console.error('Error in checkScheduledCampaigns:', error);
-    }
-  }
+		for (const campaign of campaignsToStop) {
+		  const userTz = campaign.timezone || moment.tz.guess();
+		  const endTimeInUserTz = moment(campaign.scheduledEnd).tz(userTz);
+		  console.log(`Stopping campaign "${campaign.campaignName}" - end time ${endTimeInUserTz.format('YYYY-MM-DD HH:mm z')}`);
+		  await this.stopScheduledCampaign(campaign);
+		}
+	  } catch (error) {
+		console.error('Error in checkScheduledCampaigns:', error);
+	  }
+	}
 
   async startScheduledCampaign(campaign) {
     try {
@@ -139,6 +142,7 @@ class SimpleCampaignScheduler {
         rawLine: c.rawLine
       })), campaign);
 
+	
       // Send notification with timezone info
       if (this.bot && campaign.notificationsChatId) {
         const displayTime = moment.utc(campaign.scheduledStart).tz(campaign.timezone || 'UTC');

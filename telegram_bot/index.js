@@ -91,49 +91,6 @@ async function convertAudioFile(inputPath, outputPath) {
   }
 }
 
-/*async function startCallingProcess(data, campaign) {
-  const concurrentCalls = campaign.concurrentCalls;
-
-  // Save all leads to database with campaign ID before starting
-  for (const entry of data) {
-    const phoneNumber = `+${sanitize_phoneNumber(entry.phoneNumber)}`;
-    
-    // Check if this number already exists for this campaign
-    const existingCall = await Call.findOne({
-      where: {
-        phoneNumber: phoneNumber,
-        campaignId: campaign.id
-      }
-    });
-    
-    if (!existingCall) {
-      await Call.create({
-        phoneNumber: phoneNumber,
-        rawLine: entry.rawLine,
-        used: false,
-        campaignId: campaign.id,
-        callStatus: 'pending'
-      });
-    }
-  }
-
-  await waitForConnection();
-
-  set_unprocessed_data(data);
-
-  const callPromises = [];
-
-  for (let i = 0; i < concurrentCalls; i++) {
-    const line = pop_unprocessed_line();
-    if (line) {
-      callPromises.push(require("../asterisk/call")(line));
-    }
-  }
-
-  await Promise.all(callPromises);
-  return;
-}*/
-
 async function startCallingProcess(data, campaign) {
   const concurrentCalls = campaign.concurrentCalls;
   const CALLS_PER_SECOND = 3; // Maximum 10 calls per second - adjust based on your asterisk server capacity

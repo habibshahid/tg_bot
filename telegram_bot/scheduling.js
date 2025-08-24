@@ -46,6 +46,7 @@ async function handleSchedulingCommands(bot, userStates) {
 		const timezone = callbackData.substring(3);
 		
 		if (timezone === 'custom') {
+		  // Handle custom timezone input
 		  bot.sendMessage(
 			chatId,
 			`📝 *Enter Custom Timezone*\n\n` +
@@ -66,21 +67,18 @@ async function handleSchedulingCommands(bot, userStates) {
 		  if (moment.tz.zone(timezone)) {
 			userState.scheduleData.timezone = timezone;
 			
-			// Get server info
-			const serverInfo = getServerTimezoneInfo();
-			
-			// Create moment objects in the selected timezone
-			// The times entered by user are in their selected timezone
+			// NOW interpret the times in the selected timezone
+			// Parse the string times AS IF they are in the selected timezone
 			const startInSelectedTz = moment.tz(
-			  moment(userState.scheduleData.startDatetime).format('YYYY-MM-DD HH:mm'),
+			  userState.scheduleData.startDatetimeString,
 			  'YYYY-MM-DD HH:mm',
 			  timezone
 			);
 			
 			let endInSelectedTz = null;
-			if (userState.scheduleData.endDatetime) {
+			if (userState.scheduleData.endDatetimeString) {
 			  endInSelectedTz = moment.tz(
-				moment(userState.scheduleData.endDatetime).format('YYYY-MM-DD HH:mm'),
+				userState.scheduleData.endDatetimeString,
 				'YYYY-MM-DD HH:mm',
 				timezone
 			  );
@@ -90,11 +88,18 @@ async function handleSchedulingCommands(bot, userStates) {
 			const startUTC = startInSelectedTz.clone().utc();
 			const endUTC = endInSelectedTz ? endInSelectedTz.clone().utc() : null;
 			
-			// Store both the original times and UTC times
+			// Store the UTC times
 			userState.scheduleData.startDatetimeUTC = startUTC.toDate();
 			userState.scheduleData.endDatetimeUTC = endUTC ? endUTC.toDate() : null;
 			
-			// Calculate server local time (considering server's actual timezone/offset)
+			// Also store the original times for reference
+			userState.scheduleData.startDatetime = startInSelectedTz.toDate();
+			userState.scheduleData.endDatetime = endInSelectedTz ? endInSelectedTz.toDate() : null;
+			
+			// Get server info
+			const serverInfo = getServerTimezoneInfo();
+			
+			// Calculate server local time for display
 			const serverNow = moment();
 			const startInServerTime = startUTC.clone().utcOffset(serverNow.utcOffset());
 			const endInServerTime = endUTC ? endUTC.clone().utcOffset(serverNow.utcOffset()) : null;
@@ -138,8 +143,6 @@ async function handleSchedulingCommands(bot, userStates) {
 			  } else {
 				confirmMsg += `${hours} hours, ${minutes} minutes`;
 			  }
-			} else {
-			  confirmMsg += `\n⚠️ *Note: Start time is in the past!*`;
 			}
 			
 			bot.sendMessage(chatId, confirmMsg, { parse_mode: 'Markdown' });
@@ -471,7 +474,7 @@ async function handleStartTimeInput(bot, msg, userState, userStates) {
   const userId = msg.from.id;
   const text = msg.text.trim();
   
-  // Parse the datetime
+  // Parse the datetime WITHOUT timezone interpretation
   const formats = [
     'YYYY-MM-DD HH:mm',
     'DD-MM-YYYY HH:mm',
@@ -500,38 +503,30 @@ async function handleStartTimeInput(bot, msg, userState, userStates) {
     return;
   }
   
-  // Check if time is in the past
-  if (startTime.isBefore(moment())) {
-    bot.sendMessage(
-      chatId,
-      `❌ Start time cannot be in the past.\n\n` +
-      `Please enter a future date/time.`,
-      { parse_mode: 'Markdown' }
-    );
-    return;
-  }
-  
-  userState.scheduleData.startDatetime = startTime.toDate();
+  // IMPORTANT: Store just the string, not a Date object
+  // This avoids any timezone interpretation at this stage
+  userState.scheduleData.startDatetimeString = text;
   userState.action = 'scheduling_end_time';
   
   bot.sendMessage(
     chatId,
-    `✅ Start time set: ${startTime.format('YYYY-MM-DD HH:mm')}\n\n` +
+    `✅ Start time set: ${text}\n\n` +
     `Step 4: Set End Time (Optional)\n\n` +
     `Enter end date/time (YYYY-MM-DD HH:MM) or type "skip" for no end time:`,
     { parse_mode: 'Markdown' }
   );
 }
 
+// ========== FIX 2: Update handleEndTimeInput similarly ==========
 async function handleEndTimeInput(bot, msg, userState, userStates) {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const text = msg.text.trim().toLowerCase();
   
   if (text === 'skip') {
-    userState.scheduleData.endDatetime = null;
+    userState.scheduleData.endDatetimeString = null;
   } else {
-    // Parse as moment without timezone first
+    // Parse to validate format only
     const endTime = moment(text, 'YYYY-MM-DD HH:mm', true);
     
     if (!endTime.isValid()) {
@@ -544,19 +539,8 @@ async function handleEndTimeInput(bot, msg, userState, userStates) {
       return;
     }
     
-    // Check if end time is after start time (both in same timezone for now)
-    if (endTime.isSameOrBefore(moment(userState.scheduleData.startDatetime))) {
-      bot.sendMessage(
-        chatId,
-        `❌ End time must be after start time.\n\n` +
-        `Start: ${moment(userState.scheduleData.startDatetime).format('YYYY-MM-DD HH:mm')}\n` +
-        `Please enter a valid end time:`,
-        { parse_mode: 'Markdown' }
-      );
-      return;
-    }
-    
-    userState.scheduleData.endDatetime = endTime.toDate();
+    // Store as string
+    userState.scheduleData.endDatetimeString = text;
   }
   
   // Move to timezone selection
@@ -578,8 +562,8 @@ async function handleEndTimeInput(bot, msg, userState, userStates) {
     `✅ Times set!\n\n` +
     `⏰ *Step 5: Select Timezone*\n\n` +
     `Your scheduled times:\n` +
-    `Start: ${moment(userState.scheduleData.startDatetime).format('YYYY-MM-DD HH:mm')}\n` +
-    `${userState.scheduleData.endDatetime ? `End: ${moment(userState.scheduleData.endDatetime).format('YYYY-MM-DD HH:mm')}` : 'No end time'}\n\n` +
+    `Start: ${userState.scheduleData.startDatetimeString}\n` +
+    `${userState.scheduleData.endDatetimeString ? `End: ${userState.scheduleData.endDatetimeString}` : 'No end time'}\n\n` +
     `In which timezone are these times?`,
     { 
       parse_mode: 'Markdown',
@@ -597,11 +581,13 @@ async function completeScheduling(bot, chatId, userId, userState, userStates) {
     const campaign = await Campaign.findByPk(userState.campaignId);
     
     // Update the campaign with scheduling data
+    // USE THE UTC TIMES that were calculated when timezone was selected
     await campaign.update({
       campaignName: scheduleData.name,
       campaignStatus: 'scheduled',
-      scheduledStart: scheduleData.startDatetime,  // THIS IS WRONG - should use UTC times
-      scheduledEnd: scheduleData.endDatetime,
+      scheduledStart: scheduleData.startDatetimeUTC,  // Use UTC time
+      scheduledEnd: scheduleData.endDatetimeUTC,      // Use UTC time
+      timezone: scheduleData.timezone,                // Store the user's timezone
       numbersList: scheduleData.numbersList,
       sipTrunkId: scheduleData.sipTrunkId,
       callerId: scheduleData.callerId,
@@ -616,42 +602,38 @@ async function completeScheduling(bot, chatId, userId, userState, userStates) {
     
     const trunk = await SipPeer.findByPk(scheduleData.sipTrunkId);
     
+    // Display confirmation in user's timezone
+    const startInUserTz = moment.utc(scheduleData.startDatetimeUTC).tz(scheduleData.timezone);
+    const endInUserTz = scheduleData.endDatetimeUTC ? 
+      moment.utc(scheduleData.endDatetimeUTC).tz(scheduleData.timezone) : null;
+    
     bot.sendMessage(
       chatId,
       `✅ *Campaign Scheduled Successfully!*\n\n` +
-      `📋 *Details:*\n` +
-      `Name: ${escapeMarkdown(scheduleData.name)}\n` +
-      `Numbers: ${scheduleData.totalNumbers}\n` +
-      `SIP Trunk: ${escapeMarkdown(trunk.name)}\n` +
-      `Caller ID: ${escapeMarkdown(scheduleData.callerId)}\n` +
-      `DTMF Digit: ${scheduleData.dtmfDigit}\n` +
-      `Concurrent Calls: ${scheduleData.concurrentCalls}\n` +
-      `${scheduleData.dialPrefix ? `Dial Prefix: ${scheduleData.dialPrefix}\n` : ''}` +
-      `\n📅 *Schedule:*\n` +
-      `Start: ${moment(scheduleData.startDatetime).format('YYYY-MM-DD HH:mm')}\n` +  // THIS DOESN'T SHOW TIMEZONE
-      `${scheduleData.endDatetime ? `End: ${moment(scheduleData.endDatetime).format('YYYY-MM-DD HH:mm')}` : 'No end time set'}\n` +
-      `\nThe campaign will start automatically at the scheduled time.`,
-      { 
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '📋 View Scheduled Campaigns', callback_data: 'manage_scheduled' }],
-            [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
-          ]
-        }
-      }
+      `📌 *Campaign Name:* ${escapeMarkdown(scheduleData.name)}\n` +
+      `🌍 *Timezone:* ${scheduleData.timezone}\n` +
+      `⏰ *Start Time:* ${startInUserTz.format('YYYY-MM-DD HH:mm z')}\n` +
+      `${endInUserTz ? `⏱️ *End Time:* ${endInUserTz.format('YYYY-MM-DD HH:mm z')}\n` : ''}` +
+      `📞 *Numbers:* ${scheduleData.numbersList.length}\n` +
+      `🔊 *SIP Trunk:* ${escapeMarkdown(trunk.name)}\n` +
+      `📱 *Caller ID:* ${scheduleData.callerId}\n` +
+      `⚡ *Concurrent Calls:* ${scheduleData.concurrentCalls}\n` +
+      `${scheduleData.dtmfDigit ? `🔢 *DTMF Digit:* ${scheduleData.dtmfDigit}\n` : ''}` +
+      `${scheduleData.dialPrefix ? `➕ *Dial Prefix:* ${scheduleData.dialPrefix}\n` : ''}` +
+      `\n📊 Campaign will start automatically at the scheduled time.`,
+      { parse_mode: 'Markdown' }
     );
     
+    // Clear user state
     delete userStates[userId];
     
   } catch (error) {
-    console.error('Error scheduling campaign:', error);
+    console.error('Error completing scheduling:', error);
     bot.sendMessage(
       chatId,
-      `❌ Error scheduling campaign: ${escapeMarkdown(error.message)}`,
+      `❌ Error scheduling campaign: ${error.message}`,
       { parse_mode: 'Markdown' }
     );
-    delete userStates[userId];
   }
 }
 

@@ -7,9 +7,10 @@ exports.sanitize_phoneNumber = (phoneNumber) => {
   let cleaned = phoneNumber.trim().replace(/\D/g, "");
 
   // Check if the number starts with a '+' and remove it
-  if (phoneNumber.startsWith("+")) {
+  if (cleaned.startsWith("+")) {
     cleaned = cleaned.slice(1);
   }
+
   /*
   // If it's a 10-digit number, add the country code '1'
   if (cleaned.length === 10) {
