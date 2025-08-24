@@ -20,6 +20,8 @@ const sequelize = require("../config/database");
 const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
+const simpleCampaignScheduler = require('../services/simpleCampaignScheduler');
+const { handleSchedulingCommands, showScheduledCampaigns } = require('./scheduling');
 
 
 // State management for user interactions
@@ -484,11 +486,23 @@ async function validateSipTrunk(trunkId) {
   return { valid: true, trunk: trunk };
 }
 
+function stopCallingProcess() {
+  // This should stop the current dialing process
+  // Implementation depends on your existing calling logic
+  if (global.callingInterval) {
+    clearInterval(global.callingInterval);
+    global.callingInterval = null;
+  }
+  console.log('Calling process stopped');
+}
+
 // Initialize Telegram Bot
 const initializeBot = () => {
   const bot = start_bot_instance();
   const adminId = config.creator_telegram_id;
-
+  simpleCampaignScheduler.initialize(bot);
+  console.log('Campaign scheduler initialized with bot');
+  handleSchedulingCommands(bot, userStates);
   // Main menu - Updated with Caller ID option
   const mainMenu = {
 	  reply_markup: {
@@ -496,6 +510,10 @@ const initializeBot = () => {
 		  [
 			{ text: "🚀 Start Campaign", callback_data: "start_campaign" },
 			{ text: "📊 Check Call Status", callback_data: "call_status" }
+		  ],
+		  [
+			{ text: "📅 Schedule Campaign", callback_data: "schedule_campaign" },
+			{ text: "📋 Manage Scheduled", callback_data: "manage_scheduled" }
 		  ],
 		  [
 			{ text: "🆔 Get Your ID", callback_data: "get_id" },
@@ -980,6 +998,8 @@ const initializeBot = () => {
           { parse_mode: "Markdown" }
         );
         break;
+
+	  
 
       case "set_sip":
 		  let permittedUser4 = await Allowed.findOne({ 
@@ -1805,6 +1825,92 @@ const initializeBot = () => {
 			  break;
 
 			
+		  case "scheduling_ivr_intro":
+			case "scheduling_ivr_outro":
+			  console.log('[Scheduling IVR] Processing IVR file for scheduling');
+			  console.log('[Scheduling IVR] Type:', userState.action);
+			  
+			  // Check file extension
+			  if (!fileName.toLowerCase().match(/\.(wav|mp3|mp4|m4a|aac|ogg|flac)$/)) {
+				bot.sendMessage(chatId, "❌ Please upload an audio file (WAV, MP3, MP4, M4A, AAC, OGG, or FLAC).");
+				return;
+			  }
+			  
+			  // Sanitize filename
+			  const ivrType = userState.action.includes('intro') ? 'intro' : 'outro';
+			  const timestamp = Date.now();
+			  const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+			  const ivrFileNameSchedule = `sched_${ivrType}_${timestamp}_${sanitizedFileName}.wav`;
+			  
+			  console.log('[Scheduling IVR] Saving as:', ivrFileNameSchedule);
+			  
+			  // Paths
+			  const soundsPathSchedule = "/var/lib/asterisk/sounds/";
+			  const tempPathSchedule = `/tmp/${timestamp}_${fileName}`;
+			  const finalPathSchedule = path.join(soundsPathSchedule, ivrFileNameSchedule);
+			  
+			  try {
+				// Save uploaded file temporarily
+				fs.writeFileSync(tempPathSchedule, fileBuffer);
+				console.log('[Scheduling IVR] Temp file saved');
+				
+				bot.sendMessage(chatId, "🔄 Converting audio file to Asterisk format...");
+				
+				// Convert audio to proper format (assuming convertAudioFile function exists)
+				await convertAudioFile(tempPathSchedule, finalPathSchedule);
+				console.log('[Scheduling IVR] Audio converted');
+				
+				// Clean up temp file
+				if (fs.existsSync(tempPathSchedule)) {
+				  fs.unlinkSync(tempPathSchedule);
+				}
+				
+				// Store the filename in schedule data
+				if (ivrType === 'intro') {
+				  userState.scheduleData.ivrIntroFile = ivrFileNameSchedule;
+				  
+				  // Ask if they want to upload outro
+				  bot.sendMessage(
+					chatId,
+					`✅ Intro IVR uploaded successfully!\n\n` +
+					`Would you like to upload an outro IVR file?`,
+					{ 
+					  parse_mode: 'Markdown',
+					  reply_markup: {
+						inline_keyboard: [
+						  [{ text: '📤 Upload Outro IVR', callback_data: 'sched_ivr_outro' }],
+						  [{ text: '✅ Done with IVR', callback_data: 'sched_ivr_done' }]
+						]
+					  }
+					}
+				  );
+				  userState.action = 'scheduling_ivr_choice';
+				} else {
+				  userState.scheduleData.ivrOutroFile = ivrFileNameSchedule;
+				  
+				  // Both IVR files uploaded or just outro, complete scheduling
+				  bot.sendMessage(
+					chatId,
+					`✅ Outro IVR uploaded successfully!\n\n` +
+					`Finalizing campaign schedule...`,
+					{ parse_mode: 'Markdown' }
+				  );
+				  
+				  // Import the function from scheduling module
+				  const { completeScheduling } = require('./scheduling');
+				  await completeScheduling(bot, chatId, userId, userState, userStates);
+				}
+				
+			  } catch (err) {
+				console.error('[Scheduling IVR] Processing error:', err);
+				// Clean up temp file if exists
+				if (fs.existsSync(tempPathSchedule)) {
+				  fs.unlinkSync(tempPathSchedule);
+				}
+				bot.sendMessage(chatId, `❌ Failed to process IVR file: ${err.message}`);
+			  }
+			  break;
+			  
 		  case "waiting_ivr_file":
 			console.log('[IVR] Processing IVR file');
 			console.log('[IVR] File type:', msg.audio ? 'audio' : 'document');
@@ -1878,7 +1984,83 @@ const initializeBot = () => {
 			  bot.sendMessage(chatId, `❌ Failed to process IVR file: ${err.message}`);
 			}
 			break;
-			
+		
+		  case "scheduling_numbers":
+        // Handle scheduling numbers upload
+        console.log('[Scheduling] Processing numbers file for scheduling');
+        
+        if (!fileName.endsWith('.txt')) {
+          bot.sendMessage(chatId, "❌ Please upload a TXT file.");
+          return;
+        }
+        
+        // Parse the file
+        const lines = fileBuffer.toString().split('\n');
+        const numbers = [];
+        
+        for (const line of lines) {
+          const cleaned = line.trim().replace(/[^0-9+]/g, '');
+          if (cleaned) {
+            numbers.push({
+              phoneNumber: cleaned.startsWith('+') ? cleaned : '+' + cleaned,
+              rawLine: line.trim()
+            });
+          }
+        }
+        
+        if (numbers.length === 0) {
+          bot.sendMessage(chatId, `❌ No valid phone numbers found in file.`);
+          return;
+        }
+        
+        userState.scheduleData.numbersList = numbers;
+        userState.scheduleData.totalNumbers = numbers.length;
+        
+        // Get SIP trunks
+        const sipTrunks = await SipPeer.findAll({
+          where: { 
+            category: 'trunk',
+            status: 1
+          },
+          order: [['id', 'ASC']]
+        });
+        
+        if (sipTrunks.length === 0) {
+          bot.sendMessage(
+            chatId,
+            `❌ No active SIP trunks found. Please configure a SIP trunk first.`,
+            { parse_mode: 'Markdown' }
+          );
+          delete userStates[userId];
+          return;
+        }
+        
+        // Show SIP trunk selection
+        const keyboard = {
+          inline_keyboard: sipTrunks.map(trunk => [{
+            text: `${escapeMarkdown(trunk.name)} (${escapeMarkdown(trunk.host)})`,
+            callback_data: `sched_trunk_${trunk.id}`
+          }])
+        };
+        
+        bot.sendMessage(
+          chatId,
+          `✅ *Loaded ${numbers.length} phone numbers*\n\n` +
+          `Step 2: Select SIP Trunk\n\n` +
+          `Choose the SIP trunk to use:`,
+          { 
+            parse_mode: 'Markdown',
+            reply_markup: keyboard
+          }
+        );
+        
+        userState.sipTrunks = sipTrunks;
+        userState.action = 'scheduling_sip_selection';
+        
+        console.log(`[Scheduling] Numbers loaded: ${numbers.length}, moving to SIP selection`);
+        break;
+
+    
 		  default:
 			console.log(`[File] Unknown action: ${userState.action}`);
 			bot.sendMessage(chatId, "❌ Unknown action. Please try again from the menu.");
@@ -2076,4 +2258,8 @@ bot.onText(/\/reset/, async (msg) => {
 
 };
 
-module.exports = { initializeBot };
+module.exports = { 
+	initializeBot,
+	startCallingProcess: startCallingProcess || function() {},
+	stopCallingProcess 
+};
