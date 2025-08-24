@@ -60,6 +60,11 @@ const Call = sequelize.define('Call', {
     defaultValue: 'pending',
     field: 'call_status'
   },
+  voicemail: {
+    type: DataTypes.ENUM('yes', 'no'),
+    defaultValue: 'no',
+    field: 'voicemail'
+  },
   createdAt: {
     type: DataTypes.DATE,
     defaultValue: DataTypes.NOW,

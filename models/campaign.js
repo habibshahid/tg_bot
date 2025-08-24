@@ -92,6 +92,11 @@ const Campaign = sequelize.define('Campaign', {
     defaultValue: 0,
     field: 'failed_calls'
   },
+  voicemailCalls: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    field: 'voicemail_calls'
+  },
   dtmfResponses: {
     type: DataTypes.INTEGER,
     defaultValue: 0,

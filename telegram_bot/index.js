@@ -431,9 +431,10 @@ async function getCallStats(campaignId = null) {
         total: campaign.totalCalls,
         successful: campaign.successfulCalls,
         failed: campaign.failedCalls,
+		voicemail: campaign.voicemailCalls,
         dtmf_responses: campaign.dtmfResponses,
-        success_rate: campaign.totalCalls > 0 ? ((campaign.successfulCalls / campaign.totalCalls) * 100).toFixed(2) : 0,
-        response_rate: campaign.successfulCalls > 0 ? ((campaign.dtmfResponses / campaign.successfulCalls) * 100).toFixed(2) : 0
+        success_rate: campaign.totalCalls > 0 ? (((campaign.successfulCalls) / campaign.totalCalls) * 100).toFixed(2) : 0,
+        response_rate: campaign.successfulCalls > 0 ? ((campaign.dtmfResponses / (campaign.successfulCalls )) * 100).toFixed(2) : 0
       };
     }
   }
@@ -836,6 +837,7 @@ const initializeBot = () => {
 			`Total Calls Made: ${stats.total || 0}\n` +
 			`Successful Calls: ${stats.successful || 0}\n` +
 			`Failed Calls: ${stats.failed || 0}\n` +
+			`Voicemail Calls: ${stats.voicemail || 0}\n` +
 			`DTMF Responses (${currentCampaign.dtmfDigit || '1'}): ${stats.dtmf_responses || 0}\n` +
 			`Call Success Rate: ${stats.success_rate || 0}%\n` +
 			`Response Rate: ${stats.response_rate || 0}%\n\n` +
@@ -1121,6 +1123,7 @@ const initializeBot = () => {
 			`• Total Calls: ${currentCampaignStats.totalCalls}\n` +
 			`• Successful: ${currentCampaignStats.successfulCalls}\n` +
 			`• Failed: ${currentCampaignStats.failedCalls}\n` +
+			`• Voicemail: ${currentCampaignStats.voicemailCalls}\n` +
 			`• DTMF Responses: ${currentCampaignStats.dtmfResponses}\n` +
 			`• Success Rate: ${currentCampaignStats.totalCalls > 0 ? ((currentCampaignStats.successfulCalls / currentCampaignStats.totalCalls) * 100).toFixed(2) : 0}%\n` +
 			`• Response Rate: ${currentCampaignStats.successfulCalls > 0 ? ((currentCampaignStats.dtmfResponses / currentCampaignStats.successfulCalls) * 100).toFixed(2) : 0}%`,
@@ -1629,6 +1632,7 @@ const initializeBot = () => {
 				totalCalls: 0,
 				successfulCalls: 0,
 				failedCalls: 0,
+				voicemailCalls: 0,
 				dtmfResponses: 0,
 				callCounter: 0
 			  });
@@ -1728,6 +1732,7 @@ const initializeBot = () => {
 				  totalCalls: 0,
 				  successfulCalls: 0,
 				  failedCalls: 0,
+				  voicemailCalls: 0,
 				  dtmfResponses: 0,
 				  callCounter: 0
 				});
@@ -2013,6 +2018,7 @@ bot.onText(/\/stats/, async (msg) => {
     message += `├ Total Calls: ${stats.total}\n`;
     message += `├ Successful: ${stats.successful}\n`;
     message += `├ Failed: ${stats.failed}\n`;
+	message += `├ Voicemail: ${stats.voicemail}\n`;
     message += `├ DTMF (${campaign.dtmfDigit}): ${stats.dtmf_responses}\n`;
     message += `├ Success Rate: ${stats.success_rate}%\n`;
     message += `└ Response Rate: ${stats.response_rate}%\n\n`;
@@ -2048,6 +2054,7 @@ bot.onText(/\/reset/, async (msg) => {
       totalCalls: 0,
       successfulCalls: 0,
       failedCalls: 0,
+	  voicemailCalls: 0,
       dtmfResponses: 0,
       callCounter: 0
     });
