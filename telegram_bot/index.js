@@ -500,6 +500,7 @@ function stopCallingProcess() {
 const initializeBot = () => {
   const bot = start_bot_instance();
   const adminId = config.creator_telegram_id;
+  
   simpleCampaignScheduler.initialize(bot);
   console.log('Campaign scheduler initialized with bot');
   handleSchedulingCommands(bot, userStates);

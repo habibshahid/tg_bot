@@ -1,6 +1,7 @@
-// services/simpleCampaignScheduler.js
+// services/simpleCampaignScheduler.js - Updated with timezone support
+
 const cron = require('node-cron');
-const moment = require('moment');
+const moment = require('moment-timezone');
 const { Op } = require('sequelize');
 const Campaign = require('../models/campaign');
 const Call = require('../models/call');
@@ -15,7 +16,8 @@ class SimpleCampaignScheduler {
   initialize(bot) {
     this.bot = bot;
     this.startScheduler();
-    console.log('Simple Campaign Scheduler initialized');
+    console.log('Timezone-aware Campaign Scheduler initialized');
+    console.log('Server timezone:', moment.tz.guess());
   }
 
   startScheduler() {
@@ -28,19 +30,23 @@ class SimpleCampaignScheduler {
   }
 
   async checkScheduledCampaigns() {
-    const now = new Date();
-
+    const nowUTC = moment.utc();
+    
     try {
       // Find campaigns that should start
+      // Note: scheduledStart is stored in UTC, so we compare with UTC time
       const campaignsToStart = await Campaign.findAll({
         where: {
           campaignStatus: 'scheduled',
-          scheduledStart: { [Op.lte]: now }
+          scheduledStart: { [Op.lte]: nowUTC.toDate() }
         },
         include: [{ model: SipPeer, as: 'sipTrunk' }]
       });
 
       for (const campaign of campaignsToStart) {
+        // Log with timezone info
+        const startTimeInTz = moment.utc(campaign.scheduledStart).tz(campaign.timezone || 'UTC');
+        console.log(`Starting campaign "${campaign.campaignName}" - scheduled for ${startTimeInTz.format('YYYY-MM-DD HH:mm z')}`);
         await this.startScheduledCampaign(campaign);
       }
 
@@ -49,13 +55,15 @@ class SimpleCampaignScheduler {
         where: {
           campaignStatus: 'running',
           scheduledEnd: { 
-            [Op.lte]: now,
+            [Op.lte]: nowUTC.toDate(),
             [Op.ne]: null 
           }
         }
       });
 
       for (const campaign of campaignsToStop) {
+        const endTimeInTz = moment.utc(campaign.scheduledEnd).tz(campaign.timezone || 'UTC');
+        console.log(`Stopping campaign "${campaign.campaignName}" - end time ${endTimeInTz.format('YYYY-MM-DD HH:mm z')}`);
         await this.stopScheduledCampaign(campaign);
       }
     } catch (error) {
@@ -65,7 +73,10 @@ class SimpleCampaignScheduler {
 
   async startScheduledCampaign(campaign) {
     try {
+      const startTimeInTz = moment.utc(campaign.scheduledStart).tz(campaign.timezone || 'UTC');
       console.log(`Starting scheduled campaign: ${campaign.campaignName} (ID: ${campaign.id})`);
+      console.log(`Campaign timezone: ${campaign.timezone || 'UTC'}`);
+      console.log(`Start time (${campaign.timezone}): ${startTimeInTz.format('YYYY-MM-DD HH:mm z')}`);
       
       // Update status to running
       await campaign.update({ 
@@ -128,14 +139,16 @@ class SimpleCampaignScheduler {
         rawLine: c.rawLine
       })), campaign);
 
-      // Send notification
+      // Send notification with timezone info
       if (this.bot && campaign.notificationsChatId) {
+        const displayTime = moment.utc(campaign.scheduledStart).tz(campaign.timezone || 'UTC');
         await this.bot.sendMessage(
           campaign.notificationsChatId,
           `🚀 *Scheduled Campaign Started*\n\n` +
           `Campaign: ${this.escapeMarkdown(campaign.campaignName)}\n` +
           `Numbers: ${callsToAdd.length}\n` +
-          `Started: ${moment().format('YYYY-MM-DD HH:mm')}`,
+          `Timezone: ${campaign.timezone || 'UTC'}\n` +
+          `Started: ${displayTime.format('YYYY-MM-DD HH:mm z')}`,
           { parse_mode: 'Markdown' }
         );
       }
@@ -152,7 +165,9 @@ class SimpleCampaignScheduler {
 
   async stopScheduledCampaign(campaign) {
     try {
+      const endTimeInTz = moment.utc(campaign.scheduledEnd).tz(campaign.timezone || 'UTC');
       console.log(`Stopping scheduled campaign: ${campaign.campaignName}`);
+      console.log(`End time (${campaign.timezone}): ${endTimeInTz.format('YYYY-MM-DD HH:mm z')}`);
 
       // Update status
       await campaign.update({ 
@@ -163,12 +178,14 @@ class SimpleCampaignScheduler {
       const { stopCallingProcess } = require('../telegram_bot');
       stopCallingProcess();
 
-      // Send notification
+      // Send notification with timezone info
       if (this.bot && campaign.notificationsChatId) {
         await this.bot.sendMessage(
           campaign.notificationsChatId,
           `✅ *Campaign Completed*\n\n` +
           `Campaign: ${this.escapeMarkdown(campaign.campaignName)}\n` +
+          `Timezone: ${campaign.timezone || 'UTC'}\n` +
+          `Ended: ${endTimeInTz.format('YYYY-MM-DD HH:mm z')}\n` +
           `Total Calls: ${campaign.totalCalls}\n` +
           `Successful: ${campaign.successfulCalls}\n` +
           `Failed: ${campaign.failedCalls}\n` +

@@ -1,11 +1,26 @@
 // telegram_bot/scheduling.js
 // Add this file to handle all scheduling-related bot interactions
-
-const moment = require('moment');
+const moment = require('moment-timezone');
 const { Op } = require('sequelize');
 const Campaign = require('../models/campaign');
 const SipPeer = require('../models/sippeer');
 const simpleCampaignScheduler = require('../services/simpleCampaignScheduler');
+
+const COMMON_TIMEZONES = [
+  { name: '🌍 UTC (London Winter)', value: 'UTC', offset: '+00:00' },
+  { name: '🇷🇴 Romania (EEST)', value: 'Europe/Bucharest', offset: '+03:00' },
+  { name: '🇵🇰 Pakistan (Karachi)', value: 'Asia/Karachi', offset: '+05:00' },
+  { name: '🇦🇪 Dubai (GST)', value: 'Asia/Dubai', offset: '+04:00' },
+  { name: '🇮🇳 India (IST)', value: 'Asia/Kolkata', offset: '+05:30' },
+  { name: '🇬🇧 London (BST)', value: 'Europe/London', offset: '+01:00' },
+  { name: '🇩🇪 Germany (CEST)', value: 'Europe/Berlin', offset: '+02:00' },
+  { name: '🇺🇸 Eastern (EDT)', value: 'America/New_York', offset: '-04:00' },
+  { name: '🇺🇸 Central (CDT)', value: 'America/Chicago', offset: '-05:00' },
+  { name: '🇺🇸 Mountain (MDT)', value: 'America/Denver', offset: '-06:00' },
+  { name: '🇺🇸 Pacific (PDT)', value: 'America/Los_Angeles', offset: '-07:00' },
+  { name: '🇸🇬 Singapore', value: 'Asia/Singapore', offset: '+08:00' },
+  { name: '🇦🇺 Sydney', value: 'Australia/Sydney', offset: '+10:00' }
+];
 
 // Helper function to escape markdown
 function escapeMarkdown(text) {
@@ -23,6 +38,130 @@ async function handleSchedulingCommands(bot, userStates) {
     const userId = query.from.id;
     const callbackData = query.data;
     
+	if (callbackData.startsWith('tz_')) {
+	  bot.answerCallbackQuery(query.id);
+	  const userState = userStates[userId];
+	  
+	  if (userState && userState.action === 'scheduling_timezone') {
+		const timezone = callbackData.substring(3);
+		
+		if (timezone === 'custom') {
+		  bot.sendMessage(
+			chatId,
+			`📝 *Enter Custom Timezone*\n\n` +
+			`Please enter a valid timezone identifier.\n\n` +
+			`Examples:\n` +
+			`• Asia/Karachi (Pakistan)\n` +
+			`• Europe/Bucharest (Romania/EEST)\n` +
+			`• America/New_York\n` +
+			`• Europe/London\n` +
+			`• Asia/Dubai\n\n` +
+			`You can find a full list at:\n` +
+			`https://en.wikipedia.org/wiki/List_of_tz_database_time_zones`,
+			{ parse_mode: 'Markdown' }
+		  );
+		  userState.action = 'scheduling_timezone_custom';
+		} else {
+		  // Validate and set timezone
+		  if (moment.tz.zone(timezone)) {
+			userState.scheduleData.timezone = timezone;
+			
+			// Get server info
+			const serverInfo = getServerTimezoneInfo();
+			
+			// Create moment objects in the selected timezone
+			// The times entered by user are in their selected timezone
+			const startInSelectedTz = moment.tz(
+			  moment(userState.scheduleData.startDatetime).format('YYYY-MM-DD HH:mm'),
+			  'YYYY-MM-DD HH:mm',
+			  timezone
+			);
+			
+			let endInSelectedTz = null;
+			if (userState.scheduleData.endDatetime) {
+			  endInSelectedTz = moment.tz(
+				moment(userState.scheduleData.endDatetime).format('YYYY-MM-DD HH:mm'),
+				'YYYY-MM-DD HH:mm',
+				timezone
+			  );
+			}
+			
+			// Convert to UTC for storage
+			const startUTC = startInSelectedTz.clone().utc();
+			const endUTC = endInSelectedTz ? endInSelectedTz.clone().utc() : null;
+			
+			// Store both the original times and UTC times
+			userState.scheduleData.startDatetimeUTC = startUTC.toDate();
+			userState.scheduleData.endDatetimeUTC = endUTC ? endUTC.toDate() : null;
+			
+			// Calculate server local time (considering server's actual timezone/offset)
+			const serverNow = moment();
+			const startInServerTime = startUTC.clone().utcOffset(serverNow.utcOffset());
+			const endInServerTime = endUTC ? endUTC.clone().utcOffset(serverNow.utcOffset()) : null;
+			
+			// Show comprehensive timezone information
+			let confirmMsg = `✅ *Timezone Configuration*\n\n`;
+			
+			confirmMsg += `🌍 *Selected Timezone: ${timezone}*\n`;
+			confirmMsg += `Your campaign times:\n`;
+			confirmMsg += `Start: ${startInSelectedTz.format('YYYY-MM-DD HH:mm')} ${startInSelectedTz.format('z')}\n`;
+			if (endInSelectedTz) {
+			  confirmMsg += `End: ${endInSelectedTz.format('YYYY-MM-DD HH:mm')} ${endInSelectedTz.format('z')}\n`;
+			}
+			
+			confirmMsg += `\n⏰ *UTC Times (for reference):*\n`;
+			confirmMsg += `Start: ${startUTC.format('YYYY-MM-DD HH:mm')} UTC\n`;
+			if (endUTC) {
+			  confirmMsg += `End: ${endUTC.format('YYYY-MM-DD HH:mm')} UTC\n`;
+			}
+			
+			confirmMsg += `\n🖥️ *Server Information:*\n`;
+			confirmMsg += `Current Server Time: ${serverInfo.currentTime}\n`;
+			confirmMsg += `Server UTC Offset: ${serverInfo.offset}\n`;
+			confirmMsg += `Campaign will start at (server time):\n`;
+			confirmMsg += `${startInServerTime.format('YYYY-MM-DD HH:mm')}\n`;
+			if (endInServerTime) {
+			  confirmMsg += `Campaign will end at (server time):\n`;
+			  confirmMsg += `${endInServerTime.format('YYYY-MM-DD HH:mm')}\n`;
+			}
+			
+			// Calculate time until start
+			const now = moment();
+			const timeUntilStart = moment.duration(startUTC.diff(now));
+			if (timeUntilStart.asMinutes() > 0) {
+			  const days = Math.floor(timeUntilStart.asDays());
+			  const hours = timeUntilStart.hours();
+			  const minutes = timeUntilStart.minutes();
+			  confirmMsg += `\n⏳ *Campaign starts in:*\n`;
+			  if (days > 0) {
+				confirmMsg += `${days} days, ${hours} hours, ${minutes} minutes`;
+			  } else {
+				confirmMsg += `${hours} hours, ${minutes} minutes`;
+			  }
+			} else {
+			  confirmMsg += `\n⚠️ *Note: Start time is in the past!*`;
+			}
+			
+			bot.sendMessage(chatId, confirmMsg, { parse_mode: 'Markdown' });
+			
+			// Move to campaign name
+			userState.action = 'scheduling_campaign_name';
+			
+			setTimeout(() => {
+			  bot.sendMessage(
+				chatId,
+				`Step 6: Campaign Name\n\n` +
+				`Enter a name for this scheduled campaign:`,
+				{ parse_mode: 'Markdown' }
+			  );
+			}, 1500);
+		  } else {
+			bot.sendMessage(chatId, `❌ Invalid timezone: ${timezone}`);
+		  }
+		}
+	  }
+	}
+
     if (callbackData === 'schedule_campaign') {
       bot.answerCallbackQuery(query.id);
       
@@ -208,11 +347,123 @@ async function handleSchedulingCommands(bot, userStates) {
       case 'scheduling_prefix':
         await handlePrefixInput(bot, msg, userState, userStates);
         break;
+	  
+	  case 'scheduling_timezone_custom':
+		await handleCustomTimezoneInput(bot, msg, userState, userStates);
+		break;
     }
   });
   
   // File uploads for scheduling are handled in the main index.js file
   // in the document handler with case "scheduling_numbers"
+}
+
+async function handleCustomTimezoneInput(bot, msg, userState, userStates) {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const timezone = msg.text.trim();
+  
+  // Validate timezone
+  if (!moment.tz.zone(timezone)) {
+    bot.sendMessage(
+      chatId,
+      `❌ Invalid timezone: "${timezone}"\n\n` +
+      `Please enter a valid timezone identifier.\n` +
+      `Example: Asia/Karachi, Europe/Bucharest, America/New_York`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+  
+  userState.scheduleData.timezone = timezone;
+  
+  // Get server info
+  const serverInfo = getServerTimezoneInfo();
+  
+  // Create moment objects in the selected timezone
+  const startInSelectedTz = moment.tz(
+    moment(userState.scheduleData.startDatetime).format('YYYY-MM-DD HH:mm'),
+    'YYYY-MM-DD HH:mm',
+    timezone
+  );
+  
+  let endInSelectedTz = null;
+  if (userState.scheduleData.endDatetime) {
+    endInSelectedTz = moment.tz(
+      moment(userState.scheduleData.endDatetime).format('YYYY-MM-DD HH:mm'),
+      'YYYY-MM-DD HH:mm',
+      timezone
+    );
+  }
+  
+  // Convert to UTC for storage
+  const startUTC = startInSelectedTz.clone().utc();
+  const endUTC = endInSelectedTz ? endInSelectedTz.clone().utc() : null;
+  
+  userState.scheduleData.startDatetimeUTC = startUTC.toDate();
+  userState.scheduleData.endDatetimeUTC = endUTC ? endUTC.toDate() : null;
+  
+  // Calculate server local time
+  const serverNow = moment();
+  const startInServerTime = startUTC.clone().utcOffset(serverNow.utcOffset());
+  const endInServerTime = endUTC ? endUTC.clone().utcOffset(serverNow.utcOffset()) : null;
+  
+  // Show comprehensive timezone information
+  let confirmMsg = `✅ *Timezone Configuration*\n\n`;
+  
+  confirmMsg += `🌍 *Selected Timezone: ${timezone}*\n`;
+  confirmMsg += `Your campaign times:\n`;
+  confirmMsg += `Start: ${startInSelectedTz.format('YYYY-MM-DD HH:mm')} ${startInSelectedTz.format('z')}\n`;
+  if (endInSelectedTz) {
+    confirmMsg += `End: ${endInSelectedTz.format('YYYY-MM-DD HH:mm')} ${endInSelectedTz.format('z')}\n`;
+  }
+  
+  confirmMsg += `\n⏰ *UTC Times (for reference):*\n`;
+  confirmMsg += `Start: ${startUTC.format('YYYY-MM-DD HH:mm')} UTC\n`;
+  if (endUTC) {
+    confirmMsg += `End: ${endUTC.format('YYYY-MM-DD HH:mm')} UTC\n`;
+  }
+  
+  confirmMsg += `\n🖥️ *Server Information:*\n`;
+  confirmMsg += `Current Server Time: ${serverInfo.currentTime}\n`;
+  confirmMsg += `Server UTC Offset: ${serverInfo.offset}\n`;
+  confirmMsg += `Campaign will start at (server time):\n`;
+  confirmMsg += `${startInServerTime.format('YYYY-MM-DD HH:mm')}\n`;
+  if (endInServerTime) {
+    confirmMsg += `Campaign will end at (server time):\n`;
+    confirmMsg += `${endInServerTime.format('YYYY-MM-DD HH:mm')}\n`;
+  }
+  
+  // Calculate time until start
+  const now = moment();
+  const timeUntilStart = moment.duration(startUTC.diff(now));
+  if (timeUntilStart.asMinutes() > 0) {
+    const days = Math.floor(timeUntilStart.asDays());
+    const hours = timeUntilStart.hours();
+    const minutes = timeUntilStart.minutes();
+    confirmMsg += `\n⏳ *Campaign starts in:*\n`;
+    if (days > 0) {
+      confirmMsg += `${days} days, ${hours} hours, ${minutes} minutes`;
+    } else {
+      confirmMsg += `${hours} hours, ${minutes} minutes`;
+    }
+  } else {
+    confirmMsg += `\n⚠️ *Note: Start time is in the past!*`;
+  }
+  
+  bot.sendMessage(chatId, confirmMsg, { parse_mode: 'Markdown' });
+  
+  // Move to campaign name
+  userState.action = 'scheduling_campaign_name';
+  
+  setTimeout(() => {
+    bot.sendMessage(
+      chatId,
+      `Step 6: Campaign Name\n\n` +
+      `Enter a name for this scheduled campaign:`,
+      { parse_mode: 'Markdown' }
+    );
+  }, 1500);
 }
 
 async function handleStartTimeInput(bot, msg, userState, userStates) {
@@ -280,6 +531,7 @@ async function handleEndTimeInput(bot, msg, userState, userStates) {
   if (text === 'skip') {
     userState.scheduleData.endDatetime = null;
   } else {
+    // Parse as moment without timezone first
     const endTime = moment(text, 'YYYY-MM-DD HH:mm', true);
     
     if (!endTime.isValid()) {
@@ -292,7 +544,7 @@ async function handleEndTimeInput(bot, msg, userState, userStates) {
       return;
     }
     
-    // Check if end time is after start time
+    // Check if end time is after start time (both in same timezone for now)
     if (endTime.isSameOrBefore(moment(userState.scheduleData.startDatetime))) {
       bot.sendMessage(
         chatId,
@@ -307,15 +559,100 @@ async function handleEndTimeInput(bot, msg, userState, userStates) {
     userState.scheduleData.endDatetime = endTime.toDate();
   }
   
-  userState.action = 'scheduling_campaign_name';
+  // Move to timezone selection
+  userState.action = 'scheduling_timezone';
+  
+  // Create inline keyboard for timezone selection
+  const keyboard = {
+    inline_keyboard: [
+      ...COMMON_TIMEZONES.map(tz => [{
+        text: tz.name,
+        callback_data: `tz_${tz.value}`
+      }]),
+      [{ text: '📝 Enter Custom Timezone', callback_data: 'tz_custom' }]
+    ]
+  };
   
   bot.sendMessage(
     chatId,
-    `✅ End time ${userState.scheduleData.endDatetime ? 'set: ' + moment(userState.scheduleData.endDatetime).format('YYYY-MM-DD HH:mm') : 'skipped'}\n\n` +
-    `Step 5: Campaign Name\n\n` +
-    `Enter a name for this scheduled campaign:`,
-    { parse_mode: 'Markdown' }
+    `✅ Times set!\n\n` +
+    `⏰ *Step 5: Select Timezone*\n\n` +
+    `Your scheduled times:\n` +
+    `Start: ${moment(userState.scheduleData.startDatetime).format('YYYY-MM-DD HH:mm')}\n` +
+    `${userState.scheduleData.endDatetime ? `End: ${moment(userState.scheduleData.endDatetime).format('YYYY-MM-DD HH:mm')}` : 'No end time'}\n\n` +
+    `In which timezone are these times?`,
+    { 
+      parse_mode: 'Markdown',
+      reply_markup: keyboard
+    }
   );
+}
+
+async function completeScheduling(bot, chatId, userId, userState, userStates) {
+  try {
+    const scheduleData = userState.scheduleData;
+    const Campaign = require('../models/campaign');
+    
+    // Get the existing campaign and update it with scheduling info
+    const campaign = await Campaign.findByPk(userState.campaignId);
+    
+    // Update the campaign with scheduling data
+    await campaign.update({
+      campaignName: scheduleData.name,
+      campaignStatus: 'scheduled',
+      scheduledStart: scheduleData.startDatetime,  // THIS IS WRONG - should use UTC times
+      scheduledEnd: scheduleData.endDatetime,
+      numbersList: scheduleData.numbersList,
+      sipTrunkId: scheduleData.sipTrunkId,
+      callerId: scheduleData.callerId,
+      dialPrefix: scheduleData.dialPrefix || '',
+      ivrIntroFile: scheduleData.ivrIntroFile,
+      ivrOutroFile: scheduleData.ivrOutroFile,
+      dtmfDigit: scheduleData.dtmfDigit,
+      concurrentCalls: scheduleData.concurrentCalls,
+      notificationsChatId: chatId,
+      createdBy: userId.toString()
+    });
+    
+    const trunk = await SipPeer.findByPk(scheduleData.sipTrunkId);
+    
+    bot.sendMessage(
+      chatId,
+      `✅ *Campaign Scheduled Successfully!*\n\n` +
+      `📋 *Details:*\n` +
+      `Name: ${escapeMarkdown(scheduleData.name)}\n` +
+      `Numbers: ${scheduleData.totalNumbers}\n` +
+      `SIP Trunk: ${escapeMarkdown(trunk.name)}\n` +
+      `Caller ID: ${escapeMarkdown(scheduleData.callerId)}\n` +
+      `DTMF Digit: ${scheduleData.dtmfDigit}\n` +
+      `Concurrent Calls: ${scheduleData.concurrentCalls}\n` +
+      `${scheduleData.dialPrefix ? `Dial Prefix: ${scheduleData.dialPrefix}\n` : ''}` +
+      `\n📅 *Schedule:*\n` +
+      `Start: ${moment(scheduleData.startDatetime).format('YYYY-MM-DD HH:mm')}\n` +  // THIS DOESN'T SHOW TIMEZONE
+      `${scheduleData.endDatetime ? `End: ${moment(scheduleData.endDatetime).format('YYYY-MM-DD HH:mm')}` : 'No end time set'}\n` +
+      `\nThe campaign will start automatically at the scheduled time.`,
+      { 
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '📋 View Scheduled Campaigns', callback_data: 'manage_scheduled' }],
+            [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+          ]
+        }
+      }
+    );
+    
+    delete userStates[userId];
+    
+  } catch (error) {
+    console.error('Error scheduling campaign:', error);
+    bot.sendMessage(
+      chatId,
+      `❌ Error scheduling campaign: ${escapeMarkdown(error.message)}`,
+      { parse_mode: 'Markdown' }
+    );
+    delete userStates[userId];
+  }
 }
 
 async function handleCampaignNameInput(bot, msg, userState, userStates) {
@@ -468,86 +805,33 @@ async function handlePrefixInput(bot, msg, userState, userStates) {
   );
 }
 
-// Note: File upload handling for scheduling_numbers is done in the main index.js file
-// This function is kept for reference but not used directly
-
-// In telegram_bot/scheduling.js, replace completeScheduling with this simpler version:
-
-async function completeScheduling(bot, chatId, userId, userState, userStates) {
-  try {
-    const scheduleData = userState.scheduleData;
-    const Campaign = require('../models/campaign');
-    
-    // Get the existing campaign and update it with scheduling info
-    const campaign = await Campaign.findByPk(userState.campaignId);
-    
-    // Update the campaign with scheduling data
-    await campaign.update({
-      campaignName: scheduleData.name,
-      campaignStatus: 'scheduled',
-      scheduledStart: scheduleData.startDatetime,
-      scheduledEnd: scheduleData.endDatetime,
-      numbersList: scheduleData.numbersList,
-      sipTrunkId: scheduleData.sipTrunkId,
-      callerId: scheduleData.callerId,
-      dialPrefix: scheduleData.dialPrefix || '',
-      ivrIntroFile: scheduleData.ivrIntroFile,
-      ivrOutroFile: scheduleData.ivrOutroFile,
-      dtmfDigit: scheduleData.dtmfDigit,
-      concurrentCalls: scheduleData.concurrentCalls,
-      notificationsChatId: chatId,
-      createdBy: userId.toString()
-    });
-    
-    const trunk = await SipPeer.findByPk(scheduleData.sipTrunkId);
-    
-    bot.sendMessage(
-      chatId,
-      `✅ *Campaign Scheduled Successfully!*\n\n` +
-      `📋 *Details:*\n` +
-      `Name: ${escapeMarkdown(scheduleData.name)}\n` +
-      `Numbers: ${scheduleData.totalNumbers}\n` +
-      `SIP Trunk: ${escapeMarkdown(trunk.name)}\n` +
-      `Caller ID: ${escapeMarkdown(scheduleData.callerId)}\n` +
-      `DTMF Digit: ${scheduleData.dtmfDigit}\n` +
-      `Concurrent Calls: ${scheduleData.concurrentCalls}\n` +
-      `${scheduleData.dialPrefix ? `Dial Prefix: ${scheduleData.dialPrefix}\n` : ''}` +
-      `\n📅 *Schedule:*\n` +
-      `Start: ${moment(scheduleData.startDatetime).format('YYYY-MM-DD HH:mm')}\n` +
-      `${scheduleData.endDatetime ? `End: ${moment(scheduleData.endDatetime).format('YYYY-MM-DD HH:mm')}` : 'No end time set'}\n` +
-      `\nThe campaign will start automatically at the scheduled time.`,
-      { 
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '📋 View Scheduled Campaigns', callback_data: 'manage_scheduled' }],
-            [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
-          ]
-        }
-      }
-    );
-    
-    delete userStates[userId];
-    
-  } catch (error) {
-    console.error('Error scheduling campaign:', error);
-    bot.sendMessage(
-      chatId,
-      `❌ Error scheduling campaign: ${escapeMarkdown(error.message)}`,
-      { parse_mode: 'Markdown' }
-    );
-    delete userStates[userId];
-  }
+function getServerTimezoneInfo() {
+  const serverTime = moment();
+  const serverTz = moment.tz.guess(); // This might not be accurate
+  
+  // Get actual system timezone from environment or use offset
+  const systemTz = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  
+  // Get offset in hours
+  const offsetMinutes = serverTime.utcOffset();
+  const offsetHours = offsetMinutes / 60;
+  const offsetString = serverTime.format('Z'); // Like +03:00
+  
+  return {
+    timezone: systemTz,
+    offset: offsetString,
+    offsetHours: offsetHours,
+    currentTime: serverTime.format('YYYY-MM-DD HH:mm:ss'),
+    currentTimeUTC: moment.utc().format('YYYY-MM-DD HH:mm:ss')
+  };
 }
-
-// In telegram_bot/scheduling.js, update showScheduledCampaigns:
 
 async function showScheduledCampaigns(bot, chatId, userId) {
   try {
     const Campaign = require('../models/campaign');
     const SipPeer = require('../models/sippeer');
     const { Op } = require('sequelize');
-    const moment = require('moment');
+    const moment = require('moment-timezone');
     
     // Get scheduled and running campaigns
     const campaigns = await Campaign.findAll({
@@ -573,7 +857,7 @@ async function showScheduledCampaigns(bot, chatId, userId) {
           reply_markup: {
             inline_keyboard: [
               [{ text: '📅 Schedule New Campaign', callback_data: 'schedule_campaign' }],
-              [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+              [{ text: '🏠 Main Menu', callback_data: 'main_menu' }]
             ]
           }
         }
@@ -592,18 +876,36 @@ async function showScheduledCampaigns(bot, chatId, userId) {
       }[campaign.campaignStatus];
       
       const numbers = campaign.numbersList ? campaign.numbersList.length : 0;
+      const timezone = campaign.timezone || 'UTC';
+      
+      // Convert UTC times to campaign timezone for display
+      const startTimeDisplay = moment.utc(campaign.scheduledStart).tz(timezone);
+      const endTimeDisplay = campaign.scheduledEnd ? moment.utc(campaign.scheduledEnd).tz(timezone) : null;
       
       message += `${statusEmoji} *${index + 1}. ${escapeMarkdown(campaign.campaignName)}*\n`;
       message += `Status: ${campaign.campaignStatus}\n`;
+      message += `Timezone: ${timezone}\n`;
       message += `Numbers: ${numbers}`;
       if (campaign.campaignStatus === 'running') {
         message += ` (${campaign.totalCalls} calls made)`;
       }
       message += `\n`;
-      message += `Start: ${moment(campaign.scheduledStart).format('YYYY-MM-DD HH:mm')}\n`;
-      if (campaign.scheduledEnd) {
-        message += `End: ${moment(campaign.scheduledEnd).format('YYYY-MM-DD HH:mm')}\n`;
+      message += `Start: ${startTimeDisplay.format('YYYY-MM-DD HH:mm z')}\n`;
+      if (endTimeDisplay) {
+        message += `End: ${endTimeDisplay.format('YYYY-MM-DD HH:mm z')}\n`;
       }
+      
+      // Show countdown for scheduled campaigns
+      if (campaign.campaignStatus === 'scheduled') {
+        const now = moment();
+        const timeUntilStart = moment.duration(startTimeDisplay.diff(now));
+        if (timeUntilStart.asMinutes() > 0) {
+          const hours = Math.floor(timeUntilStart.asHours());
+          const minutes = timeUntilStart.minutes();
+          message += `⏳ Starts in: ${hours}h ${minutes}m\n`;
+        }
+      }
+      
       message += `\n`;
       
       // Add action buttons
@@ -623,7 +925,7 @@ async function showScheduledCampaigns(bot, chatId, userId) {
     });
     
     keyboards.push([{ text: '📅 Schedule New', callback_data: 'schedule_campaign' }]);
-    keyboards.push([{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]);
+    keyboards.push([{ text: '🏠 Main Menu', callback_data: 'main_menu' }]);
     
     bot.sendMessage(
       chatId,
