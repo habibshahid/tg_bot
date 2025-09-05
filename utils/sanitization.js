@@ -10,7 +10,7 @@ exports.sanitize_phoneNumber = (phoneNumber) => {
   if (cleaned.startsWith("+")) {
     cleaned = cleaned.slice(1);
   }
-
+  
   /*
   // If it's a 10-digit number, add the country code '1'
   if (cleaned.length === 10) {

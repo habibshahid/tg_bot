@@ -130,8 +130,7 @@ exports.call_started = async (phoneNumber) => {
 exports.call_ended = async (phoneNumber, callStatus) => {
   const entry = get_entry_by_number(phoneNumber);
   const settings = get_settings();
-  
-  if(settings && settings?.campaign_id){
+
   const existingCall = await Call.findOne({
 	  where:{
 		phoneNumber: `+${phoneNumber}`,
@@ -152,9 +151,6 @@ exports.call_ended = async (phoneNumber, callStatus) => {
     `📴 Call Ended: ${phoneNumber} with ${callStatus}`,
     { parse_mode: "HTML" }
   );*/
-  }else{
-    console.log('Campaign Data not Found');
-  }
 };
 
 exports.add_entry_to_memory = (entry) => {
