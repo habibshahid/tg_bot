@@ -17,16 +17,14 @@ const path = require("path");
 const { Op } = require("sequelize");
 const sequelize = require("../config/database");
 
-// Import billing system components
-const User = require("../models/user");
-const { Provider, RateCard, Destination, Rate } = require("../models/provider");
-const { Transaction, CallDetail } = require("../models/transaction");
-const billingEngine = require("../services/billingEngine");
-const { setupBillingEventHandlers } = require("../asterisk/billingCallHandler");
-
 const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
+const simpleCampaignScheduler = require('../services/simpleCampaignScheduler');
+const { handleSchedulingCommands, showScheduledCampaigns } = require('./scheduling');
+
+// Import verification handlers
+const { initializeVerificationHandlers, showPendingVerifications, showActiveCalls } = require('./verification');
 
 // State management for user interactions
 const userStates = {};
@@ -37,38 +35,44 @@ function logUserState(userId, action, state) {
 }
 
 function sanitizeFilename(filename) {
+  // Remove extension first
   const nameWithoutExt = filename.replace(/\.[^/.]+$/, "");
+  // Replace spaces and special characters with underscore
   const sanitized = nameWithoutExt.replace(/[^a-zA-Z0-9]/g, '_');
+  // Remove multiple underscores
   return sanitized.replace(/_+/g, '_').toLowerCase();
 }
 
 function escapeMarkdown(text) {
   if (!text) return '';
+  // Convert to string in case it's not
   text = String(text);
+  // Escape all special Markdown characters
   return text
-    .replace(/\\/g, '\\\\') 
-    .replace(/\*/g, '\\*')   
-    .replace(/_/g, '\\_')    
-    .replace(/\[/g, '\\[')   
-    .replace(/\]/g, '\\]')   
-    .replace(/\(/g, '\\(')   
-    .replace(/\)/g, '\\)')   
-    .replace(/~/g, '\\~')    
-    .replace(/`/g, '\\`')    
-    .replace(/>/g, '\\>')    
-    .replace(/#/g, '\\#')    
-    .replace(/\+/g, '\\+')   
-    .replace(/-/g, '\\-')    
-    .replace(/=/g, '\\=')    
-    .replace(/\|/g, '\\|')   
-    .replace(/\{/g, '\\{')   
-    .replace(/\}/g, '\\}')   
-    .replace(/\./g, '\\.')   
-    .replace(/!/g, '\\!');   
+    .replace(/\\/g, '\\\\') // Backslash must be first
+    .replace(/\*/g, '\\*')   // Asterisk
+    .replace(/_/g, '\\_')    // Underscore
+    .replace(/\[/g, '\\[')   // Square bracket open
+    .replace(/\]/g, '\\]')   // Square bracket close
+    .replace(/\(/g, '\\(')   // Parenthesis open
+    .replace(/\)/g, '\\)')   // Parenthesis close
+    .replace(/~/g, '\\~')    // Tilde
+    .replace(/`/g, '\\`')    // Backtick
+    .replace(/>/g, '\\>')    // Greater than
+    .replace(/#/g, '\\#')    // Hash
+    .replace(/\+/g, '\\+')   // Plus
+    .replace(/-/g, '\\-')    // Minus
+    .replace(/=/g, '\\=')    // Equals
+    .replace(/\|/g, '\\|')   // Pipe
+    .replace(/\{/g, '\\{')   // Curly brace open
+    .replace(/\}/g, '\\}')   // Curly brace close
+    .replace(/\./g, '\\.')   // Period
+    .replace(/!/g, '\\!');   // Exclamation
 }
 
 async function convertAudioFile(inputPath, outputPath) {
   try {
+    // Using sox for conversion (install with: apt-get install sox libsox-fmt-all)
     const command = `sox "${inputPath}" -r 8000 -c 1 -b 16 "${outputPath}" norm -3`;
     
     await execPromise(command);
@@ -76,6 +80,7 @@ async function convertAudioFile(inputPath, outputPath) {
     return true;
   } catch (error) {
     console.error(`Audio conversion failed: ${error.message}`);
+    // Fallback to ffmpeg if sox fails
     try {
       const ffmpegCommand = `ffmpeg -i "${inputPath}" -acodec pcm_s16le -ar 8000 -ac 1 -f wav "${outputPath}" -y`;
       await execPromise(ffmpegCommand);
@@ -88,111 +93,15 @@ async function convertAudioFile(inputPath, outputPath) {
   }
 }
 
-// Enhanced user access check with billing integration
-async function checkUserAccess(userId, chatId, requireAdmin = false) {
-  let user = await User.findOne({ where: { telegramId: userId.toString() } });
-  
-  // Auto-create admin user if it's the first admin
-  if (!user && userId.toString() === config.creator_telegram_id) {
-    user = await User.create({
-      telegramId: userId.toString(),
-      userType: 'admin',
-      status: 'active',
-      balance: 1000, // Give admin initial balance for testing
-      firstName: 'System Administrator',
-      creditLimit: 10000
-    });
-    console.log('Auto-created admin user');
-  }
-  
-  if (!user) {
-    // For backward compatibility, check old Allowed table
-    const allowedUser = await Allowed.findOne({ where: { telegramId: userId.toString() } });
-    if (allowedUser || userId.toString() === config.creator_telegram_id) {
-      // Migrate user to new system
-      user = await User.create({
-        telegramId: userId.toString(),
-        userType: userId.toString() === config.creator_telegram_id ? 'admin' : 'user',
-        status: 'active',
-        balance: 0,
-        firstName: 'Migrated User'
-      });
-      console.log(`Migrated user ${userId} to new billing system`);
-    } else {
-      return null; // User not authorized
-    }
-  }
-  
-  if (user.status !== 'active') {
-    return null;
-  }
-  
-  if (requireAdmin && user.userType !== 'admin') {
-    return null;
-  }
-  
-  // Update last login
-  await user.update({ lastLoginAt: new Date() });
-  
-  return user;
-}
-
-// Enhanced startCallingProcess with user context and billing validation
-async function startCallingProcess(data, campaign, userId = null) {
-  let user = null;
-  
-  // If userId provided, get user for billing context
-  if (userId) {
-    user = await User.findOne({ where: { telegramId: userId.toString() } });
-    if (!user) {
-      throw new Error('User not found');
-    }
-
-    if (user.rateCardId) {
-      // Validate user has sufficient balance for campaign
-      let totalEstimatedCost = 0;
-      const validatedNumbers = [];
-      
-      // Pre-validate first 10 numbers for estimation
-      for (const entry of data.slice(0, 10)) {
-        try {
-          const estimate = await billingEngine.estimateCallCost(user.id, entry.phoneNumber, 3);
-          totalEstimatedCost += estimate.estimatedCost;
-          validatedNumbers.push({
-            ...entry,
-            estimatedCost: estimate.estimatedCost,
-            destination: estimate.destination
-          });
-        } catch (error) {
-          console.warn(`Skipping ${entry.phoneNumber}: ${error.message}`);
-        }
-      }
-
-      if (validatedNumbers.length === 0) {
-        throw new Error('No valid destinations found in your rate card');
-      }
-
-      // Check if user has sufficient balance for estimated campaign cost
-      const campaignEstimate = totalEstimatedCost * (data.length / Math.min(data.length, 10));
-      const balanceCheck = await billingEngine.checkSufficientBalance(user.id, campaignEstimate);
-      
-      if (!balanceCheck.hasSufficientBalance) {
-        throw new Error(
-          `Insufficient balance for campaign. ` +
-          `Estimated cost: $${campaignEstimate.toFixed(2)}, ` +
-          `Available: $${balanceCheck.availableBalance.toFixed(2)}`
-        );
-      }
-    }
-  }
-
+async function startCallingProcess(data, campaign) {
   const concurrentCalls = campaign.concurrentCalls;
-  const CALLS_PER_SECOND = 3;
+  const CALLS_PER_SECOND = 3; // Maximum 3 calls per second - adjust based on your asterisk server capacity
   
   // Save all leads to database with campaign ID before starting
   for (const entry of data) {
     const phoneNumber = `+${sanitize_phoneNumber(entry.phoneNumber)}`;
     
+    // Check if this number already exists for this campaign
     const existingCall = await Call.findOne({
       where: {
         phoneNumber: phoneNumber,
@@ -213,47 +122,19 @@ async function startCallingProcess(data, campaign, userId = null) {
   
   await waitForConnection();
   set_unprocessed_data(data);
-  
-  // Update settings with user context for billing (if user exists)
-  const currentSettings = get_settings();
-  const updatedSettings = {
-    ...currentSettings,
-    notifications_chat_id: campaign.notificationsChatId,
-    concurrent_calls: campaign.concurrentCalls,
-    sip_trunk: campaign.sipTrunk,
-    caller_id: campaign.callerId,
-    dial_prefix: campaign.dialPrefix || '',
-    campaign_id: campaign.id,
-    dtmf_digit: campaign.dtmfDigit,
-    ivr_intro_file: campaign.ivrIntroFile,
-    ivr_outro_file: campaign.ivrOutroFile
-  };
-  
-  if (user) {
-    updatedSettings.user_id = user.id;
-    updatedSettings.telegram_user_id = userId;
-  }
-  
-  set_settings(updatedSettings);
-  
   const callPromises = [];
   
   for (let i = 0; i < concurrentCalls; i++) {
     const line = pop_unprocessed_line();
     if (line) {
       const delayedCall = async () => {
+        // Calculate delay to ensure rate limiting
         const secondGroup = Math.floor(i / CALLS_PER_SECOND);
         const positionInGroup = i % CALLS_PER_SECOND;
         const delay = (secondGroup * 1500) + (positionInGroup * (1500 / CALLS_PER_SECOND));
         
         await new Promise(resolve => setTimeout(resolve, delay));
-        
-        // Use billing call handler if user has billing enabled
-        if (user && user.rateCardId) {
-          return require("../asterisk/billingCallHandler")(line);
-        } else {
-          return require("../asterisk/call")(line);
-        }
+        return require("../asterisk/call")(line);
       };
       callPromises.push(delayedCall());
     }
@@ -261,50 +142,25 @@ async function startCallingProcess(data, campaign, userId = null) {
   
   // Wait for all calls to complete
   await Promise.all(callPromises);
-  
   const bot = get_bot();
   const settings = get_settings();
   
-  let completionMessage = `✅ All lines have been called`;
-  
-  // Add billing summary if user has billing enabled
-  if (user && user.rateCardId) {
-    try {
-      const finalSummary = await billingEngine.getUserFinancialSummary(user.id);
-      completionMessage = `✅ *Campaign Completed*\n\n` +
-        `All numbers have been processed.\n` +
-        `Final Balance: $${finalSummary.summary.currentBalance.toFixed(2)}`;
-    } catch (error) {
-      console.error('Error getting final summary:', error);
-    }
-  }
-  
   bot.sendMessage(
-    settings?.notifications_chat_id,
-    completionMessage,
-    {
-      parse_mode: user && user.rateCardId ? "Markdown" : "HTML",
-    }
+	settings?.notifications_chat_id,
+	`✅ All lines have been called`,
+	{
+	  parse_mode: "HTML",
+	}
   );
   return;
 }
 
-// Get or create campaign for this bot (enhanced with user context)
-async function getOrCreateCampaign(userId = null) {
+// Get or create campaign for this bot
+async function getOrCreateCampaign() {
   const botToken = config.telegram_bot_token;
   
-  let whereClause = { botToken };
-  
-  // If userId is provided, try to find user-specific campaign
-  if (userId) {
-    const user = await User.findOne({ where: { telegramId: userId.toString() } });
-    if (user) {
-      whereClause.createdBy = user.telegramId;
-    }
-  }
-  
   let campaign = await Campaign.findOne({
-    where: whereClause,
+    where: { botToken },
     include: [{
       model: SipPeer,
       as: 'sipTrunk'
@@ -313,19 +169,12 @@ async function getOrCreateCampaign(userId = null) {
 
   if (!campaign) {
     // Create default campaign
-    const campaignData = {
+    campaign = await Campaign.create({
       botToken,
       campaignName: 'Default Campaign',
       concurrentCalls: config.concurrent_calls || 30,
       isActive: true
-    };
-    
-    if (userId) {
-      campaignData.createdBy = userId.toString();
-      campaignData.campaignName = `Campaign for User ${userId}`;
-    }
-    
-    campaign = await Campaign.create(campaignData);
+    });
   }
 
   return campaign;
@@ -333,12 +182,15 @@ async function getOrCreateCampaign(userId = null) {
 
 // Validate caller ID format
 function validateCallerId(callerId) {
+  // Remove all non-numeric characters for validation
   const cleaned = callerId.replace(/\D/g, '');
   
+  // Check if it's a valid US number (10 or 11 digits)
   if (cleaned.length === 10 || (cleaned.length === 11 && cleaned.startsWith('1'))) {
     return { valid: true, formatted: cleaned };
   }
   
+  // Check if it's an international number (minimum 7 digits)
   if (cleaned.length >= 7 && cleaned.length <= 15) {
     return { valid: true, formatted: cleaned };
   }
@@ -348,6 +200,7 @@ function validateCallerId(callerId) {
 
 async function createCallbackEntry(phoneNumber, campaignId) {
   try {
+    // Check if entry exists
     const existingCall = await Call.findOne({
       where: {
         phoneNumber: `+${phoneNumber}`,
@@ -356,6 +209,7 @@ async function createCallbackEntry(phoneNumber, campaignId) {
     });
     
     if (!existingCall) {
+      // Create new call entry for callback
       await Call.create({
         phoneNumber: `+${phoneNumber}`,
         rawLine: `callback-${phoneNumber}`,
@@ -369,6 +223,7 @@ async function createCallbackEntry(phoneNumber, campaignId) {
   }
 }
 
+// CREATE CALLBACK FUNCTION
 async function initiateCallback(phoneNumber, campaign) {
   const { ami } = require("../asterisk/instance");
   const { set_settings, get_settings } = require("../utils/settings");
@@ -381,6 +236,7 @@ async function initiateCallback(phoneNumber, campaign) {
     throw new Error("Callback trunk number not configured");
   }
   
+  // Ensure campaign_id is set in settings for callback tracking
   const currentSettings = get_settings();
   if (!currentSettings.campaign_id || currentSettings.campaign_id !== campaign.id) {
     set_settings({
@@ -400,7 +256,7 @@ async function initiateCallback(phoneNumber, campaign) {
   const variables = {
     CALLBACK_TRUNK: campaign.callbackTrunk.name,
     CALLBACK_CALLERID: campaign.callerId || phoneNumber,
-    CALLBACK_TRUNK_NUMBER: campaign.callbackTrunkNumber,
+	CALLBACK_TRUNK_NUMBER: campaign.callbackTrunkNumber,
     CALLBACK_DESTINATION: phoneNumber,
     CAMPAIGN_ID: String(campaign.id)
   };
@@ -410,7 +266,7 @@ async function initiateCallback(phoneNumber, campaign) {
     dialedNumber,
     regularTrunk: campaign.sipTrunk.name,
     callbackTrunk: campaign.callbackTrunk.name,
-    callbackTrunkNumber: campaign.callbackTrunkNumber,
+	callbackTrunkNumber: campaign.callbackTrunkNumber,
     campaignId: campaign.id,
     variables
   });
@@ -439,6 +295,7 @@ async function initiateCallback(phoneNumber, campaign) {
   });
 }
 
+// Helper function to read and parse the file buffer uploaded by the user
 function parseFileData(fileBuffer) {
   return fileBuffer
     .toString("utf-8")
@@ -447,12 +304,14 @@ function parseFileData(fileBuffer) {
       console.log('Processing line:', line);
       return { phoneNumber: line.trim(), rawLine: line.trim() };
     })
-    .filter(entry => entry.phoneNumber);
+    .filter(entry => entry.phoneNumber); // Filter out empty lines
 }
 
+// Function to filter out already processed phone numbers
 async function filterProcessedNumbers(data, campaignId = null) {
   let whereClause = {};
   
+  // If campaignId is provided, only check numbers for that campaign
   if (campaignId) {
     whereClause.campaignId = campaignId;
   }
@@ -472,24 +331,24 @@ async function filterProcessedNumbers(data, campaignId = null) {
   });
 }
 
+// Get call statistics
 async function getCallStats(campaignId = null) {
   if (campaignId) {
     const campaign = await Campaign.findByPk(campaignId);
     if (campaign) {
-      const campaignStats = {
+      return {
         total: campaign.totalCalls,
         successful: campaign.successfulCalls,
         failed: campaign.failedCalls,
-        voicemail: campaign.voicemailCalls,
+		voicemail: campaign.voicemailCalls,
         dtmf_responses: campaign.dtmfResponses,
         success_rate: campaign.totalCalls > 0 ? (((campaign.successfulCalls) / campaign.totalCalls) * 100).toFixed(2) : 0,
-        response_rate: campaign.successfulCalls > 0 ? ((campaign.dtmfResponses / (campaign.successfulCalls)) * 100).toFixed(2) : 0
+        response_rate: campaign.successfulCalls > 0 ? ((campaign.dtmfResponses / (campaign.successfulCalls )) * 100).toFixed(2) : 0
       };
-      console.log('##############', campaignStats)
-      return campaignStats;
     }
   }
   
+  // Fallback to old method if no campaign
   const totalCalls = await Call.count();
   const completedCalls = await Call.count({ where: { used: true } });
   const pendingCalls = await Call.count({ where: { used: false } });
@@ -504,6 +363,7 @@ async function getCallStats(campaignId = null) {
   };
 }
 
+// Get SIP trunks from database
 async function getSipTrunks() {
   return await SipPeer.findAll({
     where: { 
@@ -514,6 +374,7 @@ async function getSipTrunks() {
   });
 }
 
+// Validate SIP trunk
 async function validateSipTrunk(trunkId) {
   const trunk = await SipPeer.findByPk(trunkId);
   
@@ -532,87 +393,14 @@ async function validateSipTrunk(trunkId) {
   return { valid: true, trunk: trunk };
 }
 
-// Enhanced menu function based on user type and billing status
-function getUserMenu(user) {
-  const isAdmin = user.userType === 'admin';
-  const hasBilling = user.rateCardId ? true : false;
-  
-  let userButtons = [];
-  
-  if (hasBilling) {
-    // User with billing enabled
-    userButtons = [
-      [
-        { text: "🚀 Start Campaign", callback_data: "start_campaign" },
-        { text: "💰 Check Balance", callback_data: "check_balance" }
-      ],
-      [
-        { text: "📊 My Statistics", callback_data: "my_stats" },
-        { text: "📋 Recent Calls", callback_data: "recent_calls" }
-      ],
-      [
-        { text: "💳 My Rate Card", callback_data: "my_rates" },
-        { text: "📁 Upload Leads", callback_data: "upload_leads" }
-      ],
-      [
-        { text: "💱 Estimate Cost", callback_data: "estimate_cost" },
-        { text: "🆔 Get Your ID", callback_data: "get_id" }
-      ]
-    ];
-  } else {
-    // Legacy user or user without billing
-    userButtons = [
-      [
-        { text: "🚀 Start Campaign", callback_data: "start_campaign" },
-        { text: "📊 Check Call Status", callback_data: "call_status" }
-      ],
-      [
-        { text: "🆔 Get Your ID", callback_data: "get_id" },
-        { text: "📁 Upload Leads (TXT)", callback_data: "upload_leads" }
-      ],
-      [
-        { text: "⚙️ Set Concurrent Calls", callback_data: "set_concurrent" },
-        { text: "📞 Set Caller ID", callback_data: "set_caller_id" }
-      ],
-      [
-        { text: "🌐 Set SIP Trunk", callback_data: "set_sip" },
-        { text: "📢 Set Notifications", callback_data: "set_notifications" }
-      ],
-      [
-        { text: "🎵 Upload IVR", callback_data: "upload_ivr" },
-        { text: "🔢 Set DTMF Digit", callback_data: "set_dtmf" }
-      ],
-      [
-        { text: "📈 Campaign Stats", callback_data: "campaign_stats" },
-        { text: "➕ Set Dial Prefix", callback_data: "set_dial_prefix" }
-      ],
-      [
-        { text: "☎️ Set Callback Trunk", callback_data: "set_callback_trunk" },
-        { text: "📲 Initiate Callback", callback_data: "initiate_callback" }
-      ]
-    ];
+function stopCallingProcess() {
+  // This should stop the current dialing process
+  // Implementation depends on your existing calling logic
+  if (global.callingInterval) {
+    clearInterval(global.callingInterval);
+    global.callingInterval = null;
   }
-
-  const adminButtons = [
-    [
-      { text: "👥 Manage Users", callback_data: "admin_users" },
-      { text: "💳 Manage Rates", callback_data: "admin_rates" }
-    ],
-    [
-      { text: "💰 Add Credit", callback_data: "admin_add_credit" },
-      { text: "📊 System Stats", callback_data: "admin_system_stats" }
-    ],
-    [
-      { text: "🏗️ Create Rate Card", callback_data: "admin_create_rate" },
-      { text: "👤 Permit User", callback_data: "permit_user" }
-    ]
-  ];
-
-  return {
-    reply_markup: {
-      inline_keyboard: isAdmin ? [...adminButtons, ...userButtons] : userButtons
-    }
-  };
+  console.log('Calling process stopped');
 }
 
 // Initialize Telegram Bot
@@ -620,541 +408,347 @@ const initializeBot = () => {
   const bot = start_bot_instance();
   const adminId = config.creator_telegram_id;
   
-  // Setup billing event handlers
-  setupBillingEventHandlers();
+  // Initialize verification handlers
+  initializeVerificationHandlers(bot);
+  
+  simpleCampaignScheduler.initialize(bot);
+  console.log('Campaign scheduler initialized with bot');
+  handleSchedulingCommands(bot, userStates);
+  
+  // Enhanced main menu with verification options
+  const mainMenu = {
+	  reply_markup: {
+		inline_keyboard: [
+		  [
+			{ text: "🚀 Start Campaign", callback_data: "start_campaign" },
+			{ text: "📊 Check Call Status", callback_data: "call_status" }
+		  ],
+		  [
+			{ text: "🔍 Pending Verifications", callback_data: "pending_verifications" },
+			{ text: "📞 Active Calls", callback_data: "active_calls" }
+		  ],
+		  /*[
+			{ text: "🆔 Get Your ID", callback_data: "get_id" },
+			{ text: "📁 Upload Leads (TXT)", callback_data: "upload_leads" }
+		  ],*/
+		  [
+			{ text: "⚙️ Set Concurrent Calls", callback_data: "set_concurrent" },
+			{ text: "📞 Set Caller ID", callback_data: "set_caller_id" }
+		  ],
+		  [
+			{ text: "🌐 Set SIP Trunk", callback_data: "set_sip" },
+			{ text: "📢 Set Notifications", callback_data: "set_notifications" }
+		  ],
+		  /*[
+			{ text: "🎵 Upload IVR", callback_data: "upload_ivr" },
+			{ text: "👤 Permit User", callback_data: "permit_user" }
+		  ],
+		  [
+			{ text: "🔢 Set DTMF Digit", callback_data: "set_dtmf" },
+			{ text: "📈 Campaign Stats", callback_data: "campaign_stats" }
+		  ],*/
+		  [
+			{ text: "➕ Set Dial Prefix", callback_data: "set_dial_prefix" },
+			{ text: "- Remove Dial Prefix", callback_data: "remove_dial_prefix" }
+		  ]/*,
+		  [
+			{ text: "☎️ Set Callback Trunk", callback_data: "set_callback_trunk" },
+			{ text: "📱 Set Callback Number", callback_data: "set_callback_number" }
+		  ],
+		  [
+			{ text: "📲 Initiate Callback", callback_data: "initiate_callback" }
+		  ]*/
+		]
+	  }
+	};
 
-  // Enhanced start command with user management
-  bot.onText(/\/start/, async (msg) => {
+  // Start command - show main menu
+  bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    
-    const user = await checkUserAccess(userId, chatId);
-    if (!user) {
-      bot.sendMessage(
-        chatId,
-        "❌ *Access Denied*\n\nYou are not registered in the system. Please contact the administrator.",
-        { parse_mode: 'Markdown' }
-      );
-      return;
-    }
-    
-    const isAdmin = user.userType === 'admin';
-    const hasBilling = user.rateCardId ? true : false;
-    
-    let welcomeMessage = `🤖 *Welcome back`;
-    if (isAdmin) {
-      welcomeMessage += `, Administrator!*\n\n${escapeMarkdown(user.firstName || 'Admin')}, you have full system access.`;
-    } else {
-      welcomeMessage += `, ${escapeMarkdown(user.firstName || user.username || 'User')}!*`;
-      if (hasBilling) {
-        welcomeMessage += `\n\n💰 Balance: $${user.balance}\n📊 Rate Card: ${user.rateCardId ? 'Assigned' : 'Not Assigned'}`;
-      } else {
-        welcomeMessage += `\n\nUsing legacy mode - contact admin for billing features.`;
-      }
-    }
-    
     bot.sendMessage(
       chatId, 
-      welcomeMessage + "\n\nSelect an option from the menu below:",
+      "🤖 *Welcome to Order Verification Bot!*\n\nSelect an option from the menu below:",
       { 
-        ...getUserMenu(user),
+        ...mainMenu,
         parse_mode: "Markdown"
       }
     );
   });
 
-  // Enhanced callback query handler
+  // Help command with comprehensive order verification info
+  bot.onText(/\/help/, (msg) => {
+    const chatId = msg.chat.id;
+    const helpMessage = `🤖 *Order Verification Bot Commands*\n\n` +
+      `*Basic Commands:*\n` +
+      `/start` + ` - Show main menu\n` +
+      `/menu` + ` - Show main menu\n` +
+      `/help` + ` - Show this help message\n\n` +
+      
+      `*Call Management:*\n` +
+      `/line` + ` - Show recent DTMF responses\n` +
+      `/stats` + ` - Show detailed campaign statistics\n` +
+      `/active` + ` - Show active calls\n` +
+      `/pending` + ` - Show pending verifications\n\n` +
+      
+      `*Admin Commands:*\n` +
+      `/reset` + ` - Reset campaign statistics (admin only)\n\n` +
+      
+      `*Order Verification Flow:*\n` +
+      `1️⃣ Customer presses 1 → Order confirmed → Call ends\n` +
+      `2️⃣ Customer presses 2 → Issue reported → OTP process begins\n` +
+      `9️⃣ Customer presses 9 → Ready for verification → Admin verifies\n\n` +
+      
+      `*Verification Process:*\n` +
+      `• Customer reports issue (press 2)\n` +
+      `• System puts call on hold\n` +
+      `• Admin receives notification\n` +
+      `• Admin sends OTP manually\n` +
+      `• Customer enters OTP (press 9)\n` +
+      `• Admin verifies OTP via bot buttons\n` +
+      `• System announces result and ends call`;
+      
+    bot.sendMessage(chatId, helpMessage, { parse_mode: "Markdown" });
+  });
+
+  // Handle callback queries
   bot.on("callback_query", async (query) => {
     const chatId = query.message.chat.id;
     const userId = query.from.id;
     const callbackData = query.data;
 
+    // Answer callback to remove loading state
     bot.answerCallbackQuery(query.id);
 
-    const user = await checkUserAccess(userId, chatId);
-    if (!user) {
-      bot.sendMessage(chatId, "❌ Access denied!");
-      return;
-    }
-
     switch (callbackData) {
-      // Billing-specific callbacks
-      case "check_balance":
-        if (!user.rateCardId) {
-          bot.sendMessage(chatId, "💳 No rate card assigned. Contact administrator.");
-          return;
-        }
-        
-        try {
-          const financial = await billingEngine.getUserFinancialSummary(user.id);
-          
-          bot.sendMessage(
-            chatId,
-            `💰 *Account Balance*\n\n` +
-            `Current Balance: $${financial.summary.currentBalance.toFixed(2)}\n` +
-            `Credit Limit: $${financial.summary.creditLimit.toFixed(2)}\n` +
-            `Available Balance: $${financial.summary.availableBalance.toFixed(2)}\n\n` +
-            `📊 *Usage Summary*\n` +
-            `Total Calls: ${financial.summary.totalCalls}\n` +
-            `Answered Calls: ${financial.summary.answeredCalls}\n` +
-            `Total Minutes: ${financial.summary.totalMinutes.toFixed(2)}\n` +
-            `Total Spent: $${financial.summary.totalSpent.toFixed(2)}`,
-            { parse_mode: 'Markdown' }
-          );
-        } catch (error) {
-          bot.sendMessage(chatId, `❌ Error: ${error.message}`);
-        }
+	  case "pending_verifications":
+        await showPendingVerifications(bot, chatId);
         break;
 
-      case "my_stats":
-        if (!user.rateCardId) {
-          // Fall back to legacy stats
-          const currentCampaign = await getOrCreateCampaign(userId);
-          const stats = await getCallStats(currentCampaign.id);
-          bot.sendMessage(
-            chatId,
-            `📊 *Your Statistics*\n\n` +
-            `Total Calls: ${stats.total}\n` +
-            `Successful: ${stats.successful}\n` +
-            `Failed: ${stats.failed}\n` +
-            `DTMF Responses: ${stats.dtmf_responses}\n` +
-            `Success Rate: ${stats.success_rate}%`,
-            { parse_mode: 'Markdown' }
-          );
-          return;
-        }
-        
-        try {
-          const startOfMonth = new Date();
-          startOfMonth.setDate(1);
-          startOfMonth.setHours(0, 0, 0, 0);
-          
-          const [monthlyData, allTimeData] = await Promise.all([
-            billingEngine.getUserFinancialSummary(user.id, startOfMonth),
-            billingEngine.getUserFinancialSummary(user.id)
-          ]);
-          
-          bot.sendMessage(
-            chatId,
-            `📊 *Your Statistics*\n\n` +
-            `💰 *Account Status*\n` +
-            `Balance: $${allTimeData.summary.currentBalance.toFixed(2)}\n` +
-            `Available: $${allTimeData.summary.availableBalance.toFixed(2)}\n\n` +
-            `📅 *This Month*\n` +
-            `Calls Made: ${monthlyData.summary.totalCalls}\n` +
-            `Answered: ${monthlyData.summary.answeredCalls}\n` +
-            `Minutes: ${monthlyData.summary.totalMinutes.toFixed(2)}\n` +
-            `Spent: $${monthlyData.summary.totalSpent.toFixed(2)}\n\n` +
-            `📈 *All Time*\n` +
-            `Total Calls: ${allTimeData.summary.totalCalls}\n` +
-            `Total Minutes: ${allTimeData.summary.totalMinutes.toFixed(2)}\n` +
-            `Total Spent: $${allTimeData.summary.totalSpent.toFixed(2)}`,
-            { parse_mode: 'Markdown' }
-          );
-        } catch (error) {
-          bot.sendMessage(chatId, `❌ Error: ${error.message}`);
-        }
+      case "active_calls":
+        await showActiveCalls(bot, chatId);
         break;
+		
+		case "set_callback_trunk":
+		  let permittedUserCallback = await Allowed.findOne({ 
+			where: { telegramId: userId } 
+		  });
+		  console.log(`Request from User ${userId} for set_callback_trunk`)
+		  if(userId == adminId){
+			permittedUserCallback = true;
+		  }
+		  if (!permittedUserCallback) {
+			console.log("❌ Admin access required to set_callback_trunk!", userId);
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  // Get available SIP trunks for callback
+		  const callbackTrunks = await getSipTrunks();
+		  
+		  if (callbackTrunks.length === 0) {
+			bot.sendMessage(
+			  chatId,
+			  `☎️ *No SIP Trunks Found*\n\nNo SIP trunks are configured for callback.`,
+			  { parse_mode: "Markdown" }
+			);
+		  } else {
+			let trunkList = "☎️ *Select Callback SIP Trunk:*\n\n";
+			callbackTrunks.forEach((trunk, index) => {
+			  // PROPERLY ESCAPE all dynamic content
+			  trunkList += `${index + 1}. *${escapeMarkdown(trunk.name)}*\n`;
+			  trunkList += `   📍 Host: ${escapeMarkdown(trunk.host)}\n`;
+			  trunkList += `   👤 Username: ${escapeMarkdown(trunk.username || trunk.defaultuser || 'N/A')}\n`;
+			  trunkList += `   🔌 Status: ${trunk.status ? '✅ Active' : '❌ Inactive'}\n\n`;
+			});
+			trunkList += "Enter the number of the callback trunk you want to use:";
+			
+			const campaignCallback = await getOrCreateCampaign();
+			bot.sendMessage(chatId, trunkList, { parse_mode: "Markdown" });
+			userStates[userId] = { 
+			  action: "waiting_callback_trunk_selection", 
+			  sipTrunks: callbackTrunks,
+			  campaignId: campaignCallback.id 
+			};
+		  }
+		  break;
 
-      case "recent_calls":
-        if (!user.rateCardId) {
-          bot.sendMessage(chatId, "💳 No rate card assigned. Contact administrator.");
-          return;
-        }
-        
-        try {
-          const data = await billingEngine.getUserFinancialSummary(user.id);
-          
-          if (data.recentCalls.length === 0) {
-            bot.sendMessage(chatId, "📋 *No Recent Calls*\n\nYou haven't made any calls yet.", { parse_mode: 'Markdown' });
-            return;
-          }
-          
-          let message = "📋 *Recent Calls*\n\n";
-          
-          data.recentCalls.slice(0, 10).forEach((call, index) => {
-            const status = call.callStatus === 'answered' ? '✅' : '❌';
-            const duration = call.callStatus === 'answered' ? `${Math.round(call.billableDuration/60)}min` : 'N/A';
-            const cost = call.totalCharge > 0 ? `$${call.totalCharge.toFixed(4)}` : 'Free';
-            
-            message += `${index + 1}. ${status} ${escapeMarkdown(call.phoneNumber)}\n`;
-            message += `   Duration: ${duration} | Cost: ${cost}\n`;
-            message += `   ${call.createdAt.toLocaleDateString()} ${call.createdAt.toLocaleTimeString()}\n\n`;
-          });
-          
-          bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-        } catch (error) {
-          bot.sendMessage(chatId, `❌ Error: ${error.message}`);
-        }
-        break;
+	case "initiate_callback":
+	  const campaignCheck = await getOrCreateCampaign();
+	  
+	  if (!campaignCheck.callbackTrunkId) {
+		bot.sendMessage(
+		  chatId,
+		  `❌ *Callback Trunk Not Set*\n\nPlease set a callback trunk first using "Set Callback Trunk" option.`,
+		  { parse_mode: "Markdown" }
+		);
+		return;
+	  }
+	  
+	  if (!campaignCheck.callbackTrunkNumber) {
+		bot.sendMessage(
+		  chatId,
+		  `❌ *Callback Number Not Set*\n\nPlease set a callback trunk number using "Set Callback Number" option.`,
+		  { parse_mode: "Markdown" }
+		);
+		return;
+	  }
+	  
+	  // Load the callback trunk to get its name
+	  const callbackTrunkInfo = await SipPeer.findByPk(campaignCheck.callbackTrunkId);
+	  
+	  bot.sendMessage(
+		chatId,
+		`📲 *Initiate Callback*\n\n` +
+		`Callback Trunk: ${escapeMarkdown(callbackTrunkInfo ? callbackTrunkInfo.name : 'Loading...')}\n` +
+		`Callback Number: ${escapeMarkdown(campaignCheck.callbackTrunkNumber)}\n\n` +
+		`Select callback option:`,
+		{
+		  parse_mode: "Markdown",
+		  reply_markup: {
+			inline_keyboard: [
+			  [
+				{ text: "📞 Single Number", callback_data: "callback_single" },
+				{ text: "📁 Upload List", callback_data: "callback_list" }
+			  ],
+			  [
+				{ text: "🔙 Back", callback_data: "back_to_menu" }
+			  ]
+			]
+		  }
+		}
+	  );
+	  break;
+	  
+	case "set_callback_number":
+	  let permittedUserCallbackNum = await Allowed.findOne({ 
+		where: { telegramId: userId } 
+	  });
+	  console.log(`Request from User ${userId} for set_callback_number`)
+	  if(userId == adminId){
+		permittedUserCallbackNum = true;
+	  }
+	  if (!permittedUserCallbackNum) {
+		console.log("❌ Admin access required to set_callback_number!", userId);
+		bot.sendMessage(chatId, "❌ Admin access required!");
+		return;
+	  }
+	  
+	  const campaignForCallbackNum = await getOrCreateCampaign();
+	  
+	  // Check if callback trunk is set first
+	  if (!campaignForCallbackNum.callbackTrunkId) {
+		bot.sendMessage(
+		  chatId,
+		  `❌ *Callback Trunk Not Set*\n\nPlease set a callback trunk first before setting the callback number.`,
+		  { parse_mode: "Markdown" }
+		);
+		return;
+	  }
+	  
+	  const currentCallbackNum = campaignForCallbackNum.callbackTrunkNumber || 'Not set';
+	  bot.sendMessage(
+		chatId,
+		`📱 *Set Callback Trunk Number*\n\n` +
+		`Current Callback Number: ${escapeMarkdown(currentCallbackNum)}\n\n` +
+		`This is the destination number/extension on the callback trunk.\n` +
+		`Enter the number that will receive the callbacks:\n\n` +
+		`Examples:\n` +
+		`• 18001234567 (US number)\n` +
+		`• 442012345678 (UK number)\n` +
+		`• 1000 (Extension)\n` +
+		`• s (for 's' extension in dialplan)`,
+		{ parse_mode: "Markdown" }
+	  );
+	  userStates[userId] = { action: "waiting_callback_trunk_number", campaignId: campaignForCallbackNum.id };
+	  break;
 
-      case "my_rates":
-        if (!user.rateCardId) {
-          bot.sendMessage(
-            chatId, 
-            "💳 *No Rate Card Assigned*\n\nYou don't have a rate card assigned. Please contact the administrator.",
-            { parse_mode: 'Markdown' }
-          );
-          return;
-        }
-        
-        try {
-          const rateCard = await RateCard.findByPk(user.rateCardId, {
-            include: [
-              { 
-                model: Provider, 
-                as: 'provider' 
-              }
-            ]
-          });
-          
-          bot.sendMessage(
-            chatId,
-            `💳 *Your Rate Card*\n\n` +
-            `Name: ${escapeMarkdown(rateCard.name)}\n` +
-            `Provider: ${escapeMarkdown(rateCard.provider.name)}\n` +
-            `Currency: ${rateCard.currency}\n\n` +
-            `To see specific rates for destinations, use /estimate command.`,
-            { parse_mode: 'Markdown' }
-          );
-        } catch (error) {
-          bot.sendMessage(chatId, `❌ Error: ${error.message}`);
-        }
-        break;
+	case "callback_single":
+	  const campaignSingle = await getOrCreateCampaign();
+	  if (!campaignSingle.callbackTrunkId) {
+		bot.sendMessage(chatId, "❌ Please set callback trunk first!");
+		return;
+	  }
+	  bot.sendMessage(
+		chatId,
+		`📞 *Enter Single Number for Callback*\n\nEnter the phone number (with country code):`,
+		{ parse_mode: "Markdown" }
+	  );
+	  userStates[userId] = { action: "waiting_callback_number", campaignId: campaignSingle.id };
+	  break;
 
-      case "estimate_cost":
-        if (!user.rateCardId) {
-          bot.sendMessage(chatId, "💳 No rate card assigned. Contact administrator.");
-          return;
-        }
-        
-        bot.sendMessage(
-          chatId,
-          "💱 *Estimate Call Cost*\n\nSend a phone number to get rate information.\nExample: +1234567890",
-          { parse_mode: "Markdown" }
-        );
-        userStates[userId] = { action: "waiting_estimate_number" };
-        break;
-
-      // Admin callbacks
-      case "admin_add_credit":
-        if (user.userType !== 'admin') {
-          bot.sendMessage(chatId, "❌ Admin access required!");
-          return;
-        }
-        bot.sendMessage(
-          chatId,
-          "💰 *Add Credit to User*\n\nEnter user ID and amount:\nFormat: `USER_ID AMOUNT`\nExample: `123456789 50.00`",
-          { parse_mode: 'Markdown' }
-        );
-        userStates[userId] = { action: 'admin_adding_credit' };
-        break;
-
-      case "admin_users":
-        if (user.userType !== 'admin') {
-          bot.sendMessage(chatId, "❌ Admin access required!");
-          return;
-        }
-        
-        try {
-          const users = await User.findAll({
-            order: [['createdAt', 'DESC']],
-            limit: 20
-          });
-          
-          let message = "👥 *User Management*\n\n";
-          
-          users.forEach((u, index) => {
-            const status = u.status === 'active' ? '✅' : '❌';
-            const type = u.userType === 'admin' ? '👑' : '👤';
-            
-            message += `${index + 1}. ${type} ${status} ${escapeMarkdown(u.firstName || u.username || 'Unknown')}\n`;
-            message += `   ID: ${u.telegramId} | Balance: $${u.balance}\n`;
-            message += `   Rate Card: ${u.rateCardId || 'None'}\n\n`;
-          });
-          
-          bot.sendMessage(
-            chatId,
-            message,
-            {
-              parse_mode: 'Markdown',
-              reply_markup: {
-                inline_keyboard: [
-                  [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
-                ]
-              }
-            }
-          );
-        } catch (error) {
-          bot.sendMessage(chatId, `❌ Error: ${error.message}`);
-        }
-        break;
-
-      case "admin_system_stats":
-        if (user.userType !== 'admin') {
-          bot.sendMessage(chatId, "❌ Admin access required!");
-          return;
-        }
-        
-        try {
-          const [totalUsers, activeUsers, totalCalls, totalRevenue] = await Promise.all([
-            User.count(),
-            User.count({ where: { status: 'active' } }),
-            CallDetail.count(),
-            Transaction.sum('amount', { where: { transactionType: 'debit' } })
-          ]);
-          
-          bot.sendMessage(
-            chatId,
-            `📊 *System Statistics*\n\n` +
-            `👥 Total Users: ${totalUsers}\n` +
-            `✅ Active Users: ${activeUsers}\n` +
-            `📞 Total Calls: ${totalCalls || 0}\n` +
-            `💰 Total Revenue: $${(totalRevenue || 0).toFixed(2)}`,
-            { parse_mode: 'Markdown' }
-          );
-        } catch (error) {
-          bot.sendMessage(chatId, `❌ Error: ${error.message}`);
-        }
-        break;
-
-      // Legacy callbacks (preserved)
-      case "set_callback_trunk":
-        let permittedUserCallback = await Allowed.findOne({ 
-          where: { telegramId: userId } 
-        });
-        console.log(`Request from User ${userId} for set_callback_trunk`)
-        if(userId == adminId){
-          permittedUserCallback = true;
-        }
-        if (!permittedUserCallback && user.userType !== 'admin') {
-          console.log("❌ Admin access required to set_callback_trunk!", userId);
-          bot.sendMessage(chatId, "❌ Admin access required!");
-          return;
-        }
-        
-        const callbackTrunks = await getSipTrunks();
-        
-        if (callbackTrunks.length === 0) {
-          bot.sendMessage(
-            chatId,
-            `☎️ *No SIP Trunks Found*\n\nNo SIP trunks are configured for callback.`,
-            { parse_mode: "Markdown" }
-          );
-        } else {
-          let trunkList = "☎️ *Select Callback SIP Trunk:*\n\n";
-          callbackTrunks.forEach((trunk, index) => {
-            trunkList += `${index + 1}. *${escapeMarkdown(trunk.name)}*\n`;
-            trunkList += `   📍 Host: ${escapeMarkdown(trunk.host)}\n`;
-            trunkList += `   👤 Username: ${escapeMarkdown(trunk.username || trunk.defaultuser || 'N/A')}\n`;
-            trunkList += `   🔌 Status: ${trunk.status ? '✅ Active' : '❌ Inactive'}\n\n`;
-          });
-          trunkList += "Enter the number of the callback trunk you want to use:";
-          
-          const campaignCallback = await getOrCreateCampaign(userId);
-          bot.sendMessage(chatId, trunkList, { parse_mode: "Markdown" });
-          userStates[userId] = { 
-            action: "waiting_callback_trunk_selection", 
-            sipTrunks: callbackTrunks,
-            campaignId: campaignCallback.id 
-          };
-        }
-        break;
-
-      case "initiate_callback":
-        const campaignCheck = await getOrCreateCampaign(userId);
-        
-        if (!campaignCheck.callbackTrunkId) {
-          bot.sendMessage(
-            chatId,
-            `❌ *Callback Trunk Not Set*\n\nPlease set a callback trunk first using "Set Callback Trunk" option.`,
-            { parse_mode: "Markdown" }
-          );
-          return;
-        }
-        
-        if (!campaignCheck.callbackTrunkNumber) {
-          bot.sendMessage(
-            chatId,
-            `❌ *Callback Number Not Set*\n\nPlease set a callback trunk number using "Set Callback Number" option.`,
-            { parse_mode: "Markdown" }
-          );
-          return;
-        }
-        
-        const callbackTrunkInfo = await SipPeer.findByPk(campaignCheck.callbackTrunkId);
-        
-        bot.sendMessage(
-          chatId,
-          `📲 *Initiate Callback*\n\n` +
-          `Callback Trunk: ${escapeMarkdown(callbackTrunkInfo ? callbackTrunkInfo.name : 'Loading...')}\n` +
-          `Callback Number: ${escapeMarkdown(campaignCheck.callbackTrunkNumber)}\n\n` +
-          `Select callback option:`,
-          {
-            parse_mode: "Markdown",
-            reply_markup: {
-              inline_keyboard: [
-                [
-                  { text: "📞 Single Number", callback_data: "callback_single" },
-                  { text: "📁 Upload List", callback_data: "callback_list" }
-                ],
-                [
-                  { text: "🔙 Back", callback_data: "back_to_menu" }
-                ]
-              ]
-            }
-          }
-        );
-        break;
-        
-      case "set_callback_number":
-        let permittedUserCallbackNum = await Allowed.findOne({ 
-          where: { telegramId: userId } 
-        });
-        console.log(`Request from User ${userId} for set_callback_number`)
-        if(userId == adminId){
-          permittedUserCallbackNum = true;
-        }
-        if (!permittedUserCallbackNum && user.userType !== 'admin') {
-          console.log("❌ Admin access required to set_callback_number!", userId);
-          bot.sendMessage(chatId, "❌ Admin access required!");
-          return;
-        }
-        
-        const campaignForCallbackNum = await getOrCreateCampaign(userId);
-        
-        if (!campaignForCallbackNum.callbackTrunkId) {
-          bot.sendMessage(
-            chatId,
-            `❌ *Callback Trunk Not Set*\n\nPlease set a callback trunk first before setting the callback number.`,
-            { parse_mode: "Markdown" }
-          );
-          return;
-        }
-        
-        const currentCallbackNum = campaignForCallbackNum.callbackTrunkNumber || 'Not set';
-        bot.sendMessage(
-          chatId,
-          `📱 *Set Callback Trunk Number*\n\n` +
-          `Current Callback Number: ${escapeMarkdown(currentCallbackNum)}\n\n` +
-          `This is the destination number/extension on the callback trunk.\n` +
-          `Enter the number that will receive the callbacks:\n\n` +
-          `Examples:\n` +
-          `• 18001234567 (US number)\n` +
-          `• 442012345678 (UK number)\n` +
-          `• 1000 (Extension)\n` +
-          `• s (for 's' extension in dialplan)`,
-          { parse_mode: "Markdown" }
-        );
-        userStates[userId] = { action: "waiting_callback_trunk_number", campaignId: campaignForCallbackNum.id };
-        break;
-
-      case "callback_single":
-        const campaignSingle = await getOrCreateCampaign(userId);
-        if (!campaignSingle.callbackTrunkId) {
-          bot.sendMessage(chatId, "❌ Please set callback trunk first!");
-          return;
-        }
-        bot.sendMessage(
-          chatId,
-          `📞 *Enter Single Number for Callback*\n\nEnter the phone number (with country code):`,
-          { parse_mode: "Markdown" }
-        );
-        userStates[userId] = { action: "waiting_callback_number", campaignId: campaignSingle.id };
-        break;
-
-      case "callback_list":
-        const campaignList = await getOrCreateCampaign(userId);
-        if (!campaignList.callbackTrunkId) {
-          bot.sendMessage(chatId, "❌ Please set callback trunk first!");
-          return;
-        }
-        bot.sendMessage(
-          chatId,
-          `📁 *Upload Callback List*\n\nPlease upload a TXT file with phone numbers (one per line).`,
-          { parse_mode: "Markdown" }
-        );
-        userStates[userId] = { action: "waiting_callback_file", campaignId: campaignList.id };
-        break;
-        
-      case "set_dial_prefix":
-        let permittedUserPrefix = await Allowed.findOne({ 
-          where: { telegramId: userId } 
-        });
-        console.log(`Request from User ${userId} for set_dial_prefix`)
-        if(userId == adminId){
-          permittedUserPrefix = true;
-        }
-        if (!permittedUserPrefix && user.userType !== 'admin') {
-          console.log("❌ Admin access required to set_dial_prefix!", userId);
-          bot.sendMessage(chatId, "❌ Admin access required!");
-          return;
-        }
-        
-        const campaignForPrefix = await getOrCreateCampaign(userId);
-        const currentPrefix = campaignForPrefix.dialPrefix || 'None';
-        bot.sendMessage(
-          chatId,
-          `➕ *Set Dial Prefix*\n\n` +
-          `Current Dial Prefix: ${currentPrefix}\n\n` +
-          `Enter the prefix to add before all dialed numbers.\n` +
-          `Examples:\n` +
-          `• 9 (for outbound access)\n` +
-          `• 011 (for international calls)\n` +
-          `• 1 (for long distance)\n` +
-          `The prefix will be added to all numbers when dialing.`,
-          { parse_mode: "Markdown" }
-        );
-        userStates[userId] = { action: "waiting_dial_prefix", campaignId: campaignForPrefix.id };
-        break;
-        
-      case "remove_dial_prefix":
-        let permittedUserPrefix1 = await Allowed.findOne({ 
-          where: { telegramId: userId } 
-        });
-        console.log(`Request from User ${userId} for set_dial_prefix`)
-        if(userId == adminId){
-          permittedUserPrefix1 = true;
-        }
-        if (!permittedUserPrefix1 && user.userType !== 'admin') {
-          console.log("❌ Admin access required to set_dial_prefix!", userId);
-          bot.sendMessage(chatId, "❌ Admin access required!");
-          return;
-        }
-        
-        const campaignPrefix = await getOrCreateCampaign(userId);
-        await campaignPrefix.update({ dialPrefix: '' });
-        
-        bot.sendMessage(
-          chatId,
-          `✅ *Dial Prefix Removed Successfully!*\n\n`,
-          { parse_mode: "Markdown", ...getUserMenu(user) }
-        );
-        delete userStates[userId];
-        break;
-        
+	case "callback_list":
+	  const campaignList = await getOrCreateCampaign();
+	  if (!campaignList.callbackTrunkId) {
+		bot.sendMessage(chatId, "❌ Please set callback trunk first!");
+		return;
+	  }
+	  bot.sendMessage(
+		chatId,
+		`📁 *Upload Callback List*\n\nPlease upload a TXT file with phone numbers (one per line).`,
+		{ parse_mode: "Markdown" }
+	  );
+	  userStates[userId] = { action: "waiting_callback_file", campaignId: campaignList.id };
+	  break;
+	  
+	  case "set_dial_prefix":
+		  let permittedUserPrefix = await Allowed.findOne({ 
+			where: { telegramId: userId } 
+		  });
+		  console.log(`Request from User ${userId} for set_dial_prefix`)
+		  if(userId == adminId){
+			permittedUserPrefix = true;
+		  }
+		  if (!permittedUserPrefix) {
+			console.log("❌ Admin access required to set_dial_prefix!", userId);
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const campaignForPrefix = await getOrCreateCampaign();
+		  const currentPrefix = campaignForPrefix.dialPrefix || 'None';
+		  bot.sendMessage(
+			chatId,
+			`➕ *Set Dial Prefix*\n\n` +
+			`Current Dial Prefix: ${currentPrefix}\n\n` +
+			`Enter the prefix to add before all dialed numbers.\n` +
+			`Examples:\n` +
+			`• 9 (for outbound access)\n` +
+			`• 011 (for international calls)\n` +
+			`• 1 (for long distance)\n` +
+			`The prefix will be added to all numbers when dialing.`,
+			{ parse_mode: "Markdown" }
+		  );
+		  userStates[userId] = { action: "waiting_dial_prefix", campaignId: campaignForPrefix.id };
+		  break;
+		  
+	  case "remove_dial_prefix":
+		  let permittedUserPrefix1 = await Allowed.findOne({ 
+			where: { telegramId: userId } 
+		  });
+		  console.log(`Request from User ${userId} for remove_dial_prefix`)
+		  if(userId == adminId){
+			permittedUserPrefix1 = true;
+		  }
+		  if (!permittedUserPrefix1) {
+			console.log("❌ Admin access required to remove_dial_prefix!", userId);
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const campaignPrefix = await getOrCreateCampaign();
+		  await campaignPrefix.update({ dialPrefix: '' });
+		  
+		  bot.sendMessage(
+			chatId,
+			`✅ *Dial Prefix Removed Successfully!*\n\n`,
+			{ parse_mode: "Markdown", ...mainMenu }
+		  );
+		  delete userStates[userId];
+		  break;
+		  
       case "start_campaign":
-        const campaign = await getOrCreateCampaign(userId);
-        
-        // Check if user has billing and validate balance
-        if (user.rateCardId) {
-          try {
-            const balanceCheck = await billingEngine.checkSufficientBalance(user.id, 1.0);
-            if (!balanceCheck.hasSufficientBalance) {
-              bot.sendMessage(
-                chatId,
-                `⚠️ *Insufficient Balance*\n\n` +
-                `Current Balance: $${balanceCheck.currentBalance.toFixed(2)}\n` +
-                `Available: $${balanceCheck.availableBalance.toFixed(2)}\n\n` +
-                `Please contact administrator to add credit.`,
-                { parse_mode: "Markdown" }
-              );
-              return;
-            }
-          } catch (error) {
-            console.error('Balance check error:', error);
-          }
-        }
+        // Check for campaign in database
+        const campaign = await getOrCreateCampaign();
         
         // Validate all required fields
         const missingFields = [];
@@ -1165,11 +759,12 @@ const initializeBot = () => {
           bot.sendMessage(
             chatId, 
             `⚠️ *Cannot Start Campaign*\n\nThe following required fields are not configured:\n${missingFields.map(f => `• ${f}`).join('\n')}\n\nPlease configure all required fields before starting the campaign.`,
-            { parse_mode: "Markdown", ...getUserMenu(user) }
+            { parse_mode: "Markdown", ...mainMenu }
           );
           return;
         }
 
+        // Validate the SIP trunk
         const trunkValidation = await validateSipTrunk(campaign.sipTrunkId);
         if (!trunkValidation.valid) {
           bot.sendMessage(
@@ -1180,56 +775,62 @@ const initializeBot = () => {
           return;
         }
 
-        let campaignMessage = `📤 *Start Campaign*\n\n` +
-          `Campaign: ${escapeMarkdown(campaign.campaignName)}\n` +
-          `SIP Trunk: ${escapeMarkdown(trunkValidation.trunk.name)}\n` +
-          `Caller ID: ${escapeMarkdown(campaign.callerId)}\n` +
-          `Dial Prefix: ${campaign.dialPrefix || 'None'}\n` +
-          `Concurrent Calls: ${campaign.concurrentCalls}\n`;
-          
-        if (user.rateCardId) {
-          campaignMessage += `💰 Available Balance: $${user.balance}\n`;
-        }
-        
-        campaignMessage += `\nPlease upload your leads file (TXT format) containing phone numbers.`;
-
         bot.sendMessage(
-          chatId,
-          campaignMessage,
-          { parse_mode: "Markdown" }
-        );
+		  chatId,
+		  `📤 *Start Order Verification Campaign*\n\n` +
+		  `Campaign: ${escapeMarkdown(campaign.campaignName)}\n` +
+		  `SIP Trunk: ${escapeMarkdown(trunkValidation.trunk.name)}\n` +
+		  `Caller ID: ${escapeMarkdown(campaign.callerId)}\n` +
+		  `Dial Prefix: ${campaign.dialPrefix || 'None'}\n` +
+		  `Concurrent Calls: ${campaign.concurrentCalls}\n\n` +
+		  `📋 *Call Flow:*\n` +
+		  `• Customer presses 1 → Order confirmed\n` +
+		  `• Customer presses 2 → Issue reported → OTP verification\n\n` +
+		  `Please upload your leads file (TXT format) containing phone numbers.`,
+		  { parse_mode: "Markdown" }
+		);
         userStates[userId] = { action: "waiting_campaign_file", campaignId: campaign.id };
         break;
 
       case "set_dtmf":
-        const campaignForDtmf = await getOrCreateCampaign(userId);
-        bot.sendMessage(
-          chatId,
-          `🔢 *Set DTMF Digit*\n\n` +
-          `Current DTMF digit: ${campaignForDtmf.dtmfDigit || '1'}\n\n` +
-          `Enter a single digit (0-9) that callers should press:`,
-          { parse_mode: "Markdown" }
-        );
-        userStates[userId] = { action: "waiting_dtmf_digit", campaignId: campaignForDtmf.id };
-        break;
+		  const campaignForDtmf = await getOrCreateCampaign();
+		  bot.sendMessage(
+			chatId,
+			`🔢 *Set DTMF Digit*\n\n` +
+			`Current DTMF digit: ${campaignForDtmf.dtmfDigit || '1'}\n\n` +
+			`Enter a single digit (0-9) that callers should press:`,
+			{ parse_mode: "Markdown" }
+		  );
+		  userStates[userId] = { action: "waiting_dtmf_digit", campaignId: campaignForDtmf.id };
+		  break;
 
-      case "call_status":
-        const currentCampaign = await getOrCreateCampaign(userId);
-        const stats = await getCallStats(currentCampaign.id);
-        bot.sendMessage(
-          chatId,
-          `📊 *Call Status Report*\n\n` +
-          `Total Calls Made: ${stats.total || 0}\n` +
-          `Successful Calls: ${stats.successful || 0}\n` +
-          `Failed Calls: ${stats.failed || 0}\n` +
-          `Voicemail Calls: ${stats.voicemail || 0}\n` +
-          `DTMF Responses (${currentCampaign.dtmfDigit || '1'}): ${stats.dtmf_responses || 0}\n` +
-          `Call Success Rate: ${stats.success_rate || 0}%\n` +
-          `Response Rate: ${stats.response_rate || 0}%\n\n` +
-          `Last updated: ${new Date().toLocaleString()}`,
-          { parse_mode: "Markdown" }
-        );
-        break;
+		case "call_status":
+		  const currentCampaign = await getOrCreateCampaign();
+		  const stats = await getCallStats(currentCampaign.id);
+		  
+		  // Get pending verifications count
+		  const { getPendingVerifications } = require("../asterisk/instance");
+		  const pendingVerifications = getPendingVerifications();
+		  
+		  bot.sendMessage(
+			chatId,
+			`📊 *Order Verification Status*\n\n` +
+			`📞 *Call Statistics:*\n` +
+			`Total Calls Made: ${stats.total || 0}\n` +
+			`Successful Calls: ${stats.successful || 0}\n` +
+			`Failed Calls: ${stats.failed || 0}\n` +
+			`Voicemail Calls: ${stats.voicemail || 0}\n\n` +
+			`🔢 *DTMF Responses:*\n` +
+			`Total DTMF Responses: ${stats.dtmf_responses || 0}\n` +
+			`Success Rate: ${stats.success_rate || 0}%\n` +
+			`Response Rate: ${stats.response_rate || 0}%\n\n` +
+			`🔍 *Current Status:*\n` +
+			`Pending Verifications: ${pendingVerifications.length}\n` +
+			`DTMF Digit Tracked: ${currentCampaign.dtmfDigit || '1'}\n\n` +
+			`Last updated: ${new Date().toLocaleString()}`,
+			{ parse_mode: "Markdown" }
+		  );
+		  break;
 
       case "get_id":
         bot.sendMessage(
@@ -1240,138 +841,129 @@ const initializeBot = () => {
         break;
 
       case "upload_leads":
-        const checkCampaign = await getOrCreateCampaign(userId);
-        const isConfigured = checkCampaign.sipTrunkId && checkCampaign.callerId;
-        
-        let leadsMessage = `📁 *Upload Leads File*\n\n` +
-          `Please send a TXT file with phone numbers (one per line).\n\n`;
-          
-        if (user.rateCardId) {
-          leadsMessage += `💰 Your balance: $${user.balance}\n`;
-          if (isConfigured) {
-            leadsMessage += `✅ Campaign is configured and will auto-start after upload.`;
-          } else {
-            leadsMessage += `⚠️ Campaign configuration incomplete.`;
-          }
-        } else {
-          if (isConfigured) {
-            leadsMessage += `✅ Campaign is configured and will auto-start after upload.\n` +
-              `• SIP Trunk: ${checkCampaign.sipTrunkId ? 'Set' : 'Not set'}\n` +
-              `• Caller ID: ${checkCampaign.callerId ? escapeMarkdown(checkCampaign.callerId) : 'Not set'}`;
-          } else {
-            leadsMessage += `⚠️ Campaign is NOT fully configured.\n` +
-              `Missing: ${!checkCampaign.sipTrunkId ? 'SIP Trunk' : ''} ${!checkCampaign.callerId ? 'Caller ID' : ''}\n` +
-              `Leads will be saved but dialing won't start automatically.`;
-          }
-        }
-        
-        bot.sendMessage(
-          chatId,
-          leadsMessage,
-          { parse_mode: "Markdown" }
-        );
-        userStates[userId] = { action: "waiting_leads_file" };
-        break;
+		  const checkCampaign = await getOrCreateCampaign();
+		  const isConfigured = checkCampaign.sipTrunkId && checkCampaign.callerId;
+		  
+		  bot.sendMessage(
+			chatId,
+			`📁 *Upload Order Verification Leads*\n\n` +
+			`Please send a TXT file with phone numbers (one per line).\n\n` +
+			`📋 *Call Flow:*\n` +
+			`• Each number will be called\n` +
+			`• Press 1 → Order confirmed\n` +
+			`• Press 2 → Issue reported → OTP verification\n\n` +
+			(isConfigured ? 
+			  `✅ Campaign is configured and will auto-start after upload.\n` +
+			  `• SIP Trunk: ${checkCampaign.sipTrunkId ? 'Set' : 'Not set'}\n` +
+			  `• Caller ID: ${checkCampaign.callerId ? escapeMarkdown(checkCampaign.callerId) : 'Not set'}` :
+			  `⚠️ Campaign is NOT fully configured.\n` +
+			  `Missing: ${!checkCampaign.sipTrunkId ? 'SIP Trunk' : ''} ${!checkCampaign.callerId ? 'Caller ID' : ''}\n` +
+			  `Leads will be saved but dialing won't start automatically.`
+			),
+			{ parse_mode: "Markdown" }
+		  );
+		  userStates[userId] = { action: "waiting_leads_file" };
+		  break;
 
       case "set_caller_id":
-        let permittedUser = await Allowed.findOne({ 
-          where: { telegramId: userId } 
-        });
-        console.log(`Request from User ${userId} for set_caller_id`)
-        if(userId == adminId){
-          permittedUser = true;
-        }
-        if (!permittedUser && user.userType !== 'admin') {
-          console.log("❌ Admin access required to set_caller_id!", userId);
-          bot.sendMessage(chatId, "❌ Admin access required!");
-          return;
-        }
-        
-        const campaignForCallerId = await getOrCreateCampaign(userId);
-        const currentCallerId = campaignForCallerId.callerId || 'Not set';
-        bot.sendMessage(
-          chatId,
-          `📞 *Set Caller ID*\n\n` +
-          `Current Caller ID: ${escapeMarkdown(currentCallerId)}\n\n` +
-          `Please enter the phone number to use as Caller ID.\n` +
-          `Formats accepted:\n` +
-          `• 1234567890\n` +
-          `• 11234567890\n` +
-          `• +11234567890\n` +
-          `• (123) 456-7890`,
-          { parse_mode: "Markdown" }
-        );
-        userStates[userId] = { action: "waiting_caller_id", campaignId: campaignForCallerId.id };
-        break;
+		  let permittedUser = await Allowed.findOne({ 
+			where: { telegramId: userId } 
+		  });
+		  console.log(`Request from User ${userId} for set_caller_id`)
+		  if(userId == adminId){
+			permittedUser = true;
+		  }
+		  if (!permittedUser) {
+			console.log("❌ Admin access required to set_caller_id!", userId);
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const campaignForCallerId = await getOrCreateCampaign();
+		  const currentCallerId = campaignForCallerId.callerId || 'Not set';
+		  bot.sendMessage(
+			chatId,
+			`📞 *Set Caller ID*\n\n` +
+			`Current Caller ID: ${escapeMarkdown(currentCallerId)}\n\n` +
+			`Please enter the phone number to use as Caller ID.\n` +
+			`Formats accepted:\n` +
+			`• 1234567890\n` +
+			`• 11234567890\n` +
+			`• +11234567890\n` +
+			`• (123) 456-7890`,
+			{ parse_mode: "Markdown" }
+		  );
+		  userStates[userId] = { action: "waiting_caller_id", campaignId: campaignForCallerId.id };
+		  break;
 
       case "set_concurrent":
-        let permittedUser2 = await Allowed.findOne({ 
-          where: { telegramId: userId } 
-        });
-        console.log(`Request from User ${userId} for set_concurrent`)
-        if(userId == adminId){
-          permittedUser2 = true;
-        }
-        if (!permittedUser2 && user.userType !== 'admin') {
-          console.log("❌ Admin access required to set_concurrent!", userId);
-          bot.sendMessage(chatId, "❌ Admin access required!");
-          return;
-        }
-        const campaign2 = await getOrCreateCampaign(userId);
-        bot.sendMessage(
-          chatId,
-          `⚙️ *Set Concurrent Calls*\n\nCurrent: ${campaign2.concurrentCalls || 30}\nPlease enter the new number of concurrent calls (1-100):`,
-          { parse_mode: "Markdown" }
-        );
-        userStates[userId] = { action: "waiting_concurrent_number", campaignId: campaign2.id };
-        break;
+		  let permittedUser2 = await Allowed.findOne({ 
+			where: { telegramId: userId } 
+		  });
+		  console.log(`Request from User ${userId} for set_concurrent`)
+		  if(userId == adminId){
+			permittedUser2 = true;
+		  }
+		  if (!permittedUser2) {
+			console.log("❌ Admin access required to set_concurrent!", userId);
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  const campaign2 = await getOrCreateCampaign();
+		  bot.sendMessage(
+			chatId,
+			`⚙️ *Set Concurrent Calls*\n\nCurrent: ${campaign2.concurrentCalls || 30}\nPlease enter the new number of concurrent calls (1-100):`,
+			{ parse_mode: "Markdown" }
+		  );
+		  userStates[userId] = { action: "waiting_concurrent_number", campaignId: campaign2.id };
+		  break;
 
       case "upload_ivr":
-        let permittedUser3 = await Allowed.findOne({ 
-            where: { telegramId: userId } 
-        });
-        console.log(`Request from User ${userId} for upload_ivr`)
-        if(userId == adminId){
-          permittedUser3 = true;
-        }
-        if (!permittedUser3 && user.userType !== 'admin') {
-          console.log("❌ Admin access required to upload_ivr!", userId);
-          bot.sendMessage(chatId, "❌ Admin access required!");
-          return;
-        }
-        bot.sendMessage(
-          chatId,
-          "🎵 *Upload IVR Audio*\n\n" +
-          "Supported formats: WAV, MP3, MP4, M4A, AAC, OGG, FLAC\n" +
-          "File will be converted to: PCM 16-bit, 8000Hz, Mono\n\n" +
-          "Select type:",
-          {
-            parse_mode: "Markdown",
-            reply_markup: {
-              inline_keyboard: [
-                [
-                  { text: "📥 Intro Message", callback_data: "ivr_intro" },
-                  { text: "📤 Outro Message", callback_data: "ivr_outro" }
-                ]
-              ]
-            }
-          }
-        );
-        break;
+		  let permittedUser3 = await Allowed.findOne({ 
+			  where: { telegramId: userId } 
+		  });
+		  console.log(`Request from User ${userId} for upload_ivr`)
+		  if(userId == adminId){
+			permittedUser3 = true;
+		  }
+		  if (!permittedUser3) {
+			console.log("❌ Admin access required to upload_ivr!", userId);
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  bot.sendMessage(
+			chatId,
+			"🎵 *Upload IVR Audio*\n\n" +
+			"Supported formats: WAV, MP3, MP4, M4A, AAC, OGG, FLAC\n" +
+			"File will be converted to: PCM 16-bit, 8000Hz, Mono\n\n" +
+			"Select type:",
+			{
+			  parse_mode: "Markdown",
+			  reply_markup: {
+				inline_keyboard: [
+				  [
+					{ text: "📥 Intro Message", callback_data: "ivr_intro" },
+					{ text: "📤 Outro Message", callback_data: "ivr_outro" }
+				  ]
+				]
+			  }
+			}
+		  );
+		  break;
 
       case "ivr_intro":
       case "ivr_outro":
         const ivrType = callbackData.split("_")[1];
-        const campaign3 = await getOrCreateCampaign(userId);
-        
-        userStates[userId] = { 
-          action: "waiting_ivr_file", 
-          ivrType, 
-          campaignId: campaign3.id 
-        };
-        
-        logUserState(userId, 'Set waiting_ivr_file', userStates[userId]);
-        
+        const campaign3 = await getOrCreateCampaign();
+		
+		userStates[userId] = { 
+			action: "waiting_ivr_file", 
+			ivrType, 
+			campaignId: campaign3.id 
+		};
+		
+		logUserState(userId, 'Set waiting_ivr_file', userStates[userId]);
+		
         bot.sendMessage(
           chatId,
           `Please upload the ${ivrType} audio file now.`,
@@ -1380,57 +972,60 @@ const initializeBot = () => {
         break;
 
       case "set_sip":
-        let permittedUser4 = await Allowed.findOne({ 
-          where: { telegramId: userId } 
-        });
-        console.log(`Request from User ${userId} for set_sip`)
-        if(userId == adminId){
-          permittedUser4 = true;
-        }
-        if (!permittedUser4 && user.userType !== 'admin') {
-          console.log("❌ Admin access required to set_sip!", userId);
-          bot.sendMessage(chatId, "❌ Admin access required!");
-          return;
-        }
-        
-        const sipTrunks = await getSipTrunks();
-        
-        if (sipTrunks.length === 0) {
-          bot.sendMessage(
-            chatId,
-            `🌐 *No SIP Trunks Found*\n\nNo SIP trunks are configured in the system.\n\nYou can:\n1. Visit the web portal to create one: ${config.web_portal_url}\n2. Create a new SIP trunk here`,
-            {
-              parse_mode: "Markdown",
-              reply_markup: {
-                inline_keyboard: [
-                  [{ text: "➕ Create New SIP Trunk", callback_data: "create_sip_trunk" }],
-                  [{ text: "🔙 Back to Menu", callback_data: "back_to_menu" }]
-                ]
-              }
-            }
-          );
-        } else {
-          let trunkList = "🌐 *Available SIP Trunks:*\n\n";
-          sipTrunks.forEach((trunk, index) => {
-            trunkList += `${index + 1}. *${escapeMarkdown(trunk.name)}*\n`;
-            trunkList += `   📍 Host: ${escapeMarkdown(trunk.host)}\n`;
-            trunkList += `   👤 Username: ${escapeMarkdown(trunk.username || trunk.defaultuser || 'N/A')}\n`;
-            if (trunk.description) {
-              trunkList += `   📝 ${escapeMarkdown(trunk.description)}\n`;
-            }
-            trunkList += `   🔌 Status: ${trunk.status ? '✅ Active' : '❌ Inactive'}\n\n`;
-          });
-          trunkList += "Enter the number of the trunk you want to use:";
-          
-          const campaign4 = await getOrCreateCampaign(userId);
-          bot.sendMessage(chatId, trunkList, { parse_mode: "Markdown" });
-          userStates[userId] = { 
-            action: "waiting_sip_selection", 
-            sipTrunks: sipTrunks,
-            campaignId: campaign4.id 
-          };
-        }
-        break;
+		  let permittedUser4 = await Allowed.findOne({ 
+			where: { telegramId: userId } 
+		  });
+		  console.log(`Request from User ${userId} for set_sip`)
+		  if(userId == adminId){
+			permittedUser4 = true;
+		  }
+		  if (!permittedUser4) {
+			console.log("❌ Admin access required to set_sip!", userId);
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  // Get available SIP trunks
+		  const sipTrunks = await getSipTrunks();
+		  
+		  if (sipTrunks.length === 0) {
+			bot.sendMessage(
+			  chatId,
+			  `🌐 *No SIP Trunks Found*\n\nNo SIP trunks are configured in the system.\n\nYou can:\n1. Visit the web portal to create one: ${config.web_portal_url}\n2. Create a new SIP trunk here`,
+			  {
+				parse_mode: "Markdown",
+				reply_markup: {
+				  inline_keyboard: [
+					[{ text: "➕ Create New SIP Trunk", callback_data: "create_sip_trunk" }],
+					[{ text: "🔙 Back to Menu", callback_data: "back_to_menu" }]
+				  ]
+				}
+			  }
+			);
+		  } else {
+			// List available trunks with more details
+			let trunkList = "🌐 *Available SIP Trunks:*\n\n";
+			sipTrunks.forEach((trunk, index) => {
+			  // PROPERLY ESCAPE all dynamic content
+			  trunkList += `${index + 1}. *${escapeMarkdown(trunk.name)}*\n`;
+			  trunkList += `   📍 Host: ${escapeMarkdown(trunk.host)}\n`;
+			  trunkList += `   👤 Username: ${escapeMarkdown(trunk.username || trunk.defaultuser || 'N/A')}\n`;
+			  if (trunk.description) {
+				trunkList += `   📝 ${escapeMarkdown(trunk.description)}\n`;
+			  }
+			  trunkList += `   🔌 Status: ${trunk.status ? '✅ Active' : '❌ Inactive'}\n\n`;
+			});
+			trunkList += "Enter the number of the trunk you want to use:";
+			
+			const campaign4 = await getOrCreateCampaign();
+			bot.sendMessage(chatId, trunkList, { parse_mode: "Markdown" });
+			userStates[userId] = { 
+			  action: "waiting_sip_selection", 
+			  sipTrunks: sipTrunks,
+			  campaignId: campaign4.id 
+			};
+		  }
+		  break;
 
       case "create_sip_trunk":
         bot.sendMessage(
@@ -1450,22 +1045,22 @@ const initializeBot = () => {
           "• context: Asterisk context (e.g., outbound-trunk)",
           { parse_mode: "Markdown" }
         );
-        const campaign5 = await getOrCreateCampaign(userId);
+        const campaign5 = await getOrCreateCampaign();
         userStates[userId] = { action: "waiting_new_sip_config", campaignId: campaign5.id };
         break;
 
       case "set_notifications":
-        const campaign6 = await getOrCreateCampaign(userId);
+        const campaign6 = await getOrCreateCampaign();
         await campaign6.update({ notificationsChatId: chatId });
         bot.sendMessage(
           chatId,
-          `✅ *Notifications Channel Set*\n\nThis chat (${chatId}) will receive all notifications for this campaign.`,
+          `✅ *Notifications Channel Set*\n\nThis chat (${chatId}) will receive all verification notifications for this campaign.`,
           { parse_mode: "Markdown" }
         );
         break;
 
       case "permit_user":
-        if (user.userType !== 'admin') {
+        if (userId != adminId) {
           bot.sendMessage(chatId, "❌ Admin access required!");
           return;
         }
@@ -1478,13 +1073,13 @@ const initializeBot = () => {
         break;
 
       case "campaign_stats":
-        const campaignStats = await getCallStats();
-        const currentCampaignStats = await getOrCreateCampaign(userId);
-        
-        let trunkInfo = 'Not configured';
-        if (currentCampaignStats.sipTrunk) {
-          trunkInfo = `${escapeMarkdown(currentCampaignStats.sipTrunk.name)} (${escapeMarkdown(currentCampaignStats.sipTrunk.host)})`;
-          if (!currentCampaignStats.sipTrunk.status) {
+		  const campaignStats = await getCallStats();
+		  const currentCampaignStats = await getOrCreateCampaign();
+		  
+		  let trunkInfo = 'Not configured';
+		  if (currentCampaignStats.sipTrunk) {
+			trunkInfo = `${escapeMarkdown(currentCampaignStats.sipTrunk.name)} (${escapeMarkdown(currentCampaignStats.sipTrunk.host)})`;
+			if (!currentCampaignStats.sipTrunk.status) {
 			  trunkInfo += ' ⚠️ INACTIVE';
 			}
 		  }
@@ -1503,7 +1098,7 @@ const initializeBot = () => {
 		  // Use escape characters for special markdown characters
 		  bot.sendMessage(
 			chatId,
-			`📈 *Campaign Statistics*\n\n` +
+			`📈 *Order Verification Campaign Statistics*\n\n` +
 			`*Campaign Info:*\n` +
 			`• Name: ${escapeMarkdown(currentCampaignStats.campaignName)}\n` +
 			`• SIP Trunk: ${trunkInfo}\n` +
@@ -1528,7 +1123,7 @@ const initializeBot = () => {
 
       case "back_to_menu":
         bot.editMessageText(
-          "🤖 *Call Campaign Bot*\n\nSelect an option:",
+          "🤖 *Order Verification Bot*\n\nSelect an option:",
           {
             chat_id: chatId,
             message_id: query.message.message_id,
@@ -1781,7 +1376,7 @@ const initializeBot = () => {
 		  delete userStates[userId];
 		  break;
 
-
+      
       case "waiting_sip_selection":
         const selection = parseInt(text);
         if (isNaN(selection) || selection < 1 || selection > userState.sipTrunks.length) {
@@ -2200,6 +1795,92 @@ const initializeBot = () => {
 			  break;
 
 			
+		  case "scheduling_ivr_intro":
+			case "scheduling_ivr_outro":
+			  console.log('[Scheduling IVR] Processing IVR file for scheduling');
+			  console.log('[Scheduling IVR] Type:', userState.action);
+			  
+			  // Check file extension
+			  if (!fileName.toLowerCase().match(/\.(wav|mp3|mp4|m4a|aac|ogg|flac)$/)) {
+				bot.sendMessage(chatId, "❌ Please upload an audio file (WAV, MP3, MP4, M4A, AAC, OGG, or FLAC).");
+				return;
+			  }
+			  
+			  // Sanitize filename
+			  const ivrType = userState.action.includes('intro') ? 'intro' : 'outro';
+			  const timestamp = Date.now();
+			  const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+			  const ivrFileNameSchedule = `sched_${ivrType}_${timestamp}_${sanitizedFileName}.wav`;
+			  
+			  console.log('[Scheduling IVR] Saving as:', ivrFileNameSchedule);
+			  
+			  // Paths
+			  const soundsPathSchedule = "/var/lib/asterisk/sounds/";
+			  const tempPathSchedule = `/tmp/${timestamp}_${fileName}`;
+			  const finalPathSchedule = path.join(soundsPathSchedule, ivrFileNameSchedule);
+			  
+			  try {
+				// Save uploaded file temporarily
+				fs.writeFileSync(tempPathSchedule, fileBuffer);
+				console.log('[Scheduling IVR] Temp file saved');
+				
+				bot.sendMessage(chatId, "🔄 Converting audio file to Asterisk format...");
+				
+				// Convert audio to proper format (assuming convertAudioFile function exists)
+				await convertAudioFile(tempPathSchedule, finalPathSchedule);
+				console.log('[Scheduling IVR] Audio converted');
+				
+				// Clean up temp file
+				if (fs.existsSync(tempPathSchedule)) {
+				  fs.unlinkSync(tempPathSchedule);
+				}
+				
+				// Store the filename in schedule data
+				if (ivrType === 'intro') {
+				  userState.scheduleData.ivrIntroFile = ivrFileNameSchedule;
+				  
+				  // Ask if they want to upload outro
+				  bot.sendMessage(
+					chatId,
+					`✅ Intro IVR uploaded successfully!\n\n` +
+					`Would you like to upload an outro IVR file?`,
+					{ 
+					  parse_mode: 'Markdown',
+					  reply_markup: {
+						inline_keyboard: [
+						  [{ text: '📤 Upload Outro IVR', callback_data: 'sched_ivr_outro' }],
+						  [{ text: '✅ Done with IVR', callback_data: 'sched_ivr_done' }]
+						]
+					  }
+					}
+				  );
+				  userState.action = 'scheduling_ivr_choice';
+				} else {
+				  userState.scheduleData.ivrOutroFile = ivrFileNameSchedule;
+				  
+				  // Both IVR files uploaded or just outro, complete scheduling
+				  bot.sendMessage(
+					chatId,
+					`✅ Outro IVR uploaded successfully!\n\n` +
+					`Finalizing campaign schedule...`,
+					{ parse_mode: 'Markdown' }
+				  );
+				  
+				  // Import the function from scheduling module
+				  const { completeScheduling } = require('./scheduling');
+				  await completeScheduling(bot, chatId, userId, userState, userStates);
+				}
+				
+			  } catch (err) {
+				console.error('[Scheduling IVR] Processing error:', err);
+				// Clean up temp file if exists
+				if (fs.existsSync(tempPathSchedule)) {
+				  fs.unlinkSync(tempPathSchedule);
+				}
+				bot.sendMessage(chatId, `❌ Failed to process IVR file: ${err.message}`);
+			  }
+			  break;
+			  
 		  case "waiting_ivr_file":
 			console.log('[IVR] Processing IVR file');
 			console.log('[IVR] File type:', msg.audio ? 'audio' : 'document');
@@ -2273,7 +1954,83 @@ const initializeBot = () => {
 			  bot.sendMessage(chatId, `❌ Failed to process IVR file: ${err.message}`);
 			}
 			break;
-			
+		
+		  case "scheduling_numbers":
+        // Handle scheduling numbers upload
+        console.log('[Scheduling] Processing numbers file for scheduling');
+        
+        if (!fileName.endsWith('.txt')) {
+          bot.sendMessage(chatId, "❌ Please upload a TXT file.");
+          return;
+        }
+        
+        // Parse the file
+        const lines = fileBuffer.toString().split('\n');
+        const numbers = [];
+        
+        for (const line of lines) {
+          const cleaned = line.trim().replace(/[^0-9+]/g, '');
+          if (cleaned) {
+            numbers.push({
+              phoneNumber: cleaned.startsWith('+') ? cleaned : '+' + cleaned,
+              rawLine: line.trim()
+            });
+          }
+        }
+        
+        if (numbers.length === 0) {
+          bot.sendMessage(chatId, `❌ No valid phone numbers found in file.`);
+          return;
+        }
+        
+        userState.scheduleData.numbersList = numbers;
+        userState.scheduleData.totalNumbers = numbers.length;
+        
+        // Get SIP trunks
+        const sipTrunks = await SipPeer.findAll({
+          where: { 
+            category: 'trunk',
+            status: 1
+          },
+          order: [['id', 'ASC']]
+        });
+        
+        if (sipTrunks.length === 0) {
+          bot.sendMessage(
+            chatId,
+            `❌ No active SIP trunks found. Please configure a SIP trunk first.`,
+            { parse_mode: 'Markdown' }
+          );
+          delete userStates[userId];
+          return;
+        }
+        
+        // Show SIP trunk selection
+        const keyboard = {
+          inline_keyboard: sipTrunks.map(trunk => [{
+            text: `${escapeMarkdown(trunk.name)} (${escapeMarkdown(trunk.host)})`,
+            callback_data: `sched_trunk_${trunk.id}`
+          }])
+        };
+        
+        bot.sendMessage(
+          chatId,
+          `✅ *Loaded ${numbers.length} phone numbers*\n\n` +
+          `Step 2: Select SIP Trunk\n\n` +
+          `Choose the SIP trunk to use:`,
+          { 
+            parse_mode: 'Markdown',
+            reply_markup: keyboard
+          }
+        );
+        
+        userState.sipTrunks = sipTrunks;
+        userState.action = 'scheduling_sip_selection';
+        
+        console.log(`[Scheduling] Numbers loaded: ${numbers.length}, moving to SIP selection`);
+        break;
+
+    
 		  default:
 			console.log(`[File] Unknown action: ${userState.action}`);
 			bot.sendMessage(chatId, "❌ Unknown action. Please try again from the menu.");
@@ -2298,68 +2055,6 @@ const initializeBot = () => {
     );
   });
    
-   
-  // Cost estimation command for users
-  bot.onText(/\/estimate (.+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    const phoneNumber = match[1];
-    
-    const user = await checkUserAccess(userId, chatId);
-    if (!user) return;
-    
-    if (!user.rateCardId) {
-      bot.sendMessage(chatId, "❌ No rate card assigned. Contact administrator.");
-      return;
-    }
-    
-    try {
-      const estimate = await billingEngine.estimateCallCost(user.id, phoneNumber, 1);
-      
-      bot.sendMessage(
-        chatId,
-        `💰 *Rate Information*\n\n` +
-        `Number: ${escapeMarkdown(phoneNumber)}\n` +
-        `Destination: ${escapeMarkdown(estimate.destination.countryName)}\n` +
-        `Rate: $${estimate.sellPrice.toFixed(6)} per minute\n` +
-        `1 min cost: $${estimate.sellPrice.toFixed(4)}\n` +
-        `5 min cost: $${(estimate.sellPrice * 5).toFixed(4)}`,
-        { parse_mode: "Markdown" }
-      );
-      
-    } catch (error) {
-      bot.sendMessage(chatId, `❌ Error: ${error.message}`);
-    }
-  });
-  
-  // Balance check command
-  bot.onText(/\/balance/, async (msg) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    
-    const user = await checkUserAccess(userId, chatId);
-    if (!user) return;
-    
-    try {
-      const financial = await billingEngine.getUserFinancialSummary(user.id);
-      
-      bot.sendMessage(
-        chatId,
-        `💰 *Account Balance*\n\n` +
-        `Current Balance: $${financial.summary.currentBalance.toFixed(2)}\n` +
-        `Credit Limit: $${financial.summary.creditLimit.toFixed(2)}\n` +
-        `Available Balance: $${financial.summary.availableBalance.toFixed(2)}\n\n` +
-        `Recent Activity:\n` +
-        `Calls This Month: ${financial.summary.totalCalls}\n` +
-        `Minutes Used: ${financial.summary.totalMinutes.toFixed(2)}\n` +
-        `Amount Spent: $${financial.summary.totalSpent.toFixed(2)}`,
-        { parse_mode: "Markdown" }
-      );
-      
-    } catch (error) {
-      bot.sendMessage(chatId, `❌ Error: ${error.message}`);
-    }
-  });
   // Add these commands to the telegram bot initialization
 
 // /line command - get last pressed DTMF entries
@@ -2533,12 +2228,8 @@ bot.onText(/\/reset/, async (msg) => {
 
 };
 
-function stopCallingProcess() {
-  if (global.callingInterval) {
-    clearInterval(global.callingInterval);
-    global.callingInterval = null;
-  }
-  console.log('Calling process stopped');
-}
-
-module.exports = { initializeBot, startCallingProcess, stopCallingProcess  };
+module.exports = { 
+	initializeBot,
+	startCallingProcess: startCallingProcess || function() {},
+	stopCallingProcess 
+};

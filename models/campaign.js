@@ -112,37 +112,6 @@ const Campaign = sequelize.define('Campaign', {
     defaultValue: true,
     field: 'is_active'
   },
-  campaignStatus: {
-    type: DataTypes.ENUM('immediate', 'scheduled', 'running', 'paused', 'completed', 'cancelled'),
-    defaultValue: 'immediate',
-    field: 'campaign_status'
-  },
-  scheduledStart: {
-    type: DataTypes.DATE,
-    allowNull: true,
-    field: 'scheduled_start'
-  },
-  scheduledEnd: {
-    type: DataTypes.DATE,
-    allowNull: true,
-    field: 'scheduled_end'
-  },
-  numbersList: {
-    type: DataTypes.TEXT('long'),
-    field: 'numbers_list',
-    get() {
-      const rawValue = this.getDataValue('numbersList');
-      return rawValue ? JSON.parse(rawValue) : [];
-    },
-    set(value) {
-      this.setDataValue('numbersList', JSON.stringify(value));
-    }
-  },
-  createdBy: {
-    type: DataTypes.STRING(50),
-    allowNull: true,
-    field: 'created_by'
-  },
   createdAt: {
     type: DataTypes.DATE,
     defaultValue: DataTypes.NOW,
