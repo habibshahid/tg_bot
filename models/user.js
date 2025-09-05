@@ -1,4 +1,4 @@
-// models/user.js
+// models/user.js - FIXED VERSION
 const { DataTypes } = require('sequelize');
 const sequelize = require('../config/database');
 
@@ -91,5 +91,8 @@ const User = sequelize.define('User', {
   timestamps: true,
   underscored: true
 });
+
+// IMPORTANT: Do NOT define associations here!
+// Associations should be defined in a separate file or after all models are loaded
 
 module.exports = User;

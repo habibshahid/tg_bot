@@ -129,31 +129,65 @@ class BillingEngine {
    * Estimate call cost for pre-call validation
    */
   async estimateCallCost(userId, phoneNumber, estimatedDurationMinutes = 5) {
-    const user = await User.findByPk(userId);
-    if (!user || !user.rateCardId) {
-      throw new Error('User not found or no rate card assigned');
-    }
+	  try {
+		const user = await User.findByPk(userId);
+		if (!user) {
+		  throw new Error('USER_NOT_FOUND');
+		}
+		
+		if (!user.rateCardId) {
+		  throw new Error('NO_RATE_CARD_ASSIGNED');
+		}
+		
+		if (user.status !== 'active') {
+		  throw new Error('USER_ACCOUNT_SUSPENDED');
+		}
 
-    const destination = await this.findDestination(phoneNumber);
-    if (!destination) {
-      throw new Error('Destination not found or not supported');
-    }
+		const destination = await this.findDestination(phoneNumber);
+		if (!destination) {
+		  throw new Error('DESTINATION_NOT_SUPPORTED');
+		}
 
-    const rate = await this.getRate(user.rateCardId, destination.id);
-    if (!rate) {
-      throw new Error('No rate found for this destination');
-    }
+		const rate = await this.getRate(user.rateCardId, destination.id);
+		if (!rate) {
+		  throw new Error('NO_RATE_AVAILABLE');
+		}
 
-    const estimatedCost = parseFloat(rate.sellPrice) * estimatedDurationMinutes;
-    
-    return {
-      destination,
-      rate,
-      estimatedCost,
-      sellPrice: parseFloat(rate.sellPrice),
-      currency: 'USD' // From user or rate card
-    };
-  }
+		const estimatedCost = parseFloat(rate.sellPrice) * estimatedDurationMinutes;
+		
+		return {
+		  success: true,
+		  destination,
+		  rate,
+		  estimatedCost,
+		  sellPrice: parseFloat(rate.sellPrice),
+		  currency: user.currency || 'USD'
+		};
+		
+	  } catch (error) {
+		return {
+		  success: false,
+		  error: error.message,
+		  userFriendlyMessage: this.getUserFriendlyErrorMessage(error.message)
+		};
+	  }
+	}
+
+	/**
+	 * Get user-friendly error messages
+	 */
+	getUserFriendlyErrorMessage(errorCode) {
+	  const messages = {
+		'USER_NOT_FOUND': 'User account not found. Please contact administrator.',
+		'NO_RATE_CARD_ASSIGNED': 'No rate card assigned to your account. Please contact administrator.',
+		'USER_ACCOUNT_SUSPENDED': 'Your account is suspended. Please contact administrator.',
+		'DESTINATION_NOT_SUPPORTED': 'This destination is not supported in your rate card.',
+		'NO_RATE_AVAILABLE': 'No rates available for this destination.',
+		'INSUFFICIENT_BALANCE': 'Insufficient balance. Please add credit to your account.'
+	  };
+	  
+	  return messages[errorCode] || 'An error occurred while processing your request.';
+	}
 
   /**
    * Process call billing after call completion

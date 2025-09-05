@@ -21,9 +21,12 @@ const sequelize = require("../config/database");
 const User = require("../models/user");
 const { Provider, RateCard, Destination, Rate } = require("../models/provider");
 const { Transaction, CallDetail } = require("../models/transaction");
+
+require("../models/associations");
+
 const billingEngine = require("../services/billingEngine");
 const { setupBillingEventHandlers } = require("../asterisk/billingCallHandler");
-
+const adminUtilities = require("../utils/adminUtilities");
 const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
@@ -485,7 +488,7 @@ async function getCallStats(campaignId = null) {
         success_rate: campaign.totalCalls > 0 ? (((campaign.successfulCalls) / campaign.totalCalls) * 100).toFixed(2) : 0,
         response_rate: campaign.successfulCalls > 0 ? ((campaign.dtmfResponses / (campaign.successfulCalls)) * 100).toFixed(2) : 0
       };
-      console.log('##############', campaignStats)
+      
       return campaignStats;
     }
   }
@@ -502,6 +505,157 @@ async function getCallStats(campaignId = null) {
     pressed_one: pressedOne,
     success_rate: totalCalls > 0 ? ((pressedOne / totalCalls) * 100).toFixed(2) : 0
   };
+}
+
+/**
+ * Handle cost estimation request
+ */
+async function handleCostEstimation(bot, chatId, userId) {
+  const user = await User.findOne({ where: { telegramId: userId.toString() } });
+  
+  if (!user) {
+    bot.sendMessage(chatId, "❌ User not found. Please contact administrator.");
+    return;
+  }
+  
+  if (!user.rateCardId) {
+    bot.sendMessage(chatId, "❌ No rate card assigned. Please contact administrator.");
+    return;
+  }
+  
+  bot.sendMessage(chatId, 
+    "📱 *Cost Estimation*\n\n" +
+    "Please send the phone number you want to estimate cost for:\n\n" +
+    "Format: +1234567890 or 1234567890",
+    { parse_mode: 'Markdown' }
+  );
+  
+  userStates[userId] = { action: 'cost_estimation' };
+}
+
+/**
+ * Process cost estimation
+ */
+async function processCostEstimation(bot, chatId, userId, phoneNumber) {
+  try {
+    const user = await User.findOne({ where: { telegramId: userId.toString() } });
+    
+    // Estimate for different durations
+    const durations = [1, 5, 10, 30];
+    const estimates = [];
+    
+    for (const duration of durations) {
+      const result = await billingEngine.estimateCallCost(user.id, phoneNumber, duration);
+      
+      if (result.success) {
+        estimates.push({
+          duration,
+          cost: result.estimatedCost,
+          destination: result.destination
+        });
+      } else {
+        bot.sendMessage(chatId, `❌ ${result.userFriendlyMessage}`);
+        return;
+      }
+    }
+    
+    if (estimates.length === 0) {
+      bot.sendMessage(chatId, "❌ Unable to estimate cost for this number.");
+      return;
+    }
+    
+    const destination = estimates[0].destination;
+    
+    let message = `💰 *Cost Estimation*\n\n`;
+    message += `📞 Number: ${escapeMarkdown(phoneNumber)}\n`;
+    message += `🌍 Destination: ${escapeMarkdown(destination.countryName)}\n`;
+    message += `📍 Prefix: ${escapeMarkdown(destination.prefix)}\n\n`;
+    message += `💵 *Estimated Costs:*\n`;
+    
+    estimates.forEach(estimate => {
+      message += `• ${estimate.duration} min: $${estimate.cost.toFixed(4)}\n`;
+    });
+    
+    message += `\n💳 Current Balance: $${user.balance}\n`;
+    message += `🔄 Credit Limit: $${user.creditLimit}\n`;
+    message += `💎 Available: $${(parseFloat(user.balance) + parseFloat(user.creditLimit)).toFixed(4)}`;
+    
+    bot.sendMessage(chatId, message, { 
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "🔙 Back to Menu", callback_data: "back_to_menu" }
+        ]]
+      }
+    });
+    
+  } catch (error) {
+    console.error('Cost estimation error:', error);
+    bot.sendMessage(chatId, "❌ Error estimating cost. Please try again.");
+  }
+}
+
+/**
+ * Bulk cost estimation for campaign
+ */
+async function estimateCampaignCost(userId, phoneNumbers) {
+  try {
+    const user = await User.findOne({ where: { telegramId: userId.toString() } });
+    
+    if (!user || !user.rateCardId) {
+      throw new Error('User or rate card not found');
+    }
+    
+    const estimates = [];
+    let totalCost = 0;
+    let validNumbers = 0;
+    let invalidNumbers = 0;
+    
+    // Sample first 50 numbers for estimation
+    const sampleSize = Math.min(phoneNumbers.length, 50);
+    const sampleNumbers = phoneNumbers.slice(0, sampleSize);
+    
+    for (const phoneNumber of sampleNumbers) {
+      const result = await billingEngine.estimateCallCost(user.id, phoneNumber, 3); // 3 min average
+      
+      if (result.success) {
+        estimates.push({
+          phoneNumber,
+          cost: result.estimatedCost,
+          destination: result.destination.countryName
+        });
+        totalCost += result.estimatedCost;
+        validNumbers++;
+      } else {
+        invalidNumbers++;
+      }
+    }
+    
+    // Extrapolate to full campaign
+    const avgCostPerCall = validNumbers > 0 ? totalCost / validNumbers : 0;
+    const totalValidNumbers = Math.round((validNumbers / sampleSize) * phoneNumbers.length);
+    const estimatedTotalCost = avgCostPerCall * totalValidNumbers;
+    
+    return {
+      success: true,
+      sampleSize,
+      validNumbers,
+      invalidNumbers,
+      avgCostPerCall,
+      totalNumbers: phoneNumbers.length,
+      estimatedValidNumbers: totalValidNumbers,
+      estimatedTotalCost,
+      canAfford: (parseFloat(user.balance) + parseFloat(user.creditLimit)) >= estimatedTotalCost,
+      availableBalance: parseFloat(user.balance) + parseFloat(user.creditLimit),
+      estimates: estimates.slice(0, 10) // Return first 10 for display
+    };
+    
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message
+    };
+  }
 }
 
 async function getSipTrunks() {
@@ -585,10 +739,6 @@ function getUserMenu(user) {
       [
         { text: "📈 Campaign Stats", callback_data: "campaign_stats" },
         { text: "➕ Set Dial Prefix", callback_data: "set_dial_prefix" }
-      ],
-      [
-        { text: "☎️ Set Callback Trunk", callback_data: "set_callback_trunk" },
-        { text: "📲 Initiate Callback", callback_data: "initiate_callback" }
       ]
     ];
   }
@@ -613,6 +763,227 @@ function getUserMenu(user) {
       inline_keyboard: isAdmin ? [...adminButtons, ...userButtons] : userButtons
     }
   };
+}
+// Handle credit amount input
+async function handleAddCreditAmount(bot, msg, userStates, userId) {
+  const chatId = msg.chat.id;
+  const text = msg.text.trim();
+  const userState = userStates[userId];
+  
+  try {
+    const amount = parseFloat(text);
+    
+    if (isNaN(amount) || amount <= 0) {
+      bot.sendMessage(chatId, "❌ Invalid amount. Please enter a positive number.");
+      return;
+    }
+    
+    if (amount > 10000) {
+      bot.sendMessage(chatId, "❌ Amount exceeds maximum limit ($10,000).");
+      return;
+    }
+    
+    const selectedUser = await User.findByPk(userState.selectedUserId);
+    if (!selectedUser) {
+      bot.sendMessage(chatId, "❌ User not found.");
+      delete userStates[userId];
+      return;
+    }
+    
+    // Add credit using adminUtilities
+    const result = await adminUtilities.addCredit({
+      telegramId: selectedUser.telegramId,
+      amount: amount,
+      description: `Credit added by admin via Telegram bot`,
+      createdBy: userId.toString()
+    });
+    
+    bot.sendMessage(
+      chatId,
+      `✅ *Credit Added Successfully!*\n\n` +
+      `User: ${escapeMarkdown(result.user.firstName || 'User')}\n` +
+      `Amount Added: $${result.user.creditAdded}\n` +
+      `Previous Balance: $${result.user.previousBalance}\n` +
+      `New Balance: $${result.user.newBalance}`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '💰 Add More Credit', callback_data: 'admin_add_credit' }],
+            [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+          ]
+        }
+      }
+    );
+    
+    delete userStates[userId];
+    
+  } catch (error) {
+    console.error('Error adding credit:', error);
+    bot.sendMessage(chatId, `❌ Error adding credit: ${error.message}`);
+    delete userStates[userId];
+  }
+}
+
+async function handleAdminSetCallerId(bot, msg, userStates, userId) {
+  const chatId = msg.chat.id;
+  const text = msg.text.trim();
+  const userState = userStates[userId];
+  
+  try {
+    const validation = validateCallerId(text);
+    if (!validation.valid) {
+      bot.sendMessage(chatId, `❌ ${validation.message}`);
+      return;
+    }
+    
+    const selectedUser = await User.findByPk(userState.selectedUserId);
+    if (!selectedUser) {
+      bot.sendMessage(chatId, "❌ User not found.");
+      delete userStates[userId];
+      return;
+    }
+    
+    const campaign = await Campaign.findOne({
+      where: { createdBy: selectedUser.telegramId }
+    });
+    
+    if (campaign) {
+      await campaign.update({ callerId: validation.formatted });
+      
+      bot.sendMessage(
+        chatId,
+        `✅ *Caller ID Updated*\n\n` +
+        `User: ${escapeMarkdown(selectedUser.firstName || selectedUser.username || 'User')}\n` +
+        `Caller ID: ${escapeMarkdown(validation.formatted)}`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '📞 Back to Campaign Config', callback_data: `admin_campaign_config_${selectedUser.id}` }]
+            ]
+          }
+        }
+      );
+    }
+    
+    delete userStates[userId];
+  } catch (error) {
+    console.error('Error setting caller ID:', error);
+    bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+    delete userStates[userId];
+  }
+}
+
+// Handle prefix setting
+async function handleAdminSetPrefix(bot, msg, userStates, userId) {
+  const chatId = msg.chat.id;
+  const text = msg.text.trim();
+  const userState = userStates[userId];
+  let prefix = '';
+  
+  try {
+	if(text.toLowerCase() == 'none'){
+		prefix = '';
+	}
+	else{
+		prefix = text;
+	}
+	
+	console.log('##################', prefix, text)
+	
+    // Validate prefix (should only contain digits or be empty)
+    if (prefix !== '' && prefix && !/^\d*$/.test(prefix)) {
+      bot.sendMessage(chatId, "❌ Prefix should only contain numbers or be empty.");
+      return;
+    }
+
+    const selectedUser = await User.findByPk(userState.selectedUserId);
+    if (!selectedUser) {
+      bot.sendMessage(chatId, "❌ User not found.");
+      delete userStates[userId];
+      return;
+    }
+    
+    const campaign = await Campaign.findOne({
+      where: { createdBy: selectedUser.telegramId }
+    });
+    
+    if (campaign) {
+      await campaign.update({ dialPrefix: prefix });
+      
+      bot.sendMessage(
+        chatId,
+        `✅ *Dial Prefix Updated*\n\n` +
+        `User: ${escapeMarkdown(selectedUser.firstName || selectedUser.username || 'User')}\n` +
+        `Dial Prefix: ${text || 'None'}`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '📞 Back to Campaign Config', callback_data: `admin_campaign_config_${selectedUser.id}` }]
+            ]
+          }
+        }
+      );
+    }
+    
+    delete userStates[userId];
+  } catch (error) {
+    console.error('Error setting prefix:', error);
+    bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+    delete userStates[userId];
+  }
+}
+
+async function handleAdminSetConcurrentCalls(bot, msg, userStates, userId) {
+  const chatId = msg.chat.id;
+  const text = msg.text.trim();
+  const userState = userStates[userId];
+  
+  try {
+    // Validate prefix (should only contain digits or be empty)
+    if (text && !/^\d*$/.test(text)) {
+      bot.sendMessage(chatId, "❌ Concurrent Calls should only contain numbers or be empty.");
+      return;
+    }
+    
+    const selectedUser = await User.findByPk(userState.selectedUserId);
+    if (!selectedUser) {
+      bot.sendMessage(chatId, "❌ User not found.");
+      delete userStates[userId];
+      return;
+    }
+    
+    const campaign = await Campaign.findOne({
+      where: { createdBy: selectedUser.telegramId }
+    });
+    
+    if (campaign) {
+      await campaign.update({ concurrentCalls: text });
+      
+      bot.sendMessage(
+        chatId,
+        `✅ *Concurrent Calls Updated*\n\n` +
+        `User: ${escapeMarkdown(selectedUser.firstName || selectedUser.username || 'User')}\n` +
+        `Concurrent Calls: ${text || 'None'}`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '📞 Back to Campaign Config', callback_data: `admin_campaign_config_${selectedUser.id}` }]
+            ]
+          }
+        }
+      );
+    }
+    
+    delete userStates[userId];
+  } catch (error) {
+    console.error('Error setting Concurrent Calls:', error);
+    bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+    delete userStates[userId];
+  }
 }
 
 // Initialize Telegram Bot
@@ -705,7 +1076,7 @@ const initializeBot = () => {
           bot.sendMessage(chatId, `❌ Error: ${error.message}`);
         }
         break;
-
+      
       case "my_stats":
         if (!user.rateCardId) {
           // Fall back to legacy stats
@@ -838,57 +1209,102 @@ const initializeBot = () => {
 
       // Admin callbacks
       case "admin_add_credit":
-        if (user.userType !== 'admin') {
-          bot.sendMessage(chatId, "❌ Admin access required!");
-          return;
-        }
-        bot.sendMessage(
-          chatId,
-          "💰 *Add Credit to User*\n\nEnter user ID and amount:\nFormat: `USER_ID AMOUNT`\nExample: `123456789 50.00`",
-          { parse_mode: 'Markdown' }
-        );
-        userStates[userId] = { action: 'admin_adding_credit' };
-        break;
+		  if (user.userType !== 'admin') {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  try {
+			const users = await User.findAll({
+			  where: { status: 'active' },
+			  order: [['createdAt', 'DESC']],
+			  limit: 20
+			});
+			
+			if (users.length === 0) {
+			  bot.sendMessage(chatId, "❌ No users found in the system.");
+			  return;
+			}
+			
+			let message = "💰 *Add Credit - Select User*\n\n";
+			
+			const userButtons = users.map((u, index) => [{
+			  text: `${u.firstName || u.username || 'User'} (${u.telegramId}) - $${u.balance}`,
+			  callback_data: `admin_add_credit_${u.id}`
+			}]);
+			
+			userButtons.push([{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]);
+			
+			bot.sendMessage(
+			  chatId,
+			  message,
+			  {
+				parse_mode: 'Markdown',
+				reply_markup: {
+				  inline_keyboard: userButtons
+				}
+			  }
+			);
+		  } catch (error) {
+			bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+		  }
+		  break;
 
       case "admin_users":
-        if (user.userType !== 'admin') {
-          bot.sendMessage(chatId, "❌ Admin access required!");
-          return;
-        }
-        
-        try {
-          const users = await User.findAll({
-            order: [['createdAt', 'DESC']],
-            limit: 20
-          });
-          
-          let message = "👥 *User Management*\n\n";
-          
-          users.forEach((u, index) => {
-            const status = u.status === 'active' ? '✅' : '❌';
-            const type = u.userType === 'admin' ? '👑' : '👤';
-            
-            message += `${index + 1}. ${type} ${status} ${escapeMarkdown(u.firstName || u.username || 'Unknown')}\n`;
-            message += `   ID: ${u.telegramId} | Balance: $${u.balance}\n`;
-            message += `   Rate Card: ${u.rateCardId || 'None'}\n\n`;
-          });
-          
-          bot.sendMessage(
-            chatId,
-            message,
-            {
-              parse_mode: 'Markdown',
-              reply_markup: {
-                inline_keyboard: [
-                  [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
-                ]
-              }
-            }
-          );
-        } catch (error) {
-          bot.sendMessage(chatId, `❌ Error: ${error.message}`);
-        }
-        break;
+		  if (user.userType !== 'admin') {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  try {
+			const users = await User.findAll({
+			  include: [{ 
+				model: RateCard, 
+				as: 'rateCard',
+				include: [{ model: Provider, as: 'provider' }]
+			  }],
+			  order: [['createdAt', 'DESC']],
+			  limit: 20
+			});
+			
+			if (users.length === 0) {
+			  bot.sendMessage(chatId, "❌ No users found in the system.");
+			  return;
+			}
+			
+			let message = "👥 *User Management*\n\nSelect a user to manage:\n\n";
+			
+			const userButtons = users.map((u, index) => {
+			  const status = u.status === 'active' ? '✅' : '❌';
+			  const type = u.userType === 'admin' ? '👑 Administrator' : '👤';
+			  const rateCardName = u.rateCard ? u.rateCard.name : 'No Rate Card';
+			  
+			  return [{
+				text: `${type} ${status} ${u.telegramId} - ${rateCardName}`,
+				callback_data: `admin_manage_user_${u.id}`
+			  }];
+			});
+			
+			userButtons.push([
+			  { text: '➕ Add New User', callback_data: 'admin_add_user' },
+			  { text: '🏠 Main Menu', callback_data: 'back_to_menu' }
+			]);
+			
+			bot.sendMessage(
+			  chatId,
+			  message,
+			  {
+				parse_mode: 'Markdown',
+				reply_markup: {
+				  inline_keyboard: userButtons
+				}
+			  }
+			);
+		  } catch (error) {
+			console.error('Error in admin_users:', error);
+			bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+		  }
+		  break;
 
       case "admin_system_stats":
         if (user.userType !== 'admin') {
@@ -914,6 +1330,259 @@ const initializeBot = () => {
             { parse_mode: 'Markdown' }
           );
         } catch (error) {
+          bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+        }
+        break;
+
+	  case "admin_rates":
+        if (user.userType !== 'admin') {
+          bot.sendMessage(chatId, "❌ Admin access required!");
+          return;
+        }
+        
+        try {
+          const rateCards = await RateCard.findAll({
+            include: [
+              { model: Provider, as: 'provider' },
+              { model: Rate, as: 'rates' }
+            ],
+            order: [['createdAt', 'DESC']],
+            limit: 10
+          });
+          
+          if (rateCards.length === 0) {
+            bot.sendMessage(
+              chatId,
+              "💳 *No Rate Cards Found*\n\nThere are no rate cards in the system yet. Create one first.",
+              {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                  inline_keyboard: [
+                    [{ text: '🏗️ Create Rate Card', callback_data: 'admin_create_rate' }],
+                    [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+                  ]
+                }
+              }
+            );
+            return;
+          }
+          
+          let message = "💳 *Rate Card Management*\n\n";
+          
+          rateCards.forEach((rc, index) => {
+            const rateCount = rc.rates ? rc.rates.length : 0;
+            const status = rc.status === 'active' ? '✅' : '❌';
+            
+            message += `${index + 1}. ${status} ${escapeMarkdown(rc.name)}\n`;
+            message += `   Provider: ${escapeMarkdown(rc.provider.name)}\n`;
+            message += `   Rates: ${rateCount} destinations\n`;
+            message += `   ID: ${rc.id}\n\n`;
+          });
+          
+          bot.sendMessage(
+            chatId,
+            message,
+            {
+              parse_mode: 'Markdown',
+              reply_markup: {
+                inline_keyboard: [
+                  [{ text: '🏗️ Create Rate Card', callback_data: 'admin_create_rate' }],
+                  [{ text: '📋 Bulk Upload Rates', callback_data: 'admin_bulk_upload' }],
+                  [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+                ]
+              }
+            }
+          );
+        } catch (error) {
+          console.error('Error fetching rate cards:', error);
+          bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+        }
+        break;
+
+      case "admin_create_rate":
+        if (user.userType !== 'admin') {
+          bot.sendMessage(chatId, "❌ Admin access required!");
+          return;
+        }
+        
+        try {
+          const providers = await Provider.findAll({
+            where: { status: 'active' },
+            order: [['name', 'ASC']]
+          });
+          
+          if (providers.length === 0) {
+            bot.sendMessage(
+              chatId,
+              "🏢 *No Providers Found*\n\nYou need to create a provider first before creating rate cards.",
+              {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                  inline_keyboard: [
+                    [{ text: '🏢 Create Provider', callback_data: 'admin_create_provider' }],
+                    [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+                  ]
+                }
+              }
+            );
+            return;
+          }
+          
+          let message = "🏗️ *Create Rate Card*\n\nSelect a provider:\n\n";
+          
+          const providerButtons = providers.map(provider => [{
+            text: `${provider.name} (${provider.currency})`,
+            callback_data: `admin_create_rate_${provider.id}`
+          }]);
+          
+          providerButtons.push([{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]);
+          
+          bot.sendMessage(
+            chatId,
+            message,
+            {
+              parse_mode: 'Markdown',
+              reply_markup: {
+                inline_keyboard: providerButtons
+              }
+            }
+          );
+        } catch (error) {
+          console.error('Error fetching providers:', error);
+          bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+        }
+        break;
+
+      case "admin_bulk_upload":
+        if (user.userType !== 'admin') {
+          bot.sendMessage(chatId, "❌ Admin access required!");
+          return;
+        }
+        
+        try {
+          const rateCards = await RateCard.findAll({
+            where: { status: 'active' },
+            include: [{ model: Provider, as: 'provider' }],
+            order: [['name', 'ASC']]
+          });
+          
+          if (rateCards.length === 0) {
+            bot.sendMessage(
+              chatId,
+              "💳 *No Rate Cards Found*\n\nCreate a rate card first before uploading rates.",
+              {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                  inline_keyboard: [
+                    [{ text: '🏗️ Create Rate Card', callback_data: 'admin_create_rate' }],
+                    [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+                  ]
+                }
+              }
+            );
+            return;
+          }
+          
+          let message = "📋 *Bulk Upload Rates*\n\nSelect a rate card to upload rates to:\n\n";
+          
+          const rateCardButtons = rateCards.map(rc => [{
+            text: `${rc.name} (${rc.provider.name})`,
+            callback_data: `admin_upload_rates_${rc.id}`
+          }]);
+          
+          rateCardButtons.push([{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]);
+          
+          bot.sendMessage(
+            chatId,
+            message,
+            {
+              parse_mode: 'Markdown',
+              reply_markup: {
+                inline_keyboard: rateCardButtons
+              }
+            }
+          );
+        } catch (error) {
+          console.error('Error fetching rate cards:', error);
+          bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+        }
+        break;
+
+      case "admin_create_provider":
+        if (user.userType !== 'admin') {
+          bot.sendMessage(chatId, "❌ Admin access required!");
+          return;
+        }
+        
+        bot.sendMessage(
+          chatId,
+          "🏢 *Create Provider*\n\nEnter provider details in this format:\n\n" +
+          "`Name | Description | Currency | Billing Increment | Minimum Duration`\n\n" +
+          "Example:\n" +
+          "`Global Telecom | Premium wholesale provider | USD | 60 | 60`\n\n" +
+          "Note: Billing Increment and Minimum Duration are in seconds.",
+          { parse_mode: 'Markdown' }
+        );
+        
+        userStates[userId] = { action: 'admin_creating_provider' };
+        break;
+
+      case "admin_providers":
+        if (user.userType !== 'admin') {
+          bot.sendMessage(chatId, "❌ Admin access required!");
+          return;
+        }
+        
+        try {
+          const providers = await Provider.findAll({
+            order: [['createdAt', 'DESC']],
+            limit: 10
+          });
+          
+          if (providers.length === 0) {
+            bot.sendMessage(
+              chatId,
+              "🏢 *No Providers Found*\n\nThere are no providers in the system yet. Create one first.",
+              {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                  inline_keyboard: [
+                    [{ text: '🏢 Create Provider', callback_data: 'admin_create_provider' }],
+                    [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+                  ]
+                }
+              }
+            );
+            return;
+          }
+          
+          let message = "🏢 *Provider Management*\n\n";
+          
+          providers.forEach((provider, index) => {
+            const status = provider.status === 'active' ? '✅' : '❌';
+            
+            message += `${index + 1}. ${status} ${escapeMarkdown(provider.name)}\n`;
+            message += `   Currency: ${provider.currency}\n`;
+            message += `   Billing: ${provider.billingIncrement}s increments\n`;
+            message += `   Min Duration: ${provider.minimumDuration}s\n`;
+            message += `   ID: ${provider.id}\n\n`;
+          });
+          
+          bot.sendMessage(
+            chatId,
+            message,
+            {
+              parse_mode: 'Markdown',
+              reply_markup: {
+                inline_keyboard: [
+                  [{ text: '🏢 Create Provider', callback_data: 'admin_create_provider' }],
+                  [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+                ]
+              }
+            }
+          );
+        } catch (error) {
+          console.error('Error fetching providers:', error);
           bot.sendMessage(chatId, `❌ Error: ${error.message}`);
         }
         break;
@@ -1532,12 +2201,610 @@ const initializeBot = () => {
           {
             chat_id: chatId,
             message_id: query.message.message_id,
-            ...mainMenu,
+            ...getUserMenu(user),
             parse_mode: "Markdown"
           }
         );
         break;
     }
+	console.log('###############', callbackData)
+	if (callbackData.startsWith('admin_assign_rate_confirm_')) {
+	  if (user.userType !== 'admin') {
+		bot.sendMessage(chatId, "❌ Admin access required!");
+		return;
+	  }
+	  
+	  const parts = callbackData.replace('admin_assign_rate_confirm_', '').split('_');
+	  const selectedUserId = parts[0];
+	  const rateCardId = parts[1] === 'none' ? null : parseInt(parts[1]);
+	  
+	  try {
+		const selectedUser = await User.findByPk(selectedUserId);
+		if (!selectedUser) {
+		  bot.sendMessage(chatId, "❌ User not found.");
+		  return;
+		}
+		
+		let rateCardName = 'None';
+		if (rateCardId) {
+		  const rateCard = await RateCard.findByPk(rateCardId);
+		  if (!rateCard) {
+			bot.sendMessage(chatId, "❌ Rate card not found.");
+			return;
+		  }
+		  rateCardName = rateCard.name;
+		}
+		
+		// Update user's rate card
+		await selectedUser.update({ rateCardId });
+		
+		bot.sendMessage(
+		  chatId,
+		  `✅ *Rate Card Assignment Updated*\n\n` +
+		  `User: ${escapeMarkdown(selectedUser.firstName || selectedUser.username || 'User')}\n` +
+		  `Rate Card: ${escapeMarkdown(rateCardName)}\n\n` +
+		  `The user can now ${rateCardId ? 'make calls with billing enabled' : 'only use legacy features'}.`,
+		  {
+			parse_mode: 'Markdown',
+			reply_markup: {
+			  inline_keyboard: [
+				[{ text: '👤 Back to User', callback_data: `admin_manage_user_${selectedUser.id}` }],
+				[{ text: '👥 All Users', callback_data: 'admin_users' }],
+				[{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+			  ]
+			}
+		  }
+		);
+	  } catch (error) {
+		console.error('Error assigning rate card:', error);
+		bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+	  }
+	  return;
+	}
+	
+	// Handle individual user management (ADD THIS)
+    if (callbackData.startsWith('admin_manage_user_')) {
+      if (user.userType !== 'admin') {
+        bot.sendMessage(chatId, "❌ Admin access required!");
+        return;
+      }
+      
+      const selectedUserId = callbackData.replace('admin_manage_user_', '');
+      
+      try {
+        const selectedUser = await User.findByPk(selectedUserId, {
+          include: [{ model: RateCard, as: 'rateCard', include: [{ model: Provider, as: 'provider' }] }]
+        });
+        
+        if (!selectedUser) {
+          bot.sendMessage(chatId, "❌ User not found.");
+          return;
+        }
+        
+        const rateCardInfo = selectedUser.rateCard ? 
+          `${selectedUser.rateCard.name} (${selectedUser.rateCard.provider.name})` : 
+          'Not assigned';
+        
+        bot.sendMessage(
+          chatId,
+          `👤 *User Management*\n\n` +
+          `Name: ${escapeMarkdown(selectedUser.firstName || selectedUser.username || 'User')}\n` +
+          `Telegram ID: ${selectedUser.telegramId}\n` +
+          `Balance: $${selectedUser.balance}\n` +
+          `Credit Limit: $${selectedUser.creditLimit}\n` +
+          `Rate Card: ${escapeMarkdown(rateCardInfo)}\n` +
+          `Status: ${selectedUser.status}\n\n` +
+          `Select an action:`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: '💳 Assign Rate Card', callback_data: `admin_assign_rate_${selectedUser.id}` },
+                  { text: '💰 Add Credit', callback_data: `admin_add_credit_${selectedUser.id}` }
+                ],
+				[
+				  { text: '📞 Campaign Config', callback_data: `admin_campaign_config_${selectedUser.id}` },
+				  { text: '🔄 Change Status', callback_data: `admin_change_status_${selectedUser.id}` }
+				],
+                [
+                  { text: '📊 View Details', callback_data: `admin_user_details_${selectedUser.id}` },
+				  { text: '🔙 Back to Users', callback_data: 'admin_users' }
+                ],
+                [
+                  { text: '🏠 Main Menu', callback_data: 'back_to_menu' }
+                ]
+              ]
+            }
+          }
+        );
+      } catch (error) {
+        bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+      }
+      return;
+    }
+
+	if (callbackData.startsWith('admin_campaign_config_')) {
+	  if (user.userType !== 'admin') {
+		bot.sendMessage(chatId, "❌ Admin access required!");
+		return;
+	  }
+	  
+	  const selectedUserId = callbackData.replace('admin_campaign_config_', '');
+	  
+	  try {
+		const selectedUser = await User.findByPk(selectedUserId);
+		if (!selectedUser) {
+		  bot.sendMessage(chatId, "❌ User not found.");
+		  return;
+		}
+		
+		// Get user's campaign
+		const campaign = await Campaign.findOne({
+		  where: { createdBy: selectedUser.telegramId },
+		  include: [
+			{ model: SipPeer, as: 'sipTrunk' },
+			{ model: SipPeer, as: 'callbackTrunk' }
+		  ]
+		});
+		
+		if (!campaign) {
+		  // Create campaign if it doesn't exist
+		  const newCampaign = await Campaign.create({
+			botToken: config.telegram_bot_token,
+			campaignName: `Campaign for ${selectedUser.firstName || selectedUser.username || 'User'}`,
+			createdBy: selectedUser.telegramId,
+			concurrentCalls: 30,
+			isActive: true
+		  });
+		  
+		  bot.sendMessage(
+			chatId,
+			`📞 *Campaign Configuration*\n\n` +
+			`User: ${escapeMarkdown(selectedUser.firstName || selectedUser.username || 'User')}\n\n` +
+			`New campaign created. Configure settings:`,
+			{
+			  parse_mode: 'Markdown',
+			  reply_markup: {
+				inline_keyboard: [
+				  [
+					{ text: '🌐 Set SIP Trunk', callback_data: `admin_set_sip_${selectedUser.id}` },
+					{ text: '📞 Set Caller ID', callback_data: `admin_set_callerid_${selectedUser.id}` }
+				  ],
+				  [
+					{ text: '➕ Set Dial Prefix', callback_data: `admin_set_prefix_${selectedUser.id}` },
+					{ text: '🔢 Set Concurrent Calls', callback_data: `admin_set_concurrent_${selectedUser.id}` }
+				  ],
+				  [
+					{ text: '🔙 Back to User', callback_data: `admin_manage_user_${selectedUser.id}` }
+				  ]
+				]
+			  }
+			}
+		  );
+		} else {
+		  const sipTrunkName = campaign.sipTrunk ? campaign.sipTrunk.name : 'Not set';
+		  const callerId = campaign.callerId || 'Not set';
+		  const dialPrefix = campaign.dialPrefix || 'None';
+		  
+		  bot.sendMessage(
+			chatId,
+			`📞 *Campaign Configuration*\n\n` +
+			`User: ${escapeMarkdown(selectedUser.firstName || selectedUser.username || 'User')}\n` +
+			`Campaign: ${escapeMarkdown(campaign.campaignName)}\n\n` +
+			`*Current Settings:*\n` +
+			`🌐 SIP Trunk: ${escapeMarkdown(sipTrunkName)}\n` +
+			`📞 Caller ID: ${escapeMarkdown(callerId)}\n` +
+			`➕ Dial Prefix: ${escapeMarkdown(dialPrefix)}\n` +
+			`🔢 Concurrent Calls: ${campaign.concurrentCalls}\n` +
+			`🔢 DTMF Digit: ${campaign.dtmfDigit || '1'}\n\n` +
+			`Select setting to modify:`,
+			{
+			  parse_mode: 'Markdown',
+			  reply_markup: {
+				inline_keyboard: [
+				  [
+					{ text: '🌐 Change SIP Trunk', callback_data: `admin_set_sip_${selectedUser.id}` },
+					{ text: '📞 Change Caller ID', callback_data: `admin_set_callerid_${selectedUser.id}` }
+				  ],
+				  [
+					{ text: '➕ Change Dial Prefix', callback_data: `admin_set_prefix_${selectedUser.id}` },
+					{ text: '🔢 Change Concurrent Calls', callback_data: `admin_set_concurrent_${selectedUser.id}` }
+				  ],
+				  [
+					{ text: '🔢 Change DTMF Digit', callback_data: `admin_set_dtmf_${selectedUser.id}` },
+				  ],
+				  [
+					{ text: '🔙 Back to User', callback_data: `admin_manage_user_${selectedUser.id}` }
+				  ]
+				]
+			  }
+			}
+		  );
+		}
+	  } catch (error) {
+		console.error('Error in campaign config:', error);
+		bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+	  }
+	  return;
+	}
+
+	if (callbackData.startsWith('admin_set_sip_')) {
+	  if (user.userType !== 'admin') {
+		bot.sendMessage(chatId, "❌ Admin access required!");
+		return;
+	  }
+	  
+	  const selectedUserId = callbackData.replace('admin_set_sip_', '');
+	  
+	  try {
+		const sipTrunks = await SipPeer.findAll({
+		  where: { category: 'trunk', status: 1 },
+		  order: [['name', 'ASC']]
+		});
+		
+		if (sipTrunks.length === 0) {
+		  bot.sendMessage(chatId, "❌ No SIP trunks available.");
+		  return;
+		}
+		
+		const trunkButtons = sipTrunks.map(trunk => [{
+		  text: `${trunk.name} (${trunk.host})`,
+		  callback_data: `admin_confirm_sip_${selectedUserId}_${trunk.id}`
+		}]);
+		
+		trunkButtons.push([{ 
+		  text: '🔙 Back', 
+		  callback_data: `admin_campaign_config_${selectedUserId}` 
+		}]);
+		
+		bot.sendMessage(
+		  chatId,
+		  `🌐 *Select SIP Trunk*\n\nChoose a SIP trunk for this user:`,
+		  {
+			parse_mode: 'Markdown',
+			reply_markup: {
+			  inline_keyboard: trunkButtons
+			}
+		  }
+		);
+	  } catch (error) {
+		bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+	  }
+	  return;
+	}
+
+	// Handle SIP Trunk confirmation
+	if (callbackData.startsWith('admin_confirm_sip_')) {
+	  if (user.userType !== 'admin') {
+		bot.sendMessage(chatId, "❌ Admin access required!");
+		return;
+	  }
+	  
+	  const parts = callbackData.replace('admin_confirm_sip_', '').split('_');
+	  const selectedUserId = parts[0];
+	  const sipTrunkId = parseInt(parts[1]);
+	  
+	  try {
+		const [selectedUser, sipTrunk] = await Promise.all([
+		  User.findByPk(selectedUserId),
+		  SipPeer.findByPk(sipTrunkId)
+		]);
+		
+		if (!selectedUser || !sipTrunk) {
+		  bot.sendMessage(chatId, "❌ User or SIP trunk not found.");
+		  return;
+		}
+		
+		const campaign = await Campaign.findOne({
+		  where: { createdBy: selectedUser.telegramId }
+		});
+		
+		if (campaign) {
+		  await campaign.update({ sipTrunkId });
+		  
+		  bot.sendMessage(
+			chatId,
+			`✅ *SIP Trunk Updated*\n\n` +
+			`User: ${escapeMarkdown(selectedUser.firstName || selectedUser.username || 'User')}\n` +
+			`SIP Trunk: ${escapeMarkdown(sipTrunk.name)}\n` +
+			`Host: ${escapeMarkdown(sipTrunk.host)}`,
+			{
+			  parse_mode: 'Markdown',
+			  reply_markup: {
+				inline_keyboard: [
+				  [{ text: '📞 Back to Campaign Config', callback_data: `admin_campaign_config_${selectedUser.id}` }]
+				]
+			  }
+			}
+		  );
+		}
+	  } catch (error) {
+		bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+	  }
+	  return;
+	}
+
+	// Handle Caller ID setting
+	if (callbackData.startsWith('admin_set_callerid_')) {
+	  if (user.userType !== 'admin') {
+		bot.sendMessage(chatId, "❌ Admin access required!");
+		return;
+	  }
+	  
+	  const selectedUserId = callbackData.replace('admin_set_callerid_', '');
+	  
+	  bot.sendMessage(
+		chatId,
+		`📞 *Set Caller ID*\n\nEnter the caller ID number for this user:\n\n` +
+		`Examples:\n` +
+		`• 1234567890\n` +
+		`• +11234567890\n` +
+		`• (123) 456-7890`,
+		{ parse_mode: 'Markdown' }
+	  );
+	  
+	  userStates[userId] = { 
+		action: 'admin_setting_callerid',
+		selectedUserId: selectedUserId
+	  };
+	  return;
+	}
+
+	// Handle Dial Prefix setting
+	if (callbackData.startsWith('admin_set_prefix_')) {
+	  if (user.userType !== 'admin') {
+		bot.sendMessage(chatId, "❌ Admin access required!");
+		return;
+	  }
+	  
+	  const selectedUserId = callbackData.replace('admin_set_prefix_', '');
+	  
+	  bot.sendMessage(
+		chatId,
+		`➕ *Set Dial Prefix*\n\nEnter the dial prefix for this user:\n\n` +
+		`Examples:\n` +
+		`• 9 (for outbound access)\n` +
+		`• 011 (for international)\n` +
+		`• type none for no prefix`,
+		{ parse_mode: 'Markdown' }
+	  );
+	  
+	  userStates[userId] = { 
+		action: 'admin_setting_prefix',
+		selectedUserId: selectedUserId
+	  };
+	  return;
+	}
+	
+	if (callbackData.startsWith('admin_set_concurrent_')) {
+	  if (user.userType !== 'admin') {
+		bot.sendMessage(chatId, "❌ Admin access required!");
+		return;
+	  }
+	  
+	  const selectedUserId = callbackData.replace('admin_set_concurrent_', '');
+	  
+	  bot.sendMessage(
+		chatId,
+		`➕ *Set Concurrent Calls Limit*\n\nEnter the Calls Count for this user:\n\n` +
+		`Examples:\n` +
+		`• 10\n` +
+		`• Leave empty for no limit`,
+		{ parse_mode: 'Markdown' }
+	  );
+	  
+	  userStates[userId] = { 
+		action: 'admin_setting_concurrent_calls',
+		selectedUserId: selectedUserId
+	  };
+	  return;
+	}
+	
+    // Handle rate card assignment (ADD THIS)
+    if (callbackData.startsWith('admin_assign_rate_')) {
+      if (user.userType !== 'admin') {
+        bot.sendMessage(chatId, "❌ Admin access required!");
+        return;
+      }
+      
+      const selectedUserId = callbackData.replace('admin_assign_rate_', '');
+      
+      try {
+        const [selectedUser, rateCards] = await Promise.all([
+          User.findByPk(selectedUserId),
+          RateCard.findAll({
+            where: { status: 'active' },
+            include: [{ model: Provider, as: 'provider' }],
+            order: [['name', 'ASC']]
+          })
+        ]);
+        
+        if (!selectedUser) {
+          bot.sendMessage(chatId, "❌ User not found.");
+          return;
+        }
+        
+        if (rateCards.length === 0) {
+          bot.sendMessage(chatId, "❌ No active rate cards found. Create one first.");
+          return;
+        }
+        
+        let message = `💳 *Assign Rate Card*\n\n` +
+          `User: ${escapeMarkdown(selectedUser.firstName || selectedUser.username || 'User')}\n\n` +
+          `Select a rate card:\n\n`;
+        
+        const rateCardButtons = rateCards.map(rc => [{
+          text: `${rc.name} (${rc.provider.name})`,
+          callback_data: `admin_assign_rate_confirm_${selectedUser.id}_${rc.id}`
+        }]);
+        
+        // Add option to remove rate card
+        rateCardButtons.push([{ 
+          text: '🚫 Remove Rate Card', 
+          callback_data: `admin_assign_rate_confirm_${selectedUser.id}_none` 
+        }]);
+        
+        rateCardButtons.push([{ 
+          text: '🔙 Back', 
+          callback_data: `admin_manage_user_${selectedUser.id}` 
+        }]);
+        
+        bot.sendMessage(
+          chatId,
+          message,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: rateCardButtons
+            }
+          }
+        );
+      } catch (error) {
+        bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+      }
+      return;
+    }
+
+    // Handle rate card assignment confirmation (ADD THIS)
+    if (callbackData.startsWith('admin_assign_rate_confirm_')) {
+      if (user.userType !== 'admin') {
+        bot.sendMessage(chatId, "❌ Admin access required!");
+        return;
+      }
+      
+      const parts = callbackData.replace('admin_assign_rate_confirm_', '').split('_');
+      const selectedUserId = parts[0];
+      const rateCardId = parts[1] === 'none' ? null : parseInt(parts[1]);
+      
+      try {
+        const selectedUser = await User.findByPk(selectedUserId);
+        if (!selectedUser) {
+          bot.sendMessage(chatId, "❌ User not found.");
+          return;
+        }
+        
+        let rateCardName = 'None';
+        if (rateCardId) {
+          const rateCard = await RateCard.findByPk(rateCardId);
+          if (!rateCard) {
+            bot.sendMessage(chatId, "❌ Rate card not found.");
+            return;
+          }
+          rateCardName = rateCard.name;
+        }
+        
+        // Update user's rate card
+        await selectedUser.update({ rateCardId });
+        
+        bot.sendMessage(
+          chatId,
+          `✅ *Rate Card Assignment Updated*\n\n` +
+          `User: ${escapeMarkdown(selectedUser.firstName || selectedUser.username || 'User')}\n` +
+          `Rate Card: ${escapeMarkdown(rateCardName)}\n\n` +
+          `The user can now ${rateCardId ? 'make calls with billing enabled' : 'only use legacy features'}.`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '👤 Back to User', callback_data: `admin_manage_user_${selectedUser.id}` }],
+                [{ text: '👥 All Users', callback_data: 'admin_users' }],
+                [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+              ]
+            }
+          }
+        );
+      } catch (error) {
+        console.error('Error assigning rate card:', error);
+        bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+      }
+      return;
+    }
+	
+	// Handle dynamic callbacks for rate card creation and uploads
+    if (callbackData.startsWith('admin_create_rate_')) {
+      if (user.userType !== 'admin') {
+        bot.sendMessage(chatId, "❌ Admin access required!");
+        return;
+      }
+      
+      const providerId = callbackData.replace('admin_create_rate_', '');
+      
+      bot.sendMessage(
+        chatId,
+        "🏗️ *Create Rate Card*\n\nEnter rate card details in this format:\n\n" +
+        "`Name | Description`\n\n" +
+        "Example:\n`Premium Rates | High quality routes for premium customers`",
+        { parse_mode: 'Markdown' }
+      );
+      
+      userStates[userId] = { 
+        action: 'admin_creating_rate_card',
+        providerId: parseInt(providerId)
+      };
+      return;
+    }
+    
+    if (callbackData.startsWith('admin_upload_rates_')) {
+      if (user.userType !== 'admin') {
+        bot.sendMessage(chatId, "❌ Admin access required!");
+        return;
+      }
+      
+      const rateCardId = callbackData.replace('admin_upload_rates_', '');
+      
+      bot.sendMessage(
+        chatId,
+        "📋 *Bulk Upload Rates*\n\nSend a CSV file with the following format:\n\n" +
+        "`Country Code,Country Name,Prefix,Description,Region,Cost Price,Sell Price,Min Duration,Billing Increment`\n\n" +
+        "Example:\n" +
+        "`US,United States,1,USA Mobile,North America,0.01,0.02,60,60`\n" +
+        "`UK,United Kingdom,44,UK Mobile,Europe,0.015,0.025,60,60`",
+        { parse_mode: 'Markdown' }
+      );
+      
+      userStates[userId] = { 
+        action: 'admin_uploading_rates',
+        rateCardId: parseInt(rateCardId)
+      };
+      return;
+    }
+	
+	// Handle dynamic callbacks for user credit addition
+	if (callbackData.startsWith('admin_add_credit_')) {
+	  if (user.userType !== 'admin') {
+		bot.sendMessage(chatId, "❌ Admin access required!");
+		return;
+	  }
+	  
+	  const selectedUserId = callbackData.replace('admin_add_credit_', '');
+	  
+	  try {
+		const selectedUser = await User.findByPk(selectedUserId);
+		if (!selectedUser) {
+		  bot.sendMessage(chatId, "❌ User not found.");
+		  return;
+		}
+		
+		bot.sendMessage(
+		  chatId,
+		  `💰 *Add Credit*\n\n` +
+		  `Selected User: ${escapeMarkdown(selectedUser.firstName || selectedUser.username || 'User')}\n` +
+		  `Telegram ID: ${selectedUser.telegramId}\n` +
+		  `Current Balance: $${selectedUser.balance}\n\n` +
+		  `Enter the amount to add:\nExample: 50.00`,
+		  { parse_mode: 'Markdown' }
+		);
+		
+		userStates[userId] = { 
+		  action: 'admin_adding_credit_amount',
+		  selectedUserId: selectedUserId
+		};
+	  } catch (error) {
+		bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+	  }
+	  return;
+	}
   });
 
   // Handle text messages based on user state
@@ -1550,7 +2817,7 @@ const initializeBot = () => {
     
     const userState = userStates[userId];
     if (!userState) return;
-
+	
     switch (userState.action) {
 		case "waiting_callback_trunk_number":
 		  const callbackTrunkNum = text.trim();
@@ -1569,11 +2836,39 @@ const initializeBot = () => {
 			`✅ *Callback Trunk Number Set Successfully!*\n\n` +
 			`Callback Number: ${escapeMarkdown(callbackTrunkNum)}\n\n` +
 			`This number will be dialed on the callback trunk when callbacks are initiated.`,
-			{ parse_mode: "Markdown", ...mainMenu }
+			{ parse_mode: "Markdown", ...getUserMenu(user) }
 		  );
 		  delete userStates[userId];
 		  break;
 		
+		case 'admin_setting_callerid':
+		  await handleAdminSetCallerId(bot, msg, userStates, userId);
+		  break;
+		  
+		case 'admin_setting_prefix':
+		  await handleAdminSetPrefix(bot, msg, userStates, userId);
+		  break;
+		  
+		case 'admin_setting_concurrent_calls':
+		  await handleAdminSetConcurrentCalls(bot, msg, userStates, userId);
+		  break;
+		
+		case 'admin_creating_rate_card':
+			await handleCreateRateCard(bot, msg, userStates);
+			break;
+			
+		case 'admin_creating_provider':
+			await handleCreateProvider(bot, msg, userStates);
+			break;
+			
+		case 'admin_uploading_rates':
+			bot.sendMessage(chatId, "📋 Please upload a CSV file with the rate data.");
+			break;
+		
+		case 'admin_adding_credit_amount':
+		  await handleAddCreditAmount(bot, msg, userStates, userId);
+		  break;		
+
 		case "waiting_callback_confirmation":
 		  if (text.toLowerCase() === 'yes') {
 			const campaignCb = await Campaign.findByPk(userState.campaignId, {
@@ -1632,10 +2927,10 @@ const initializeBot = () => {
 			  `${failedCount > 0 ? `Failed: ${failedCount} callbacks\n` : ''}` +
 			  `Using trunk: ${escapeMarkdown(campaignCb.callbackTrunk ? campaignCb.callbackTrunk.name : 'N/A')}\n` +
 			  `Callback number: ${escapeMarkdown(campaignCb.callbackTrunkNumber || 'N/A')}`,
-			  { parse_mode: "Markdown", ...mainMenu }
+			  { parse_mode: "Markdown", ...getUserMenu(user) }
 			);
 		  } else {
-			bot.sendMessage(chatId, "❌ Callback cancelled.", mainMenu);
+			bot.sendMessage(chatId, "❌ Callback cancelled.", getUserMenu(user));
 		  }
 		  delete userStates[userId];
 		  break;
@@ -1655,7 +2950,7 @@ const initializeBot = () => {
 		  bot.sendMessage(
 			chatId,
 			`✅ *Callback Trunk Set Successfully!*\n\nSelected: ${escapeMarkdown(selectedCallbackTrunk.name)}`,
-			{ parse_mode: "Markdown", ...mainMenu }
+			{ parse_mode: "Markdown", ...getUserMenu(user) }
 		  );
 		  delete userStates[userId];
 		  break;
@@ -1727,7 +3022,7 @@ const initializeBot = () => {
 			chatId,
 			`✅ *Dial Prefix ${prefix ? 'Set' : 'Removed'} Successfully!*\n\n` +
 			`${prefix ? `Prefix: ${prefix}\n\nAll numbers will be dialed as: ${prefix} + [phone number]` : 'No prefix will be added to dialed numbers.'}`,
-			{ parse_mode: "Markdown", ...mainMenu }
+			{ parse_mode: "Markdown", ...getUserMenu(user) }
 		  );
 		  delete userStates[userId];
 		  break;
@@ -1745,7 +3040,7 @@ const initializeBot = () => {
 		  bot.sendMessage(
 			chatId,
 			`✅ *Caller ID Set Successfully!*\n\nCaller ID: ${escapeMarkdown(validation.formatted)}\n\nThis number will be displayed to recipients when making calls.`,
-			{ parse_mode: "Markdown", ...mainMenu }
+			{ parse_mode: "Markdown", ...getUserMenu(userId) }
 		  );
 		  delete userStates[userId];
 		  break;
@@ -1761,7 +3056,7 @@ const initializeBot = () => {
         bot.sendMessage(
           chatId,
           `✅ Concurrent calls set to: ${concurrentNum}`,
-          mainMenu
+          getUserMenu(userId)
         );
         delete userStates[userId];
         break;
@@ -1776,7 +3071,7 @@ const initializeBot = () => {
 		  bot.sendMessage(
 			chatId,
 			`✅ DTMF digit set to: ${text}`,
-			mainMenu
+			getUserMenu(userId)
 		  );
 		  delete userStates[userId];
 		  break;
@@ -1794,7 +3089,7 @@ const initializeBot = () => {
         bot.sendMessage(
           chatId,
           `✅ SIP trunk set to: ${selectedTrunk.name}`,
-          mainMenu
+          getUserMenu(userId)
         );
         delete userStates[userId];
         break;
@@ -1852,7 +3147,7 @@ const initializeBot = () => {
             `🌐 Host: ${newSipPeer.host}\n` +
             `👤 Username: ${newSipPeer.username}\n` +
             `🔌 Status: Active`,
-            { parse_mode: "Markdown", ...mainMenu }
+            { parse_mode: "Markdown", ...getUserMenu(user) }
           );
           
         } catch (error) {
@@ -1875,7 +3170,7 @@ const initializeBot = () => {
             bot.sendMessage(chatId, "⚠️ User already permitted.");
           } else {
             await Allowed.create({ telegramId: permitId });
-            bot.sendMessage(chatId, `✅ User ${permitId} permitted!`, mainMenu);
+            bot.sendMessage(chatId, `✅ User ${permitId} permitted!`, getUserMenu(user));
           }
         } catch (error) {
           bot.sendMessage(chatId, `❌ Error: ${error.message}`);
@@ -1885,12 +3180,85 @@ const initializeBot = () => {
     }
   });
 
+  // Handle bulk rate upload via CSV document
+  bot.on('document', async (msg) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const userState = userStates[userId];
+    
+    if (!userState || userState.action !== 'admin_uploading_rates') {
+      return;
+    }
+    
+    const user = await checkUserAccess(userId, chatId, true); // Admin required
+    if (!user) return;
+    
+    try {
+      const fileId = msg.document.file_id;
+      const fileName = msg.document.file_name;
+      
+      if (!fileName.toLowerCase().endsWith('.csv')) {
+        bot.sendMessage(chatId, "❌ Please upload a CSV file.");
+        return;
+      }
+      
+      bot.sendMessage(chatId, "📋 Processing CSV file...");
+      
+      const fileInfo = await bot.getFile(fileId);
+      const fileBuffer = await axios.get(`https://api.telegram.org/file/bot${config.telegram_bot_token}/${fileInfo.file_path}`, {
+        responseType: 'arraybuffer'
+      });
+      
+      const csvContent = Buffer.from(fileBuffer.data).toString('utf-8');
+      
+      // Process CSV and upload rates
+      const result = await adminUtilities.bulkUploadRates(userState.rateCardId, csvContent);
+      
+      bot.sendMessage(
+        chatId,
+        `✅ *Rates Uploaded Successfully!*\n\n` +
+        `Processed: ${result.created} rates\n` +
+        `Total in file: ${result.total}\n\n` +
+        `${result.message}`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '💳 Manage Rates', callback_data: 'admin_rates' }],
+              [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+            ]
+          }
+        }
+      );
+      
+      delete userStates[userId];
+      
+    } catch (error) {
+      console.error('Error uploading rates:', error);
+      bot.sendMessage(
+        chatId,
+        `❌ Error uploading rates: ${error.message}\n\n` +
+        `Please check your CSV format and try again.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+            ]
+          }
+        }
+      );
+      delete userStates[userId];
+    }
+  });
+  
   // Handle file uploads
   bot.on("message", async (msg) => {
 	  if (!msg.audio && !msg.document) return;
 	  
 	  const chatId = msg.chat.id;
 	  const userId = msg.from.id;
+	  const user = msg.from.id;
 	  const userState = userStates[userId];
 	  
 	  // Get file info based on type
@@ -1987,12 +3355,38 @@ const initializeBot = () => {
 				`✅ *Callbacks Complete*\n\n` +
 				`Successfully initiated: ${successCount} callbacks\n` +
 				`${failCount > 0 ? `Failed: ${failCount} callbacks\n` : ''}`,
-				{ parse_mode: "Markdown", ...mainMenu }
+				{ parse_mode: "Markdown", ...getUserMenu(user) }
 			  );
 			  delete userStates[userId];
 			  break;
 
-		  
+		  case 'admin_setting_callerid':
+			  await handleAdminSetCallerId(bot, msg, userStates, userId);
+			  break;
+			  
+			case 'admin_setting_prefix':
+			  await handleAdminSetPrefix(bot, msg, userStates, userId);
+			  break;
+		  case 'admin_setting_concurrent_calls':
+			  await handleAdminSetConcurrentCalls(bot, msg, userStates, userId);
+			  break;
+			  
+		  case 'admin_creating_rate_card':
+			await handleCreateRateCard(bot, msg, userStates);
+			break;
+			
+		  case 'admin_creating_provider':
+			await handleCreateProvider(bot, msg, userStates);
+			break;
+			
+		  case 'admin_uploading_rates':
+			bot.sendMessage(chatId, "📋 Please upload a CSV file with the rate data.");
+			break;
+			
+		  case 'admin_adding_credit_amount':
+			  await handleAddCreditAmount(bot, msg, userStates, userId);
+			  break;
+			  
 		  case "waiting_campaign_file":
 			  console.log('[Document] Processing campaign file');
 			  
@@ -2047,7 +3441,7 @@ const initializeBot = () => {
 				`Processing ${unprocessedData.length} phone numbers...\n\n` +
 				`Statistics have been reset for this new campaign.\n` +
 				`You'll receive notifications as calls progress.`,
-				{ parse_mode: "Markdown", ...mainMenu }
+				{ parse_mode: "Markdown", ...getUserMenu(userId) }
 			  );
 			  
 			  // Update settings with campaign data including DTMF digit
@@ -2108,7 +3502,7 @@ const initializeBot = () => {
 					`Duplicates: ${data2.length - unprocessedData2.length}\n\n` +
 					`❌ SIP Trunk Error: ${escapeMarkdown(trunkValidation.message)}\n\n` +
 					`Please fix the SIP trunk configuration and use "Start Campaign" to begin dialing.`,
-					{ parse_mode: "Markdown", ...mainMenu }
+					{ parse_mode: "Markdown", ...getUserMenu(user) }
 				  );
 				  
 				  for (const entry of unprocessedData2) {
@@ -2152,7 +3546,7 @@ const initializeBot = () => {
 				  `DTMF Digit: ${escapeMarkdown(campaignWithTrunk.dtmfDigit || '1')}\n` +
 				  `Concurrent Calls: ${campaignWithTrunk.concurrentCalls}\n\n` +
 				  `Dialing will begin automatically...`,
-				  { parse_mode: "Markdown", ...mainMenu }
+				  { parse_mode: "Markdown", ...getUserMenu(user) }
 				);
 				
 				set_settings({
@@ -2183,7 +3577,7 @@ const initializeBot = () => {
 				  `⚠️ *Campaign NOT Started - Missing Configuration:*\n` +
 				  `${missingFields.map(f => `• ${f}`).join('\n')}\n\n` +
 				  `Please configure the missing fields and use "Start Campaign" to begin dialing.`,
-				  { parse_mode: "Markdown", ...mainMenu }
+				  { parse_mode: "Markdown", ...getUserMenu(user) }
 				);
 				
 				for (const entry of unprocessedData2) {
@@ -2258,7 +3652,7 @@ const initializeBot = () => {
 				`✅ IVR ${userState.ivrType} file uploaded and converted successfully!\n\n` +
 				`📁 File: ${ivrFileName}\n` +
 				`📍 Location: ${soundsPath}`,
-				mainMenu
+				getUserMenu(user)
 			  );
 			  
 			  delete userStates[userId];
@@ -2292,7 +3686,7 @@ const initializeBot = () => {
       chatId,
       "🤖 *Call Campaign Bot*\n\nSelect an option:",
       { 
-        ...mainMenu,
+        ...getUserMenu(user),
         parse_mode: "Markdown"
       }
     );
@@ -2523,7 +3917,7 @@ bot.onText(/\/reset/, async (msg) => {
     bot.sendMessage(
       chatId,
       `✅ *Campaign Statistics Reset*\n\nAll counters have been reset to 0.`,
-      { parse_mode: "Markdown", ...mainMenu }
+      { parse_mode: "Markdown", ...getUserMenu(user) }
     );
     
   } catch (error) {
@@ -2532,6 +3926,133 @@ bot.onText(/\/reset/, async (msg) => {
 });
 
 };
+
+// Handle rate card creation
+  async function handleCreateRateCard(bot, msg, userStates) {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const text = msg.text.trim();
+    const userState = userStates[userId];
+    
+    try {
+      const parts = text.split('|').map(p => p.trim());
+      if (parts.length !== 2) {
+        bot.sendMessage(chatId, "❌ Invalid format. Use: `Name | Description`", { parse_mode: 'Markdown' });
+        return;
+      }
+      
+      const [name, description] = parts;
+      
+      if (!name || !description) {
+        bot.sendMessage(chatId, "❌ Both name and description are required.");
+        return;
+      }
+      
+      const result = await adminUtilities.createRateCard({
+        name,
+        description,
+        providerId: userState.providerId,
+        currency: 'USD'
+      });
+      
+      bot.sendMessage(
+        chatId,
+        `✅ *Rate Card Created Successfully!*\n\n` +
+        `Name: ${escapeMarkdown(result.rateCard.name)}\n` +
+        `Description: ${escapeMarkdown(result.rateCard.description)}\n` +
+        `ID: ${result.rateCard.id}\n\n` +
+        `You can now upload rates to this rate card.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '📋 Upload Rates', callback_data: `admin_upload_rates_${result.rateCard.id}` }],
+              [{ text: '💳 Manage Rates', callback_data: 'admin_rates' }],
+              [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+            ]
+          }
+        }
+      );
+      
+      delete userStates[userId];
+      
+    } catch (error) {
+      console.error('Error creating rate card:', error);
+      bot.sendMessage(chatId, `❌ Error creating rate card: ${error.message}`);
+      delete userStates[userId];
+    }
+  }
+
+  // Handle provider creation
+  async function handleCreateProvider(bot, msg, userStates) {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const text = msg.text.trim();
+    
+    try {
+      const parts = text.split('|').map(p => p.trim());
+      if (parts.length !== 5) {
+        bot.sendMessage(
+          chatId, 
+          "❌ Invalid format. Use:\n`Name | Description | Currency | Billing Increment | Minimum Duration`", 
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      
+      const [name, description, currency, billingIncrement, minimumDuration] = parts;
+      
+      if (!name || !description || !currency) {
+        bot.sendMessage(chatId, "❌ Name, description, and currency are required.");
+        return;
+      }
+      
+      const billingInc = parseInt(billingIncrement) || 60;
+      const minDuration = parseInt(minimumDuration) || 60;
+      
+      if (billingInc <= 0 || minDuration <= 0) {
+        bot.sendMessage(chatId, "❌ Billing increment and minimum duration must be positive numbers.");
+        return;
+      }
+      
+      const result = await adminUtilities.createProvider({
+        name,
+        description,
+        currency: currency.toUpperCase(),
+        billingIncrement: billingInc,
+        minimumDuration: minDuration
+      });
+      
+      bot.sendMessage(
+        chatId,
+        `✅ *Provider Created Successfully!*\n\n` +
+        `Name: ${escapeMarkdown(result.provider.name)}\n` +
+        `Description: ${escapeMarkdown(result.provider.description)}\n` +
+        `Currency: ${result.provider.currency}\n` +
+        `Billing Increment: ${result.provider.billingIncrement}s\n` +
+        `Minimum Duration: ${result.provider.minimumDuration}s\n` +
+        `ID: ${result.provider.id}\n\n` +
+        `You can now create rate cards for this provider.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🏗️ Create Rate Card', callback_data: 'admin_create_rate' }],
+              [{ text: '🏢 Manage Providers', callback_data: 'admin_providers' }],
+              [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+            ]
+          }
+        }
+      );
+      
+      delete userStates[userId];
+      
+    } catch (error) {
+      console.error('Error creating provider:', error);
+      bot.sendMessage(chatId, `❌ Error creating provider: ${error.message}`);
+      delete userStates[userId];
+    }
+  }
 
 function stopCallingProcess() {
   if (global.callingInterval) {

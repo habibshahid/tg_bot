@@ -1,4 +1,4 @@
-// models/transaction.js
+// models/transaction.js - FIXED VERSION (remove associations from here)
 const { DataTypes } = require('sequelize');
 const sequelize = require('../config/database');
 
@@ -67,7 +67,7 @@ const Transaction = sequelize.define('Transaction', {
   underscored: true
 });
 
-// models/callDetail.js - Extended CDR for billing
+// CallDetail model
 const CallDetail = sequelize.define('CallDetail', {
   id: {
     type: DataTypes.INTEGER,
@@ -205,50 +205,6 @@ const CallDetail = sequelize.define('CallDetail', {
   tableName: 'call_details',
   timestamps: true,
   underscored: true
-});
-
-// Associations
-const User = require('./user');
-const { RateCard, Destination } = require('./provider');
-
-User.hasMany(Transaction, {
-  foreignKey: 'userId',
-  as: 'transactions'
-});
-
-Transaction.belongsTo(User, {
-  foreignKey: 'userId',
-  as: 'user'
-});
-
-User.hasMany(CallDetail, {
-  foreignKey: 'userId',
-  as: 'callDetails'
-});
-
-CallDetail.belongsTo(User, {
-  foreignKey: 'userId',
-  as: 'user'
-});
-
-CallDetail.belongsTo(RateCard, {
-  foreignKey: 'rateCardId',
-  as: 'rateCard'
-});
-
-CallDetail.belongsTo(Destination, {
-  foreignKey: 'destinationId',
-  as: 'destination'
-});
-
-Transaction.belongsTo(CallDetail, {
-  foreignKey: 'callDetailId',
-  as: 'callDetail'
-});
-
-CallDetail.hasOne(Transaction, {
-  foreignKey: 'callDetailId',
-  as: 'transaction'
 });
 
 module.exports = { Transaction, CallDetail };

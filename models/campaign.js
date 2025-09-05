@@ -112,6 +112,11 @@ const Campaign = sequelize.define('Campaign', {
     defaultValue: true,
     field: 'is_active'
   },
+  createdBy: {
+    type: DataTypes.STRING(100),
+    defaultValue: 0,
+    field: 'created_by'
+  },
   createdAt: {
     type: DataTypes.DATE,
     defaultValue: DataTypes.NOW,

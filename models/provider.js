@@ -222,35 +222,4 @@ const Rate = sequelize.define('Rate', {
   underscored: true
 });
 
-// Associations
-Provider.hasMany(RateCard, { 
-  foreignKey: 'providerId',
-  as: 'rateCards'
-});
-
-RateCard.belongsTo(Provider, { 
-  foreignKey: 'providerId',
-  as: 'provider'
-});
-
-RateCard.hasMany(Rate, {
-  foreignKey: 'rateCardId',
-  as: 'rates'
-});
-
-Rate.belongsTo(RateCard, {
-  foreignKey: 'rateCardId',
-  as: 'rateCard'
-});
-
-Rate.belongsTo(Destination, {
-  foreignKey: 'destinationId',
-  as: 'destination'
-});
-
-Destination.hasMany(Rate, {
-  foreignKey: 'destinationId',
-  as: 'rates'
-});
-
 module.exports = { Provider, RateCard, Destination, Rate };

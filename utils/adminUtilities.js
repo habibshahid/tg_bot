@@ -469,6 +469,234 @@ class AdminUtilities {
       userStats
     };
   }
-}
 
+	/**
+	 * Validate rate card completeness
+	 */
+	async validateRateCard(rateCardId) {
+	  const rateCard = await RateCard.findByPk(rateCardId, {
+		include: [
+		  { model: Rate, as: 'rates', include: [{ model: Destination, as: 'destination' }] },
+		  { model: Provider, as: 'provider' }
+		]
+	  });
+	  
+	  if (!rateCard) {
+		throw new Error('Rate card not found');
+	  }
+	  
+	  const validation = {
+		rateCardId,
+		name: rateCard.name,
+		provider: rateCard.provider.name,
+		totalRates: rateCard.rates.length,
+		issues: [],
+		warnings: [],
+		status: 'valid'
+	  };
+	  
+	  // Check for missing rates
+	  if (rateCard.rates.length === 0) {
+		validation.issues.push('No rates configured');
+		validation.status = 'invalid';
+	  }
+	  
+	  // Check for zero or negative rates
+	  const invalidRates = rateCard.rates.filter(rate => 
+		parseFloat(rate.sellPrice) <= 0 || parseFloat(rate.costPrice) < 0
+	  );
+	  
+	  if (invalidRates.length > 0) {
+		validation.issues.push(`${invalidRates.length} rates have invalid pricing`);
+		validation.status = 'invalid';
+	  }
+	  
+	  // Check for rates where sell price < cost price
+	  const unprofitableRates = rateCard.rates.filter(rate => 
+		parseFloat(rate.sellPrice) < parseFloat(rate.costPrice)
+	  );
+	  
+	  if (unprofitableRates.length > 0) {
+		validation.warnings.push(`${unprofitableRates.length} rates are unprofitable`);
+	  }
+	  
+	  // Check for expired rates
+	  const now = new Date();
+	  const expiredRates = rateCard.rates.filter(rate => 
+		rate.effectiveTo && new Date(rate.effectiveTo) < now
+	  );
+	  
+	  if (expiredRates.length > 0) {
+		validation.warnings.push(`${expiredRates.length} rates have expired`);
+	  }
+	  
+	  return validation;
+	}
+
+	/**
+	 * Get rate card coverage report
+	 */
+	async getRateCardCoverage(rateCardId) {
+	  const [rateCard, allDestinations] = await Promise.all([
+		RateCard.findByPk(rateCardId, {
+		  include: [{ model: Rate, as: 'rates', include: [{ model: Destination, as: 'destination' }] }]
+		}),
+		Destination.findAll({ where: { status: 'active' } })
+	  ]);
+	  
+	  if (!rateCard) {
+		throw new Error('Rate card not found');
+	  }
+	  
+	  const coveredDestinations = rateCard.rates.map(rate => rate.destination.id);
+	  const uncoveredDestinations = allDestinations.filter(dest => 
+		!coveredDestinations.includes(dest.id)
+	  );
+	  
+	  return {
+		rateCardId,
+		name: rateCard.name,
+		totalDestinations: allDestinations.length,
+		coveredDestinations: coveredDestinations.length,
+		uncoveredDestinations: uncoveredDestinations.length,
+		coveragePercentage: ((coveredDestinations.length / allDestinations.length) * 100).toFixed(2),
+		uncoveredList: uncoveredDestinations.map(dest => ({
+		  id: dest.id,
+		  countryName: dest.countryName,
+		  prefix: dest.prefix
+		}))
+	  };
+	}
+
+	/**
+	 * Add credit to user account with validation
+	 */
+	async addCredit(userData) {
+	  const transaction = await sequelize.transaction();
+	  
+	  try {
+		const { telegramId, amount, description, createdBy } = userData;
+		
+		// Validation
+		if (!telegramId || !amount || !createdBy) {
+		  throw new Error('Missing required fields');
+		}
+		
+		const creditAmount = parseFloat(amount);
+		if (isNaN(creditAmount) || creditAmount <= 0) {
+		  throw new Error('Invalid credit amount');
+		}
+		
+		if (creditAmount > 10000) { // Maximum single credit limit
+		  throw new Error('Credit amount exceeds maximum limit ($10,000)');
+		}
+		
+		// Find user
+		const user = await User.findOne({ 
+		  where: { telegramId: telegramId.toString() },
+		  transaction
+		});
+		
+		if (!user) {
+		  throw new Error('User not found');
+		}
+		
+		if (user.status !== 'active') {
+		  throw new Error('Cannot add credit to inactive user');
+		}
+		
+		// Calculate new balance
+		const currentBalance = parseFloat(user.balance);
+		const newBalance = currentBalance + creditAmount;
+		
+		// Update user balance
+		await user.update({ balance: newBalance }, { transaction });
+		
+		// Create transaction record
+		await Transaction.create({
+		  userId: user.id,
+		  transactionType: 'credit',
+		  amount: creditAmount,
+		  balanceBefore: currentBalance,
+		  balanceAfter: newBalance,
+		  description: description || `Credit added by ${createdBy}`,
+		  createdBy: createdBy.toString()
+		}, { transaction });
+		
+		await transaction.commit();
+		
+		return {
+		  success: true,
+		  user: {
+			id: user.id,
+			telegramId: user.telegramId,
+			firstName: user.firstName,
+			lastName: user.lastName,
+			previousBalance: currentBalance,
+			newBalance,
+			creditAdded: creditAmount
+		  },
+		  message: `Successfully added $${creditAmount} credit`
+		};
+		
+	  } catch (error) {
+		await transaction.rollback();
+		throw error;
+	  }
+	}
+
+	/**
+	 * Deduct credit with insufficient balance protection
+	 */
+	async deductCredit(userId, amount, description, reference = null) {
+	  const transaction = await sequelize.transaction();
+	  
+	  try {
+		const debitAmount = parseFloat(amount);
+		if (isNaN(debitAmount) || debitAmount <= 0) {
+		  throw new Error('Invalid debit amount');
+		}
+		
+		const user = await User.findByPk(userId, { transaction });
+		if (!user) {
+		  throw new Error('User not found');
+		}
+		
+		const currentBalance = parseFloat(user.balance);
+		const availableBalance = currentBalance + parseFloat(user.creditLimit);
+		
+		if (availableBalance < debitAmount) {
+		  throw new Error('Insufficient balance including credit limit');
+		}
+		
+		const newBalance = currentBalance - debitAmount;
+		
+		await user.update({ balance: newBalance }, { transaction });
+		
+		await Transaction.create({
+		  userId,
+		  transactionType: 'debit',
+		  amount: debitAmount,
+		  balanceBefore: currentBalance,
+		  balanceAfter: newBalance,
+		  description: description || 'Account debit',
+		  reference,
+		  createdBy: 'system'
+		}, { transaction });
+		
+		await transaction.commit();
+		
+		return {
+		  success: true,
+		  previousBalance: currentBalance,
+		  newBalance,
+		  amountDeducted: debitAmount
+		};
+		
+	  } catch (error) {
+		await transaction.rollback();
+		throw error;
+	  }
+	}
+}
 module.exports = new AdminUtilities();
