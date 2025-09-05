@@ -144,48 +144,20 @@ async function checkUserAccess(userId, chatId, requireAdmin = false) {
 async function startCallingProcess(data, campaign, userId = null) {
   let user = null;
   
-  // If userId provided, get user for billing context
+  // Always try to get user for billing context
   if (userId) {
     user = await User.findOne({ where: { telegramId: userId.toString() } });
     if (!user) {
-      throw new Error('User not found');
-    }
-
-    if (user.rateCardId) {
-      // Validate user has sufficient balance for campaign
-      let totalEstimatedCost = 0;
-      const validatedNumbers = [];
-      
-      // Pre-validate first 10 numbers for estimation
-      for (const entry of data.slice(0, 10)) {
-        try {
-          const estimate = await billingEngine.estimateCallCost(user.id, entry.phoneNumber, 3);
-          totalEstimatedCost += estimate.estimatedCost;
-          validatedNumbers.push({
-            ...entry,
-            estimatedCost: estimate.estimatedCost,
-            destination: estimate.destination
-          });
-        } catch (error) {
-          console.warn(`Skipping ${entry.phoneNumber}: ${error.message}`);
-        }
-      }
-
-      if (validatedNumbers.length === 0) {
-        throw new Error('No valid destinations found in your rate card');
-      }
-
-      // Check if user has sufficient balance for estimated campaign cost
-      const campaignEstimate = totalEstimatedCost * (data.length / Math.min(data.length, 10));
-      const balanceCheck = await billingEngine.checkSufficientBalance(user.id, campaignEstimate);
-      
-      if (!balanceCheck.hasSufficientBalance) {
-        throw new Error(
-          `Insufficient balance for campaign. ` +
-          `Estimated cost: $${campaignEstimate.toFixed(2)}, ` +
-          `Available: $${balanceCheck.availableBalance.toFixed(2)}`
-        );
-      }
+      console.warn(`User ${userId} not found, creating default user for billing`);
+      // Create a default user for billing if doesn't exist
+      user = await User.create({
+        telegramId: userId.toString(),
+        userType: 'user',
+        status: 'active',
+        balance: 0,
+        firstName: 'Auto-created User',
+        rateCardId: null // Will be assigned by admin later
+      });
     }
   }
 
@@ -217,7 +189,7 @@ async function startCallingProcess(data, campaign, userId = null) {
   await waitForConnection();
   set_unprocessed_data(data);
   
-  // Update settings with user context for billing (if user exists)
+  // ALWAYS set user context for billing
   const currentSettings = get_settings();
   const updatedSettings = {
     ...currentSettings,
@@ -232,9 +204,13 @@ async function startCallingProcess(data, campaign, userId = null) {
     ivr_outro_file: campaign.ivrOutroFile
   };
   
+  // CRITICAL: Always set user context, even if no rate card
   if (user) {
     updatedSettings.user_id = user.id;
     updatedSettings.telegram_user_id = userId;
+    console.log(`[Billing] User context set: ${user.telegramId}, Rate Card: ${user.rateCardId || 'None'}`);
+  } else {
+    console.log(`[Warning] No user context available for billing`);
   }
   
   set_settings(updatedSettings);
@@ -251,12 +227,9 @@ async function startCallingProcess(data, campaign, userId = null) {
         
         await new Promise(resolve => setTimeout(resolve, delay));
         
-        // Use billing call handler if user has billing enabled
-        if (user && user.rateCardId) {
-          return require("../asterisk/billingCallHandler")(line);
-        } else {
-          return require("../asterisk/call")(line);
-        }
+        // ALWAYS use billing call handler
+        console.log(`[System] Using billing handler for all calls (User: ${user ? user.telegramId : 'none'})`);
+        return require("../asterisk/billingCallHandler")(line);
       };
       callPromises.push(delayedCall());
     }
@@ -268,26 +241,24 @@ async function startCallingProcess(data, campaign, userId = null) {
   const bot = get_bot();
   const settings = get_settings();
   
-  let completionMessage = `✅ All lines have been called`;
+  let completionMessage = `✅ *Campaign Completed*\n\nAll numbers have been processed.`;
   
-  // Add billing summary if user has billing enabled
+  // Add billing summary if user has rate card
   if (user && user.rateCardId) {
     try {
       const finalSummary = await billingEngine.getUserFinancialSummary(user.id);
-      completionMessage = `✅ *Campaign Completed*\n\n` +
-        `All numbers have been processed.\n` +
-        `Final Balance: $${finalSummary.summary.currentBalance.toFixed(2)}`;
+      completionMessage += `\n\nFinal Balance: $${finalSummary.summary.currentBalance.toFixed(2)}`;
     } catch (error) {
       console.error('Error getting final summary:', error);
     }
+  } else {
+    completionMessage += `\n\n💡 Contact admin to enable billing for future campaigns.`;
   }
   
   bot.sendMessage(
     settings?.notifications_chat_id,
     completionMessage,
-    {
-      parse_mode: user && user.rateCardId ? "Markdown" : "HTML",
-    }
+    { parse_mode: "Markdown" }
   );
   return;
 }
@@ -889,8 +860,6 @@ async function handleAdminSetPrefix(bot, msg, userStates, userId) {
 	else{
 		prefix = text;
 	}
-	
-	console.log('##################', prefix, text)
 	
     // Validate prefix (should only contain digits or be empty)
     if (prefix !== '' && prefix && !/^\d*$/.test(prefix)) {
@@ -2146,54 +2115,329 @@ const initializeBot = () => {
         userStates[userId] = { action: "waiting_permit_id" };
         break;
 
-      case "campaign_stats":
-        const campaignStats = await getCallStats();
-        const currentCampaignStats = await getOrCreateCampaign(userId);
-        
-        let trunkInfo = 'Not configured';
-        if (currentCampaignStats.sipTrunk) {
-          trunkInfo = `${escapeMarkdown(currentCampaignStats.sipTrunk.name)} (${escapeMarkdown(currentCampaignStats.sipTrunk.host)})`;
-          if (!currentCampaignStats.sipTrunk.status) {
-			  trunkInfo += ' ⚠️ INACTIVE';
-			}
+      case "check_balance":
+		  if (!user.rateCardId) {
+			bot.sendMessage(chatId, "💳 No rate card assigned. Contact administrator to enable billing features.");
+			return;
 		  }
 		  
-		  let callbackInfo = 'Not configured';
-		  if (currentCampaignStats.callbackTrunkId) {
-			const callbackTrunk = await SipPeer.findByPk(currentCampaignStats.callbackTrunkId);
-			if (callbackTrunk) {
-			  callbackInfo = `${escapeMarkdown(callbackTrunk.name)}`;
-			  if (currentCampaignStats.callbackTrunkNumber) {
-				callbackInfo += ` → ${escapeMarkdown(currentCampaignStats.callbackTrunkNumber)}`;
+		  try {
+			const financial = await billingEngine.getUserFinancialSummary(user.id);
+			
+			// Get recent call details for this user
+			const recentCalls = await CallDetail.findAll({
+			  where: { userId: user.id },
+			  order: [['createdAt', 'DESC']],
+			  limit: 5,
+			  include: [
+				{ 
+				  model: Destination, 
+				  as: 'destination',
+				  attributes: ['countryName', 'prefix']
+				}
+			  ]
+			});
+			
+			let message = `💰 *Account Balance*\n\n`;
+			message += `💳 Current Balance: $${financial.summary.currentBalance.toFixed(2)}\n`;
+			message += `🏦 Credit Limit: $${financial.summary.creditLimit.toFixed(2)}\n`;
+			message += `💵 Available Balance: $${financial.summary.availableBalance.toFixed(2)}\n\n`;
+			
+			message += `📊 *Usage Summary*\n`;
+			message += `📞 Total Calls: ${financial.summary.totalCalls}\n`;
+			message += `✅ Answered Calls: ${financial.summary.answeredCalls}\n`;
+			message += `⏱️ Total Minutes: ${financial.summary.totalMinutes.toFixed(1)}\n`;
+			message += `💸 Total Spent: $${financial.summary.totalSpent.toFixed(2)}\n\n`;
+			
+			if (recentCalls.length > 0) {
+			  message += `📋 *Recent Calls*\n`;
+			  recentCalls.forEach((call, index) => {
+				const status = call.callStatus === 'answered' ? '✅' : '❌';
+				const duration = call.callStatus === 'answered' ? `${Math.round(call.billableDuration/60)}min` : 'N/A';
+				const cost = call.totalCharge > 0 ? `$${call.totalCharge.toFixed(4)}` : 'Free';
+				const destination = call.destination ? call.destination.countryName : 'Unknown';
+				
+				message += `${index + 1}. ${status} ${call.phoneNumber} (${destination})\n`;
+				message += `   ${duration} | ${cost} | ${call.createdAt.toLocaleDateString()}\n`;
+			  });
+			}
+			
+			bot.sendMessage(chatId, message, { 
+			  parse_mode: 'Markdown',
+			  reply_markup: {
+				inline_keyboard: [
+				  [{ text: '🔄 Refresh', callback_data: 'check_balance' }],
+				  [{ text: '📊 Detailed Report', callback_data: 'detailed_report' }],
+				  [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+				]
 			  }
-			}
+			});
+		  } catch (error) {
+			console.error('Balance check error:', error);
+			bot.sendMessage(chatId, `❌ Error retrieving balance: ${error.message}`);
+		  }
+		  break;
+
+		// 3. Add detailed report functionality
+		case "detailed_report":
+		  if (!user.rateCardId) {
+			bot.sendMessage(chatId, "💳 No rate card assigned. Contact administrator.");
+			return;
 		  }
 		  
-		  // Use escape characters for special markdown characters
-		  bot.sendMessage(
-			chatId,
-			`📈 *Campaign Statistics*\n\n` +
-			`*Campaign Info:*\n` +
-			`• Name: ${escapeMarkdown(currentCampaignStats.campaignName)}\n` +
-			`• SIP Trunk: ${trunkInfo}\n` +
-			`• Caller ID: ${escapeMarkdown(currentCampaignStats.callerId || 'Not set ⚠️')}\n` +
-			`• Callback Config: ${callbackInfo}\n` +
-			`• Concurrent Calls: ${currentCampaignStats.concurrentCalls}\n` +
-			`• DTMF Digit: ${currentCampaignStats.dtmfDigit}\n` +
-			`• Dial Prefix: ${currentCampaignStats.dialPrefix || 'None'}\n` +
-			`• IVR Intro: ${escapeMarkdown(currentCampaignStats.ivrIntroFile || 'Using default')}\n` +
-			`• IVR Outro: ${escapeMarkdown(currentCampaignStats.ivrOutroFile || 'Using default')}\n\n` +
-			`*Campaign Performance:*\n` +
-			`• Total Calls: ${currentCampaignStats.totalCalls}\n` +
-			`• Successful: ${currentCampaignStats.successfulCalls}\n` +
-			`• Failed: ${currentCampaignStats.failedCalls}\n` +
-			`• Voicemail: ${currentCampaignStats.voicemailCalls}\n` +
-			`• DTMF Responses: ${currentCampaignStats.dtmfResponses}\n` +
-			`• Success Rate: ${currentCampaignStats.totalCalls > 0 ? ((currentCampaignStats.successfulCalls / currentCampaignStats.totalCalls) * 100).toFixed(2) : 0}%\n` +
-			`• Response Rate: ${currentCampaignStats.successfulCalls > 0 ? ((currentCampaignStats.dtmfResponses / currentCampaignStats.successfulCalls) * 100).toFixed(2) : 0}%`,
-			{ parse_mode: "Markdown" }
-		  );
+		  try {
+			// Get calls from last 30 days
+			const thirtyDaysAgo = new Date();
+			thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+			
+			const callDetails = await CallDetail.findAll({
+			  where: { 
+				userId: user.id,
+				createdAt: { [Op.gte]: thirtyDaysAgo }
+			  },
+			  order: [['createdAt', 'DESC']],
+			  limit: 20,
+			  include: [
+				{ 
+				  model: Destination, 
+				  as: 'destination',
+				  attributes: ['countryName', 'prefix']
+				}
+			  ]
+			});
+			
+			const transactions = await Transaction.findAll({
+			  where: { 
+				userId: user.id,
+				createdAt: { [Op.gte]: thirtyDaysAgo }
+			  },
+			  order: [['createdAt', 'DESC']],
+			  limit: 10
+			});
+			
+			let message = `📊 *Detailed Report (Last 30 Days)*\n\n`;
+			
+			// Summary stats
+			const totalCalls = callDetails.length;
+			const answeredCalls = callDetails.filter(c => c.callStatus === 'answered').length;
+			const totalMinutes = callDetails.reduce((sum, c) => sum + (c.billableDuration / 60), 0);
+			const totalSpent = callDetails.reduce((sum, c) => sum + parseFloat(c.totalCharge), 0);
+			
+			message += `📈 *Summary*\n`;
+			message += `Calls Made: ${totalCalls}\n`;
+			message += `Answered: ${answeredCalls} (${totalCalls > 0 ? ((answeredCalls/totalCalls)*100).toFixed(1) : 0}%)\n`;
+			message += `Minutes: ${totalMinutes.toFixed(1)}\n`;
+			message += `Amount: $${totalSpent.toFixed(2)}\n\n`;
+			
+			// Recent transactions
+			if (transactions.length > 0) {
+			  message += `💳 *Recent Transactions*\n`;
+			  transactions.slice(0, 5).forEach((txn, index) => {
+				const type = txn.transactionType === 'credit' ? '💰' : '💸';
+				const amount = txn.transactionType === 'credit' ? `+$${txn.amount}` : `-$${txn.amount}`;
+				message += `${type} ${amount} | ${txn.createdAt.toLocaleDateString()}\n`;
+				if (txn.description) {
+				  message += `   ${txn.description}\n`;
+				}
+			  });
+			}
+			
+			bot.sendMessage(chatId, message, { 
+			  parse_mode: 'Markdown',
+			  reply_markup: {
+				inline_keyboard: [
+				  [{ text: '💰 Check Balance', callback_data: 'check_balance' }],
+				  [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+				]
+			  }
+			});
+		  } catch (error) {
+			console.error('Detailed report error:', error);
+			bot.sendMessage(chatId, `❌ Error generating report: ${error.message}`);
+		  }
 		  break;
+
+		// 4. Fix campaign stats to show accurate billing data
+		// Fixed campaign stats case with proper data validation and Markdown escaping
+case "campaign_stats":
+  try {
+    const currentCampaign = await getOrCreateCampaign(userId);
+    
+    // Get billing-based stats if user has rate card
+    let callStats = {};
+    if (user.rateCardId) {
+      // Get stats from call_details table (billing records) with better data validation
+      const billingStats = await CallDetail.findAll({
+        where: { 
+          userId: user.id,
+          campaignId: currentCampaign.id
+        },
+        attributes: [
+          [sequelize.fn('COUNT', sequelize.col('id')), 'totalCalls'],
+          [sequelize.fn('SUM', sequelize.literal("CASE WHEN call_status = 'answered' THEN 1 ELSE 0 END")), 'answeredCalls'],
+          [sequelize.fn('SUM', sequelize.literal("CASE WHEN call_status != 'answered' THEN 1 ELSE 0 END")), 'failedCalls'],
+          [sequelize.fn('SUM', sequelize.literal("CASE WHEN dtmf_pressed IS NOT NULL THEN 1 ELSE 0 END")), 'dtmfResponses'],
+          [sequelize.fn('SUM', sequelize.col('billable_duration')), 'totalSeconds'],
+          [sequelize.fn('SUM', sequelize.col('total_charge')), 'totalSpent']
+        ],
+        raw: true
+      });
+      
+      const stats = billingStats[0];
+      const totalCalls = parseInt(stats.totalCalls) || 0;
+      const totalSeconds = parseFloat(stats.totalSeconds || 0);
+      const totalSpent = parseFloat(stats.totalSpent || 0);
+      
+      // Validate data ranges to prevent unrealistic numbers
+      const validatedMinutes = Math.min(totalSeconds / 60, 999999); // Cap at 999,999 minutes
+      const validatedSpent = Math.min(totalSpent, 999999); // Cap at $999,999
+      
+      callStats = {
+        total: totalCalls,
+        successful: parseInt(stats.answeredCalls) || 0,
+        failed: parseInt(stats.failedCalls) || 0,
+        dtmf_responses: parseInt(stats.dtmfResponses) || 0,
+        total_minutes: validatedMinutes,
+        total_spent: validatedSpent
+      };
+      
+      // Log suspicious data for debugging
+      if (totalSeconds > 86400 * 30 || totalSpent > 10000) { // More than 30 days of minutes or $10k
+        console.warn(`[Stats] Suspicious billing data detected for user ${user.id}: ${totalSeconds}s, $${totalSpent}`);
+      }
+    } else {
+      // Use legacy stats from campaign table
+      callStats = {
+        total: currentCampaign.totalCalls || 0,
+        successful: currentCampaign.successfulCalls || 0,
+        failed: currentCampaign.failedCalls || 0,
+        dtmf_responses: currentCampaign.dtmfResponses || 0
+      };
+    }
+    
+    // Calculate rates with safety checks
+    const successRate = callStats.total > 0 ? 
+      Math.min(((callStats.successful / callStats.total) * 100), 100).toFixed(1) : '0.0';
+    const responseRate = callStats.successful > 0 ? 
+      Math.min(((callStats.dtmf_responses / callStats.successful) * 100), 100).toFixed(1) : '0.0';
+    
+    // Safely escape campaign name and trunk info
+    const campaignName = currentCampaign.campaignName ? 
+      currentCampaign.campaignName.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&') : 'Unknown Campaign';
+    
+    let trunkInfo = 'Not configured';
+    if (currentCampaign.sipTrunk) {
+      const trunkName = currentCampaign.sipTrunk.name ? 
+        currentCampaign.sipTrunk.name.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&') : 'Unknown';
+      const trunkHost = currentCampaign.sipTrunk.host ? 
+        currentCampaign.sipTrunk.host.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&') : 'Unknown';
+      
+      trunkInfo = `${trunkName} (${trunkHost})`;
+      if (!currentCampaign.sipTrunk.status) {
+        trunkInfo += ' ⚠️ INACTIVE';
+      }
+    }
+    
+    const callerId = currentCampaign.callerId ? 
+      currentCampaign.callerId.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&') : 'Not set ⚠️';
+    const dialPrefix = currentCampaign.dialPrefix ? 
+      currentCampaign.dialPrefix.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&') : 'None';
+    
+    // Build message with proper escaping
+    let message = `📈 *Campaign Statistics*\n\n`;
+    message += `*Campaign:* ${campaignName}\n\n`;
+    
+    message += `📊 *Performance*\n`;
+    message += `Total Calls: ${callStats.total}\n`;
+    message += `✅ Successful: ${callStats.successful}\n`;
+    message += `❌ Failed: ${callStats.failed}\n`;
+    message += `🔢 DTMF (${currentCampaign.dtmfDigit || '1'}): ${callStats.dtmf_responses}\n`;
+    message += `📈 Success Rate: ${successRate}%\n`;
+    message += `📱 Response Rate: ${responseRate}%\n\n`;
+    
+    // Only show billing info if data is reasonable
+    if (user.rateCardId && callStats.total_minutes !== undefined && callStats.total_minutes > 0) {
+      const avgCostPerCall = callStats.total > 0 ? (callStats.total_spent / callStats.total) : 0;
+      
+      message += `💰 *Billing Info*\n`;
+      message += `Total Minutes: ${callStats.total_minutes.toFixed(1)}\n`;
+      message += `Total Spent: $${callStats.total_spent.toFixed(2)}\n\n`;
+    }
+    
+    message += `⚙️ *Configuration*\n`;
+    message += `SIP Trunk: ${trunkInfo}\n`;
+    message += `Caller ID: ${callerId}\n`;
+    message += `Concurrent: ${currentCampaign.concurrentCalls} calls\n`;
+    message += `Dial Prefix: ${dialPrefix}`;
+    
+    // Validate message length (Telegram has limits)
+    if (message.length > 4096) {
+      message = message.substring(0, 4000) + '\n\n...message truncated...';
+    }
+    
+    bot.sendMessage(chatId, message, { 
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🔄 Refresh Stats', callback_data: 'campaign_stats' }],
+          user.rateCardId ? [{ text: '💰 Check Balance', callback_data: 'check_balance' }] : [],
+          [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+        ].filter(row => row.length > 0)
+      }
+    });
+  } catch (error) {
+    console.error('Campaign stats error:', error);
+    
+    // Send a simple fallback message if the main one fails
+    bot.sendMessage(chatId, 
+      `❌ Error loading detailed stats: ${error.message}\n\n` +
+      `📊 Basic Stats:\n` +
+      `Campaign calls are being processed. Use /stats for console output or contact admin if issues persist.`,
+      { 
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+          ]
+        }
+      }
+    );
+  }
+  break;
+
+// Also add a debug query to check for data anomalies
+case "debug_billing_data":
+  if (user.userType !== 'admin') {
+    bot.sendMessage(chatId, "❌ Admin access required!");
+    return;
+  }
+  
+  try {
+    const suspiciousRecords = await CallDetail.findAll({
+      where: { 
+        [Op.or]: [
+          { billable_duration: { [Op.gt]: 3600 } }, // More than 1 hour
+          { total_charge: { [Op.gt]: 100 } } // More than $100
+        ]
+      },
+      limit: 10,
+      order: [['total_charge', 'DESC']]
+    });
+    
+    let debugMessage = `🔍 *Billing Debug Info*\n\n`;
+    debugMessage += `Found ${suspiciousRecords.length} suspicious records:\n\n`;
+    
+    suspiciousRecords.forEach((record, index) => {
+      debugMessage += `${index + 1}. ${record.phoneNumber}\n`;
+      debugMessage += `   Duration: ${(record.billableDuration / 60).toFixed(1)}min\n`;
+      debugMessage += `   Charge: $${record.totalCharge}\n`;
+      debugMessage += `   Status: ${record.callStatus}\n\n`;
+    });
+    
+    bot.sendMessage(chatId, debugMessage, { parse_mode: 'Markdown' });
+  } catch (error) {
+    bot.sendMessage(chatId, `❌ Debug error: ${error.message}`);
+  }
+  break;
 
       case "back_to_menu":
         bot.editMessageText(
@@ -2207,7 +2451,7 @@ const initializeBot = () => {
         );
         break;
     }
-	console.log('###############', callbackData)
+
 	if (callbackData.startsWith('admin_assign_rate_confirm_')) {
 	  if (user.userType !== 'admin') {
 		bot.sendMessage(chatId, "❌ Admin access required!");
@@ -3457,7 +3701,8 @@ const initializeBot = () => {
 				ivr_outro_file: campaign.ivrOutroFile
 			  });
 			  
-			  startCallingProcess(unprocessedData, campaign);
+			  // FIX: Pass userId for billing context
+			  startCallingProcess(unprocessedData, campaign, userId);
 			  delete userStates[userId];
 			  break;
 
@@ -3561,7 +3806,7 @@ const initializeBot = () => {
 				  ivr_outro_file: campaignWithTrunk.ivrOutroFile
 				});
 				
-				startCallingProcess(unprocessedData2, campaignWithTrunk);
+				startCallingProcess(unprocessedData2, campaignWithTrunk, campaignWithTrunk?.createdBy);
 				
 			  } else {
 				const missingFields = [];

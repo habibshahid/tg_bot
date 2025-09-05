@@ -190,83 +190,165 @@ class BillingEngine {
 	}
 
   /**
-   * Process call billing after call completion
-   */
-  async processCallBilling(callDetailData) {
-    const transaction = await sequelize.transaction();
-    
-    try {
-      const {
+ * Process call billing after call completion - handles both billing and non-billing users
+ */
+async processCallBilling(callDetailData) {
+  const transaction = await sequelize.transaction();
+  
+  try {
+    const {
+      userId,
+      phoneNumber,
+      callDuration,
+      callStatus,
+      campaignId,
+      callId,
+      callStarted,
+      callAnswered,
+      callEnded,
+      hangupCause,
+      dtmfPressed,
+      sipTrunkId,
+      callerId
+    } = callDetailData;
+
+    // Get user
+    const user = await User.findByPk(userId, { transaction });
+    if (!user) {
+      await transaction.rollback();
+      throw new Error('User not found');
+    }
+
+    // If user has no rate card, create call detail without billing
+    if (!user.rateCardId) {
+      console.log(`[System] Creating call record without billing for user ${user.telegramId}`);
+      
+      const callDetail = await CallDetail.create({
         userId,
-        phoneNumber,
-        callDuration,
-        callStatus,
         campaignId,
         callId,
+        phoneNumber,
+        destinationId: null,
+        rateCardId: null,
         callStarted,
         callAnswered,
         callEnded,
-        hangupCause,
+        callDuration: callDuration || 0,
+        billableDuration: 0,
+        callStatus: callStatus || 'failed',
+        hangupCause: hangupCause || 'NO_RATE_CARD',
         dtmfPressed,
+        costPrice: 0,
+        sellPrice: 0,
+        totalCost: 0,
+        totalCharge: 0,
+        profit: 0,
         sipTrunkId,
-        callerId
-      } = callDetailData;
+        callerId,
+        processed: true // Mark as processed since no billing needed
+      }, { transaction });
 
-      // Get user and rate card
-      const user = await User.findByPk(userId);
-      if (!user || !user.rateCardId) {
-        throw new Error('User not found or no rate card assigned');
-      }
+      // Also update legacy calls table for backward compatibility
+      const Call = require('../models/call');
+      const legacyCall = await Call.findOne({
+        where: {
+          phoneNumber: phoneNumber,
+          campaignId: campaignId
+        },
+        transaction
+      });
 
-      // Find destination
-      const destination = await this.findDestination(phoneNumber);
-      if (!destination) {
-        // Create call detail without billing for unknown destinations
-        await CallDetail.create({
-          userId,
-          campaignId,
-          callId,
-          phoneNumber,
-          callStarted,
-          callAnswered,
-          callEnded,
-          callDuration: callDuration || 0,
-          billableDuration: 0,
-          callStatus: callStatus || 'failed',
-          hangupCause: hangupCause || 'DESTINATION_NOT_FOUND',
-          dtmfPressed,
-          sipTrunkId,
-          callerId,
-          totalCost: 0,
-          totalCharge: 0,
-          profit: 0,
-          processed: true
+      if (legacyCall) {
+        await legacyCall.update({
+          callStarted: callStarted,
+          callEnded: callEnded,
+          callStatus: callStatus === 'answered' ? 'success' : 'failed',
+          used: true
         }, { transaction });
-
-        await transaction.commit();
-        return { success: false, reason: 'Destination not found' };
       }
 
-      // Get rate
-      const rate = await this.getRate(user.rateCardId, destination.id);
-      if (!rate) {
-        throw new Error('No rate found for this destination');
+      await transaction.commit();
+      
+      return {
+        success: true,
+        callDetail,
+        charges: { totalCost: 0, totalCharge: 0, profit: 0 },
+        newBalance: parseFloat(user.balance),
+        billingEnabled: false,
+        message: 'Call recorded without billing - no rate card assigned'
+      };
+    }
+
+    // User has rate card - proceed with full billing
+    console.log(`[Billing] Processing billing for user ${user.telegramId} with rate card ${user.rateCardId}`);
+
+    // Find destination
+    const destination = await this.findDestination(phoneNumber);
+    if (!destination) {
+      console.warn(`[Billing] Destination not found for ${phoneNumber}`);
+      
+      // Create call detail without billing for unknown destinations
+      const callDetail = await CallDetail.create({
+        userId,
+        campaignId,
+        callId,
+        phoneNumber,
+        destinationId: null,
+        rateCardId: user.rateCardId,
+        callStarted,
+        callAnswered,
+        callEnded,
+        callDuration: callDuration || 0,
+        billableDuration: 0,
+        callStatus: callStatus || 'failed',
+        hangupCause: hangupCause || 'DESTINATION_NOT_FOUND',
+        dtmfPressed,
+        costPrice: 0,
+        sellPrice: 0,
+        totalCost: 0,
+        totalCharge: 0,
+        profit: 0,
+        sipTrunkId,
+        callerId,
+        processed: true
+      }, { transaction });
+
+      // Update legacy calls table
+      const Call = require('../models/call');
+      const legacyCall = await Call.findOne({
+        where: {
+          phoneNumber: phoneNumber,
+          campaignId: campaignId
+        },
+        transaction
+      });
+
+      if (legacyCall) {
+        await legacyCall.update({
+          callStarted: callStarted,
+          callEnded: callEnded,
+          callStatus: 'failed', // Unknown destination = failed
+          used: true
+        }, { transaction });
       }
 
-      // Calculate billing only for answered calls
-      let billableDuration = 0;
-      let charges = { totalCost: 0, totalCharge: 0, profit: 0 };
+      await transaction.commit();
+      return { 
+        success: false, 
+        reason: 'Destination not found',
+        callDetail,
+        charges: { totalCost: 0, totalCharge: 0, profit: 0 },
+        newBalance: parseFloat(user.balance),
+        billingEnabled: true
+      };
+    }
 
-      if (callStatus === 'answered' && callDuration > 0) {
-        billableDuration = this.calculateBillableDuration(
-          callDuration,
-          rate.minimumDuration,
-          rate.billingIncrement
-        );
-        charges = this.calculateCallCharges(rate, billableDuration);
-      }
-
-      // Create call detail record
+    // Get rate for the destination
+    const rate = await this.getRate(user.rateCardId, destination.id);
+    if (!rate) {
+      console.warn(`[Billing] No rate found for destination ${destination.countryName} (+${destination.prefix})`);
+      
+      // Create call detail without billing for destinations without rates
       const callDetail = await CallDetail.create({
         userId,
         campaignId,
@@ -278,63 +360,186 @@ class BillingEngine {
         callAnswered,
         callEnded,
         callDuration: callDuration || 0,
-        billableDuration,
+        billableDuration: 0,
         callStatus: callStatus || 'failed',
-        hangupCause,
+        hangupCause: hangupCause || 'NO_RATE_AVAILABLE',
         dtmfPressed,
-        costPrice: parseFloat(rate.costPrice),
-        sellPrice: parseFloat(rate.sellPrice),
-        totalCost: charges.totalCost,
-        totalCharge: charges.totalCharge,
-        profit: charges.profit,
+        costPrice: 0,
+        sellPrice: 0,
+        totalCost: 0,
+        totalCharge: 0,
+        profit: 0,
         sipTrunkId,
         callerId,
-        processed: false
+        processed: true
       }, { transaction });
 
-      // Process billing if there's a charge
-      if (charges.totalCharge > 0) {
-        const balanceBefore = parseFloat(user.balance);
-        const newBalance = balanceBefore - charges.totalCharge;
+      // Update legacy calls table
+      const Call = require('../models/call');
+      const legacyCall = await Call.findOne({
+        where: {
+          phoneNumber: phoneNumber,
+          campaignId: campaignId
+        },
+        transaction
+      });
 
-        // Update user balance
-        await user.update({ balance: newBalance }, { transaction });
-
-        // Create transaction record
-        await Transaction.create({
-          userId,
-          transactionType: 'debit',
-          amount: charges.totalCharge,
-          balanceBefore,
-          balanceAfter: newBalance,
-          description: `Call to ${phoneNumber} - ${Math.round(billableDuration/60)}min`,
-          reference: callId,
-          callDetailId: callDetail.id,
-          createdBy: 'system'
+      if (legacyCall) {
+        await legacyCall.update({
+          callStarted: callStarted,
+          callEnded: callEnded,
+          callStatus: 'failed', // No rate = failed
+          used: true
         }, { transaction });
-
-        // Mark call as processed
-        await callDetail.update({ processed: true }, { transaction });
-      } else {
-        // Mark as processed even if no charge (failed calls, etc.)
-        await callDetail.update({ processed: true }, { transaction });
       }
 
       await transaction.commit();
-
-      return {
-        success: true,
-        callDetail: callDetail.toJSON(),
-        charges,
-        newBalance: parseFloat(user.balance)
+      return { 
+        success: false, 
+        reason: 'No rate found for this destination',
+        callDetail,
+        charges: { totalCost: 0, totalCharge: 0, profit: 0 },
+        newBalance: parseFloat(user.balance),
+        billingEnabled: true
       };
-
-    } catch (error) {
-      await transaction.rollback();
-      console.error('Billing processing error:', error);
-      throw error;
     }
+
+    // Calculate billing only for answered calls with duration
+    let billableDuration = 0;
+    let charges = { totalCost: 0, totalCharge: 0, profit: 0 };
+
+    if (callStatus === 'answered' && callDuration > 0) {
+      billableDuration = this.calculateBillableDuration(
+        callDuration,
+        rate.minimumDuration || 60, // Default 60 seconds minimum
+        rate.billingIncrement || 60  // Default 60 seconds increment
+      );
+      charges = this.calculateCallCharges(rate, billableDuration);
+      console.log(`[Billing] Call answered - Duration: ${callDuration}s, Billable: ${billableDuration}s, Charge: $${charges.totalCharge.toFixed(4)}`);
+    } else {
+      console.log(`[Billing] Call not answered or no duration - Status: ${callStatus}, Duration: ${callDuration}s`);
+    }
+
+    // Create comprehensive call detail record
+    const callDetail = await CallDetail.create({
+      userId,
+      campaignId,
+      callId,
+      phoneNumber,
+      destinationId: destination.id,
+      rateCardId: user.rateCardId,
+      callStarted,
+      callAnswered,
+      callEnded,
+      callDuration: callDuration || 0,
+      billableDuration,
+      callStatus: callStatus || 'failed',
+      hangupCause: hangupCause || 'UNKNOWN',
+      dtmfPressed,
+      costPrice: parseFloat(rate.costPrice || 0),
+      sellPrice: parseFloat(rate.sellPrice || 0),
+      totalCost: charges.totalCost,
+      totalCharge: charges.totalCharge,
+      profit: charges.profit,
+      sipTrunkId,
+      callerId,
+      processed: false // Will be marked true after billing is processed
+    }, { transaction });
+
+    let newBalance = parseFloat(user.balance);
+
+    // Process billing if there's a charge (answered calls only)
+    if (charges.totalCharge > 0) {
+      const balanceBefore = parseFloat(user.balance);
+      newBalance = balanceBefore - charges.totalCharge;
+
+      // Check if user has sufficient balance (including credit limit)
+      const availableBalance = balanceBefore + parseFloat(user.creditLimit || 0);
+      if (availableBalance < charges.totalCharge) {
+        console.warn(`[Billing] Insufficient balance for user ${user.telegramId}: Required $${charges.totalCharge.toFixed(4)}, Available $${availableBalance.toFixed(2)}`);
+        
+        // Mark call as processed but don't charge
+        await callDetail.update({ 
+          processed: true,
+          hangupCause: hangupCause + '_INSUFFICIENT_BALANCE'
+        }, { transaction });
+
+        await transaction.commit();
+        return {
+          success: false,
+          reason: 'Insufficient balance',
+          callDetail,
+          charges,
+          newBalance: balanceBefore,
+          billingEnabled: true
+        };
+      }
+
+      // Update user balance
+      await user.update({ balance: newBalance }, { transaction });
+
+      // Create transaction record
+      const Transaction = require('../models/transaction').Transaction;
+      await Transaction.create({
+        userId,
+        transactionType: 'debit',
+        amount: charges.totalCharge,
+        balanceBefore,
+        balanceAfter: newBalance,
+        description: `Call to ${phoneNumber} - ${Math.round(billableDuration/60)}min (${destination.countryName})`,
+        reference: callId,
+        callDetailId: callDetail.id,
+        createdBy: 'system'
+      }, { transaction });
+
+      // Mark call as processed
+      await callDetail.update({ processed: true }, { transaction });
+
+      console.log(`[Billing] Successfully charged $${charges.totalCharge.toFixed(4)} - New balance: $${newBalance.toFixed(2)}`);
+    } else {
+      // No charge (failed call, no answer, etc.) but mark as processed
+      await callDetail.update({ processed: true }, { transaction });
+      console.log(`[Billing] No charge for ${callStatus} call`);
+    }
+
+    // Update legacy calls table for backward compatibility
+    const Call = require('../models/call');
+    const legacyCall = await Call.findOne({
+      where: {
+        phoneNumber: phoneNumber,
+        campaignId: campaignId
+      },
+      transaction
+    });
+
+    if (legacyCall) {
+      await legacyCall.update({
+        callStarted: callStarted,
+        callEnded: callEnded,
+        callStatus: callStatus === 'answered' ? 'success' : 'failed',
+        used: true
+      }, { transaction });
+    }
+
+    await transaction.commit();
+
+    return {
+      success: true,
+      callDetail,
+      charges,
+      newBalance,
+      billingEnabled: true,
+      message: charges.totalCharge > 0 ? 
+        `Call billed: $${charges.totalCharge.toFixed(4)} for ${Math.round(billableDuration/60)} minutes` :
+        `Call completed without charge (${callStatus})`
+    };
+
+  } catch (error) {
+    await transaction.rollback();
+    console.error('[Billing] Error processing call billing:', error);
+    throw error;
   }
+}
 
   /**
    * Add credit to user account

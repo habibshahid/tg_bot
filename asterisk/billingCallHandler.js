@@ -5,11 +5,27 @@ const { get_settings } = require("../utils/settings");
 const { ami } = require("./instance");
 const Campaign = require("../models/campaign");
 const User = require("../models/user");
-const { CallDetail } = require("../models/transaction");
-const billingEngine = require("../services/billingEngine");
+
+const {
+  add_entry_to_database,
+  add_other_entry_to_database,
+  call_started,
+  call_ended,
+  pop_unprocessed_line,
+} = require("../utils/entries");
+const pressedNumbers = new Set();
 
 // Store active calls for billing tracking
 const activeCalls = new Map();
+
+// Import billing engine with error handling
+let billingEngine;
+try {
+  billingEngine = require("../services/billingEngine");
+  console.log('[Billing] Billing engine loaded successfully');
+} catch (error) {
+  console.error('[Billing] Error loading billing engine:', error);
+}
 
 // Pre-call validation and billing check
 async function validateCallAndBalance(phoneNumber, settings) {
@@ -18,10 +34,33 @@ async function validateCallAndBalance(phoneNumber, settings) {
   }
 
   try {
-    // Estimate call cost (assuming 5 minute max call)
+    const user = await User.findByPk(settings.user_id);
+    if (!user) {
+      throw new Error('User not found');
+    }
+
+    // If user has no rate card, skip balance validation but allow call
+    if (!user.rateCardId) {
+      console.log(`[System] User ${user.telegramId} has no rate card - call will proceed without billing`);
+      return {
+        estimate: { sellPrice: 0, estimatedCost: 0 },
+        balanceCheck: { hasSufficientBalance: true, availableBalance: 0 },
+        canProceed: true,
+        billingEnabled: false
+      };
+    }
+
+    // User has rate card - do full validation
+    if (!billingEngine || typeof billingEngine.estimateCallCost !== 'function') {
+      throw new Error('Billing engine not available');
+    }
+    
     const estimate = await billingEngine.estimateCallCost(settings.user_id, phoneNumber, 5);
     
-    // Check if user has sufficient balance
+    if (!estimate.success) {
+      throw new Error(estimate.userFriendlyMessage || estimate.error);
+    }
+    
     const balanceCheck = await billingEngine.checkSufficientBalance(
       settings.user_id, 
       estimate.estimatedCost
@@ -37,7 +76,8 @@ async function validateCallAndBalance(phoneNumber, settings) {
     return {
       estimate,
       balanceCheck,
-      canProceed: true
+      canProceed: true,
+      billingEnabled: true
     };
     
   } catch (error) {
@@ -47,7 +87,7 @@ async function validateCallAndBalance(phoneNumber, settings) {
 }
 
 // Enhanced call initiation with billing
-module.exports = async (entry) => {
+async function makeBillingCall(entry) {
   if (!entry) {
     return;
   }
@@ -66,48 +106,28 @@ module.exports = async (entry) => {
     
     const actionId = `call-${number}-${Date.now()}`;
     const sipTrunk = settings.sip_trunk;
-    const trunkName = sipTrunk ? sipTrunk.name : 'main';
-    let callerId = settings.caller_id || number;
+    const trunkName = sipTrunk ? sipTrunk.name : 'test_trunk';
+    const callerId = settings.caller_id || '1234567890';
     const dialPrefix = settings.dial_prefix || '';
     const dialedNumber = dialPrefix + number;
     
-    // ANI rotation logic (existing code)
-    if (settings.campaign_id && callerId && callerId.length >= 4) {
-      const campaign = await Campaign.findByPk(settings.campaign_id);
-      if (campaign) {
-        await campaign.increment('callCounter');
-        await campaign.increment('totalCalls');
-        
-        if (campaign.callCounter % 100 === 0) {
-          const randomLast4 = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
-          callerId = callerId.substring(0, callerId.length - 4) + randomLast4;
-          console.log(`ANI Rotation: Original ${settings.caller_id} -> New ${callerId} (Call #${campaign.callCounter})`);
-        }
-      }
-    }
-
-    console.log(`[Billing] Making call to ${number}:`);
-    console.log(`  User ID: ${settings.user_id}`);
-    console.log(`  Estimated cost: $${validation.estimate.estimatedCost.toFixed(4)}`);
-    console.log(`  Available balance: $${validation.balanceCheck.availableBalance.toFixed(2)}`);
-    console.log(`  Destination: ${validation.estimate.destination.countryName}`);
-    console.log(`  Rate: $${validation.estimate.sellPrice.toFixed(6)}/min`);
+    console.log(`[Billing] Initiating call to ${number} (User: ${settings.user_id}, Billing: ${validation.billingEnabled})`);
     
-    // Store call start time and details for billing
+    // Store call info for billing tracking
     activeCalls.set(actionId, {
       callId: actionId,
       userId: settings.user_id,
-      campaignId: settings.campaign_id,
       phoneNumber: `+${number}`,
       callStarted: new Date(),
       callAnswered: null,
-      callEnded: null,
+      campaignId: settings.campaign_id,
       sipTrunkId: sipTrunk?.id,
       callerId: callerId,
-      estimatedCost: validation.estimate.estimatedCost,
-      ratePerMinute: validation.estimate.sellPrice
+      estimatedRate: validation.estimate.sellPrice || 0,
+      billingEnabled: validation.billingEnabled
     });
 
+    // Set variables for Asterisk
     const variables = {
       callId: actionId,
       TRUNK_NAME: trunkName,
@@ -116,7 +136,7 @@ module.exports = async (entry) => {
       DTMF_DIGIT: settings.dtmf_digit || '1',
       DESTINATION: number,
       USER_ID: settings.user_id,
-      BILLING_RATE: validation.estimate.sellPrice
+      BILLING_RATE: validation.estimate.sellPrice || 0
     };
 
     // Add IVR files if they exist
@@ -148,221 +168,318 @@ module.exports = async (entry) => {
           
           // Create failed call record
           try {
-            await billingEngine.processCallBilling({
-              userId: settings.user_id,
-              phoneNumber: `+${number}`,
-              callDuration: 0,
-              callStatus: 'failed',
-              campaignId: settings.campaign_id,
-              callId: actionId,
-              callStarted: new Date(),
-              callAnswered: null,
-              callEnded: new Date(),
-              hangupCause: err.message || 'ORIGINATE_FAILED',
-              sipTrunkId: sipTrunk?.id,
-              callerId: callerId
-            });
+            if (billingEngine && typeof billingEngine.processCallBilling === 'function') {
+              await billingEngine.processCallBilling({
+                userId: settings.user_id,
+                phoneNumber: `+${number}`,
+                callDuration: 0,
+                callStatus: 'failed',
+                campaignId: settings.campaign_id,
+                callId: actionId,
+                callStarted: new Date(),
+                callAnswered: null,
+                callEnded: new Date(),
+                hangupCause: err.message || 'ORIGINATE_FAILED',
+                sipTrunkId: sipTrunk?.id,
+                callerId: callerId
+              });
+            }
           } catch (billingError) {
-            console.error('Billing error for failed call:', billingError);
-          }
-          
-          // Update campaign failed calls counter
-          if (settings.campaign_id) {
-            Campaign.increment('failedCalls', { where: { id: settings.campaign_id } });
+            console.error('Error creating failed call record:', billingError);
           }
           
           const bot = get_bot();
-          bot.sendMessage(
-            settings?.notifications_chat_id,
-            `❌ *Call Failed*\n\n` +
-            `Number: ${number}\n` +
-            `Error: ${err.message}\n` +
-            `Trunk: ${trunkName}\n` +
-            `Estimated Cost: $${validation.estimate.estimatedCost.toFixed(4)}`,
-            { parse_mode: "Markdown" }
-          );
+          if (bot && settings?.notifications_chat_id) {
+            bot.sendMessage(
+              settings.notifications_chat_id,
+              `❌ *Call Failed*\n\n📞 ${number}\n❌ ${err.message}`,
+              { parse_mode: "Markdown" }
+            );
+          }
           
           // Continue with next call
           const { pop_unprocessed_line } = require("../utils/entries");
-          require("./call")(pop_unprocessed_line());
+          const nextLine = pop_unprocessed_line();
+          if (nextLine) {
+            makeBillingCall(nextLine);
+          }
         } else {
-          console.log("Originate Response:", res);
-          
-          const bot = get_bot();
-          bot.sendMessage(
-            settings?.notifications_chat_id,
-            `📞 *Call Initiated*\n\n` +
-            `Number: ${number}\n` +
-            `Destination: ${validation.estimate.destination.countryName}\n` +
-            `Rate: $${validation.estimate.sellPrice.toFixed(6)}/min\n` +
-            `Max Cost (5min): $${validation.estimate.estimatedCost.toFixed(4)}`,
-            { parse_mode: "Markdown" }
-          );
+          console.log(`[Billing] Originate Response: ${res.response} for ${number}`);
         }
       }
     );
 
   } catch (error) {
-    console.error('Call validation/billing error:', error);
-    
-    // Update failed calls counter
-    if (settings.campaign_id) {
-      Campaign.increment('failedCalls', { where: { id: settings.campaign_id } });
-    }
+    console.error(`[Billing] Call initiation failed for ${number}:`, error);
     
     const bot = get_bot();
-    bot.sendMessage(
-      settings?.notifications_chat_id,
-      `❌ *Call Blocked*\n\n` +
-      `Number: ${number}\n` +
-      `Reason: ${error.message}`,
-      { parse_mode: "Markdown" }
-    );
+    if (bot && settings?.notifications_chat_id) {
+      bot.sendMessage(
+        settings.notifications_chat_id,
+        `❌ *Call Failed*\n\n📞 ${number}\nReason: ${error.message}`,
+        { parse_mode: "Markdown" }
+      );
+    }
     
     // Continue with next call
     const { pop_unprocessed_line } = require("../utils/entries");
-    require("./call")(pop_unprocessed_line());
+    const nextLine = pop_unprocessed_line();
+    if (nextLine) {
+      makeBillingCall(nextLine);
+    }
   }
-};
+}
+
+// Track if event handlers are already set up to prevent duplicates
+let eventHandlersSetup = false;
 
 // Enhanced AMI event handlers for billing
 function setupBillingEventHandlers() {
-  const { ami } = require("./instance");
-  const { get_settings } = require("../utils/settings");
+  if (eventHandlersSetup) {
+    console.log('[Billing] Event handlers already set up, skipping');
+    return;
+  }
+  
+  console.log('[Billing] Setting up billing event handlers');
+  eventHandlersSetup = true;
   
   ami.on("managerevent", async (data) => {
     const settings = get_settings();
     
-    // Handle call answered
-    if (data?.event === 'OriginateResponse' && data.response === 'Success') {
+	  const dtmfDigit = settings.dtmf_digit || '1';
+	  
+	  // ONLY handle DTMF events - billing handler will handle all call events
+	  if (data?.event == "DTMFEnd") {
+		if (!pressedNumbers.has(data?.exten)) {
+		  console.log(`+${data?.exten} has pressed ${data?.digit}`);
+		  pressedNumbers.add(data?.exten);
+		  
+		  if(data?.digit == dtmfDigit){
+			add_entry_to_database(data?.exten, data?.digit);
+		  }
+		  else{
+			add_other_entry_to_database(data?.exten, data?.digit);
+		  }
+		  
+		  let activeCall = null;
+			let callId = null;
+			
+			// Find active call by phone number
+			for (const [id, call] of activeCalls.entries()) {
+			  // Remove the + from stored phone number for comparison
+			  const storedNumber = call.phoneNumber.replace(/^\+/, '');
+			  if (storedNumber === data?.exten) {
+				activeCall = call;
+				callId = id;
+				console.log(`[Billing Debug] Found matching active call: ${callId}`);
+				break;
+			  }
+			}
+			
+			if (activeCall && callId) {
+				activeCall.dtmfPressed = data?.digit || '';
+			}
+		  // Update DTMF responses counter
+		  if (settings.campaign_id) {
+			Campaign.increment('dtmfResponses', { where: { id: settings.campaign_id } });
+		  }
+		} else {
+		  console.log(`+${data?.exten} has already pressed ${dtmfDigit}, ignoring duplicate`);
+		}
+	  }
+	  
+    // Add debug logging with action filtering
+    if (data?.actionid && data.actionid.startsWith('call-')) {
+      console.log(`[Billing Debug] Event: ${data.event}, ActionID: ${data.actionid}, Response: ${data.response || 'N/A'}`);
+    }
+    
+    // Handle call originate response - ONLY for billing calls
+    if (data?.event === 'OriginateResponse' && data.actionid && data.actionid.startsWith('call-')) {
       const callId = data.actionid;
       const activeCall = activeCalls.get(callId);
       
       if (activeCall) {
-        activeCall.callAnswered = new Date();
-        console.log(`[Billing] Call answered: ${callId}`);
-        
-        // Update campaign successful calls counter
-        if (settings.campaign_id) {
-          Campaign.increment('successfulCalls', { where: { id: settings.campaign_id } });
+        if (data.response === 'Success') {
+          console.log(`[Billing] Call originated successfully: ${activeCall.phoneNumber}`);
+		  activeCall.callAnswered = new Date();
+		  if (settings.campaign_id) {
+			  Campaign.increment('successfulCalls', { where: { id: settings.campaign_id } });
+			  Campaign.increment('totalCalls', { where: { id: settings.campaign_id } });
+			  console.log(`[Billing] Updated campaign ${settings.campaign_id} - successful calls incremented`);
+			}
+        } else {
+          console.log(`[Billing] Call failed to originate: ${activeCall.phoneNumber}, Reason: ${data.reason}`);
+          activeCalls.delete(callId);
+          if (settings.campaign_id) {
+			
+			  Campaign.increment('failedCalls', { where: { id: settings.campaign_id } });
+			  Campaign.increment('totalCalls', { where: { id: settings.campaign_id } });
+			  console.log(`[Billing] Updated campaign ${settings.campaign_id} - failed calls incremented`);
+			
+			// Note: successful calls already incremented when call was answered
+		  }
+          // Process as failed call
+          try {
+            if (billingEngine && typeof billingEngine.processCallBilling === 'function') {
+              await billingEngine.processCallBilling({
+                userId: activeCall.userId,
+                phoneNumber: activeCall.phoneNumber,
+                callDuration: 0,
+                callStatus: 'failed',
+                campaignId: activeCall.campaignId,
+                callId: callId,
+                callStarted: activeCall.callStarted,
+                callAnswered: null,
+                callEnded: new Date(),
+                hangupCause: data.reason || 'ORIGINATE_FAILED',
+                sipTrunkId: activeCall.sipTrunkId,
+                callerId: activeCall.callerId,
+				dtmfPressed: (activeCall.dtmfPressed) ? activeCall.dtmfPressed : ''
+              });
+            }
+          } catch (error) {
+            console.error('Error processing failed call billing:', error);
+          }
+          
+          // Continue with next call
+          const { pop_unprocessed_line } = require("../utils/entries");
+          const nextLine = pop_unprocessed_line();
+          if (nextLine) {
+            makeBillingCall(nextLine);
+          }
         }
       }
     }
     
-    // Handle call hangup
+    // Handle call answer detection using Newstate event
+    if (data?.event === 'Newstate' && data.channelstate === '6') {
+	  // Channel state 6 = Up (answered)
+	  const phoneNumber = data.exten; // Use exten field instead of parsing channel
+	  if (phoneNumber) {
+		console.log(`[Billing Debug] Call answered for extension: ${phoneNumber}`);
+		
+		for (const [callId, activeCall] of activeCalls.entries()) {
+		  // Remove the + from stored phone number for comparison
+		  const storedNumber = activeCall.phoneNumber.replace(/^\+/, '');
+		  if (storedNumber === phoneNumber && !activeCall.callAnswered) {
+			activeCall.callAnswered = new Date();
+			console.log(`[Billing] Call answered: ${activeCall.phoneNumber} at ${activeCall.callAnswered.toISOString()}`);
+			
+			// Update campaign successful calls counter
+			if (settings.campaign_id) {
+			  Campaign.increment('successfulCalls', { where: { id: settings.campaign_id } });
+			}
+			break;
+		  }
+		}
+	  }
+	}
+    
+    // Handle call hangup with proper billing - ONLY for billing calls
     if (data?.event === "Hangup") {
-      const callId = data.actionid || `call-${data.exten}-*`; // Try to match by pattern
-      
-      // Find active call by phone number if actionid not available
-      let activeCall = null;
-      if (callId.includes('*')) {
-        for (const [id, call] of activeCalls.entries()) {
-          if (call.phoneNumber.includes(data.exten)) {
-            activeCall = call;
-            activeCalls.delete(id);
-            break;
-          }
-        }
-      } else {
-        activeCall = activeCalls.get(callId);
-        activeCalls.delete(callId);
-      }
-      
-      if (activeCall) {
-        const callEndTime = new Date();
-        const callDuration = activeCall.callAnswered ? 
-          Math.floor((callEndTime - activeCall.callAnswered) / 1000) : 0;
-        
-        console.log(`[Billing] Call ended: ${activeCall.phoneNumber}, Duration: ${callDuration}s`);
-        
-        // Process billing
-        try {
-          const billingData = {
-            userId: activeCall.userId,
-            phoneNumber: activeCall.phoneNumber,
-            callDuration: callDuration,
-            callStatus: activeCall.callAnswered ? 'answered' : 'no_answer',
-            campaignId: activeCall.campaignId,
-            callId: activeCall.callId,
-            callStarted: activeCall.callStarted,
-            callAnswered: activeCall.callAnswered,
-            callEnded: callEndTime,
-            hangupCause: data["cause-txt"] || 'NORMAL_CLEARING',
-            sipTrunkId: activeCall.sipTrunkId,
-            callerId: activeCall.callerId
-          };
-          
-          const billingResult = await billingEngine.processCallBilling(billingData);
-          
-          if (billingResult.success && billingResult.charges.totalCharge > 0) {
-            const bot = get_bot();
-            bot.sendMessage(
-              settings?.notifications_chat_id,
-              `💰 *Call Completed & Billed*\n\n` +
-              `Number: ${activeCall.phoneNumber}\n` +
-              `Duration: ${Math.round(billingResult.callDetail.billableDuration/60)} minutes\n` +
-              `Cost: $${billingResult.charges.totalCharge.toFixed(4)}\n` +
-              `New Balance: $${billingResult.newBalance.toFixed(2)}`,
-              { parse_mode: "Markdown" }
-            );
-          }
-          
-        } catch (billingError) {
-          console.error('Billing processing error:', billingError);
-          
-          const bot = get_bot();
-          bot.sendMessage(
-            settings?.notifications_chat_id,
-            `⚠️ *Billing Error*\n\n` +
-            `Call to ${activeCall.phoneNumber} completed but billing failed.\n` +
-            `Error: ${billingError.message}`,
-            { parse_mode: "Markdown" }
-          );
-        }
-        
-        // Continue with next call
-        const { pop_unprocessed_line } = require("../utils/entries");
-        require("../asterisk/call")(pop_unprocessed_line());
-      }
-    }
-    
-    // Handle DTMF events (existing logic with user context)
-    if (data?.event == "DTMFEnd") {
-      const settings = get_settings();
-      const dtmfDigit = settings.dtmf_digit || '1';
-      
-      if (data?.digit == dtmfDigit) {
-        // Update campaign DTMF responses counter
-        if (settings.campaign_id) {
-          Campaign.increment('dtmfResponses', { where: { id: settings.campaign_id } });
-        }
-        
-        // Add DTMF response to call detail if exists
-        try {
-          const callDetail = await CallDetail.findOne({
-            where: {
-              phoneNumber: `+${data?.exten}`,
-              userId: settings.user_id,
-              processed: false
-            },
-            order: [['createdAt', 'DESC']]
-          });
-          
-          if (callDetail) {
-            await callDetail.update({ dtmfPressed: data?.digit });
-          }
-        } catch (error) {
-          console.error('Error updating DTMF in call detail:', error);
-        }
-        
-        const bot = get_bot();
-        bot.sendMessage(
-          settings.notifications_chat_id,
-          `✅ *DTMF Response*\n\n${data?.exten} pressed ${dtmfDigit}`,
-          { parse_mode: "Markdown" }
-        );
-      }
-    }
+	  // The phone number is in data.exten, not in the channel name
+	  const phoneNumber = data.exten;
+	  
+	  if (phoneNumber) {
+		console.log(`[Billing Debug] Hangup detected for extension: ${phoneNumber}, Channel: ${data.channel}`);
+		
+		let activeCall = null;
+		let callId = null;
+		
+		// Find active call by phone number
+		for (const [id, call] of activeCalls.entries()) {
+		  // Remove the + from stored phone number for comparison
+		  const storedNumber = call.phoneNumber.replace(/^\+/, '');
+		  if (storedNumber === phoneNumber) {
+			activeCall = call;
+			callId = id;
+			console.log(`[Billing Debug] Found matching active call: ${callId}`);
+			break;
+		  }
+		}
+		
+		if (activeCall && callId) {
+		  activeCalls.delete(callId);
+		  
+		  const callEndTime = new Date();
+		  const callDuration = activeCall.callAnswered ? 
+			Math.floor((callEndTime - activeCall.callAnswered) / 1000) : 0;
+		  
+		  const callStatus = activeCall.callAnswered ? 'answered' : 'no_answer';
+		  
+		  console.log(`[Billing] Call ended: ${activeCall.phoneNumber}, Status: ${callStatus}, Duration: ${callDuration}s, Hangup: ${data["cause-txt"]}`);
+		  
+		  // Process billing
+		  try {
+			if (billingEngine && typeof billingEngine.processCallBilling === 'function') {
+			  const billingData = {
+				userId: activeCall.userId,
+				phoneNumber: activeCall.phoneNumber,
+				callDuration: callDuration,
+				callStatus: callStatus,
+				campaignId: activeCall.campaignId,
+				callId: callId,
+				callStarted: activeCall.callStarted,
+				callAnswered: activeCall.callAnswered,
+				callEnded: callEndTime,
+				hangupCause: data["cause-txt"] || 'NORMAL_CLEARING',
+				sipTrunkId: activeCall.sipTrunkId,
+				callerId: activeCall.callerId,
+				dtmfPressed: (activeCall.dtmfPressed) ? activeCall.dtmfPressed : ''
+			  };
+			  
+			  console.log(`[Billing Debug] Processing billing for call: ${JSON.stringify({
+				phoneNumber: activeCall.phoneNumber,
+				duration: callDuration,
+				status: callStatus,
+				answered: activeCall.callAnswered
+			  })}`);
+			  
+			  const billingResult = await billingEngine.processCallBilling(billingData);
+			  
+			  if (billingResult.success) {
+				if (billingResult.charges.totalCharge > 0) {
+				  const bot = get_bot();
+				  if (bot && settings?.notifications_chat_id) {
+					bot.sendMessage(
+					  settings.notifications_chat_id,
+					  `💰 *Call Billed*\n\n` +
+					  `📞 ${activeCall.phoneNumber}\n` +
+					  `⏱️ ${Math.round(billingResult.callDetail.billableDuration/60)} min\n` +
+					  `💵 $${billingResult.charges.totalCharge.toFixed(4)}\n` +
+					  `💳 Balance: $${billingResult.newBalance.toFixed(2)}`,
+					  { parse_mode: "Markdown" }
+					);
+				  }
+				  console.log(`[Billing] SUCCESS: Charged $${billingResult.charges.totalCharge.toFixed(4)} for ${Math.round(billingResult.callDetail.billableDuration/60)} minutes`);
+				} else {
+				  console.log(`[Billing] No charge for ${callStatus} call to ${activeCall.phoneNumber}`);
+				}
+			  } else {
+				console.warn(`[Billing] Billing processing failed: ${billingResult.reason || 'Unknown error'}`);
+			  }
+			} else {
+			  console.error('Cannot process billing - billingEngine not available');
+			}
+			
+		  } catch (billingError) {
+			console.error('[Billing] Error processing call billing:', billingError);
+		  }
+		  
+		  // Continue with next call
+		  const { pop_unprocessed_line } = require("../utils/entries");
+		  const nextLine = pop_unprocessed_line();
+		  if (nextLine) {
+			makeBillingCall(nextLine);
+		  }
+		} else {
+		  console.log(`[Billing Debug] No active call found for hangup extension: ${phoneNumber}`);
+		  console.log(`[Billing Debug] Current active calls:`, Array.from(activeCalls.keys()));
+		}
+	  } else {
+		console.log(`[Billing Debug] Hangup event has no extension field`);
+	  }
+	}
   });
 }
 
@@ -376,8 +493,8 @@ function clearActiveCalls() {
   activeCalls.clear();
 }
 
-module.exports = {
-  setupBillingEventHandlers,
-  getActiveCalls,
-  clearActiveCalls
-};
+// Export the main function and utility functions
+module.exports = makeBillingCall;
+module.exports.setupBillingEventHandlers = setupBillingEventHandlers;
+module.exports.getActiveCalls = getActiveCalls;
+module.exports.clearActiveCalls = clearActiveCalls;

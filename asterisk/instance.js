@@ -34,67 +34,9 @@ ami.on("clear_pressed_numbers", () => {
 });
 
 ami.on("managerevent", async (data) => {
-  const settings = get_settings();
-  const dtmfDigit = settings.dtmf_digit || '1';
   
-  if (data?.event == "DTMFEnd") {
-    if (!pressedNumbers.has(data?.exten)) {
-      console.log(`+${data?.exten} has pressed ${dtmfDigit}`);
-		
-      pressedNumbers.add(data?.exten);
-      
-	  if(data?.digit == dtmfDigit){
-		add_entry_to_database(data?.exten, data?.digit);
-	  }
-	  else{
-	    add_other_entry_to_database(data?.exten, data?.digit);
-	  }
-      
-      // Update DTMF responses counter
-      if (settings.campaign_id) {
-        Campaign.increment('dtmfResponses', { where: { id: settings.campaign_id } });
-      }
-    } else {
-      console.log(`+${data?.exten} has already pressed ${dtmfDigit}, ignoring duplicate`);
-    }
-  }
   
-  if(data?.event === 'OriginateResponse'){
-	//console.log('OriginateResponse', data)
-    if(data.response == 'Success'){
-      const phoneNumber = data.exten == '' ? data.calleridnum : data.exten;
-      console.log(`Call answered on channel: ${data?.channel} ${phoneNumber}`);
-      call_started(phoneNumber);
-      
-      // Update successful calls counter
-      if (settings.campaign_id) {
-        Campaign.increment('successfulCalls', { where: { id: settings.campaign_id } });
-      }
-    }
-    else{
-      console.log(
-        `Call to ${data?.exten} with +${data?.calleridnum} has ended with failed with reason ${data?.reason}`
-      );
-      call_ended(data?.exten, 'Failure');
-      // Update failed calls counter
-      if (settings.campaign_id) {
-        Campaign.increment('failedCalls', { where: { id: settings.campaign_id } });
-      }
-      
-      require("./call")(pop_unprocessed_line());
-    }
-  }
-
-  if (data?.event === "Hangup") {
-	//console.log('Hangup', data)
-    if(data?.exten){
-		call_ended(data?.exten, 'Success');
-		console.log(
-		  `Call to ${data?.exten} from +${data?.calleridnum} has ended with reason ${data["cause-txt"]}`
-		);
-		require("./call")(pop_unprocessed_line());
-	}
-  }
+  // Remove all OriginateResponse and Hangup handling - billing handler will manage these
 });
 
 function waitForConnection() {
