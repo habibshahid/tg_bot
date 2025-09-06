@@ -1,5 +1,7 @@
-// models/associations.js - Define all model associations here
+// models/associations.js - ENHANCED VERSION with User-SipPeer associations
 const User = require('./user');
+const SipPeer = require('./sippeer');
+const Campaign = require('./campaign');
 const { Provider, RateCard, Destination, Rate } = require('./provider');
 const { Transaction, CallDetail } = require('./transaction');
 
@@ -12,6 +14,17 @@ User.belongsTo(RateCard, {
 RateCard.hasMany(User, {
   foreignKey: 'rateCardId',
   as: 'users'
+});
+
+// NEW: User <-> SipPeer associations for approval workflow
+User.belongsTo(SipPeer, {
+  foreignKey: 'sipTrunkId',
+  as: 'sipTrunk'
+});
+
+User.belongsTo(SipPeer, {
+  foreignKey: 'callbackTrunkId',
+  as: 'callbackTrunk'
 });
 
 // User <-> Transaction associations
@@ -91,5 +104,7 @@ CallDetail.hasOne(Transaction, {
   foreignKey: 'callDetailId',
   as: 'transaction'
 });
+
+// Campaign <-> SipPeer associations are already defined in campaign.js - DON'T DUPLICATE THEM HERE
 
 console.log('✅ Model associations defined successfully');

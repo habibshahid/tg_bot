@@ -49,6 +49,67 @@ const User = sequelize.define('User', {
     allowNull: true,
     field: 'rate_card_id'
   },
+  // NEW APPROVAL WORKFLOW FIELDS
+  sipTrunkId: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+    field: 'sip_trunk_id'
+  },
+  callbackTrunkId: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+    field: 'callback_trunk_id'
+  },
+  callerId: {
+    type: DataTypes.STRING(50),
+    allowNull: true,
+    field: 'caller_id'
+  },
+  dialPrefix: {
+    type: DataTypes.STRING(20),
+    allowNull: true,
+    field: 'dial_prefix'
+  },
+  destinationRoute: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+    field: 'destination_route'
+  },
+  concurrentCalls: {
+    type: DataTypes.INTEGER,
+    defaultValue: 30,
+    field: 'concurrent_calls'
+  },
+  approvalStatus: {
+    type: DataTypes.ENUM('pending', 'approved', 'rejected'),
+    defaultValue: 'pending',
+    field: 'approval_status'
+  },
+  approvalDate: {
+    type: DataTypes.DATE,
+    allowNull: true,
+    field: 'approval_date'
+  },
+  approvedBy: {
+    type: DataTypes.STRING(50),
+    allowNull: true,
+    field: 'approved_by'
+  },
+  campaignSettingsComplete: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: false,
+    field: 'campaign_settings_complete'
+  },
+  approvalNotes: {
+    type: DataTypes.TEXT,
+    allowNull: true,
+    field: 'approval_notes'
+  },
+  requestedAt: {
+    type: DataTypes.DATE,
+    defaultValue: DataTypes.NOW,
+    field: 'requested_at'
+  },
   status: {
     type: DataTypes.ENUM('active', 'suspended', 'inactive'),
     defaultValue: 'active'
@@ -89,10 +150,55 @@ const User = sequelize.define('User', {
 }, {
   tableName: 'users',
   timestamps: true,
-  underscored: true
+  underscored: true,
+  hooks: {
+    beforeCreate: (user, options) => {
+      // Set campaign settings complete if all required fields are present
+      user.campaignSettingsComplete = !!(
+        user.sipTrunkId && 
+        user.callerId && 
+        user.concurrentCalls
+      );
+    },
+    beforeUpdate: (user, options) => {
+      // Update campaign settings complete status
+      if (user.changed('sipTrunkId') || user.changed('callerId') || user.changed('concurrentCalls')) {
+        user.campaignSettingsComplete = !!(
+          user.sipTrunkId && 
+          user.callerId && 
+          user.concurrentCalls
+        );
+      }
+    }
+  }
 });
 
-// IMPORTANT: Do NOT define associations here!
-// Associations should be defined in a separate file or after all models are loaded
+// Instance methods for approval workflow
+User.prototype.isApproved = function() {
+  return this.approvalStatus === 'approved';
+};
 
+User.prototype.isPending = function() {
+  return this.approvalStatus === 'pending';
+};
+
+User.prototype.isRejected = function() {
+  return this.approvalStatus === 'rejected';
+};
+
+User.prototype.hasCompleteCampaignSettings = function() {
+  return !!(this.sipTrunkId && this.callerId && this.concurrentCalls);
+};
+
+User.prototype.canCreateCampaign = function() {
+  return this.isApproved() && this.hasCompleteCampaignSettings();
+};
+
+// Static methods
+User.getPendingApprovals = function() {
+  return this.findAll({
+    where: { approvalStatus: 'pending' },
+    order: [['requestedAt', 'ASC']]
+  });
+};
 module.exports = User;

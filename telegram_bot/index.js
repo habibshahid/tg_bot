@@ -21,6 +21,7 @@ const sequelize = require("../config/database");
 const User = require("../models/user");
 const { Provider, RateCard, Destination, Rate } = require("../models/provider");
 const { Transaction, CallDetail } = require("../models/transaction");
+const { handleApprovalCallbacks, handleApprovalTextMessages } = require('./approvalHandlers');
 
 require("../models/associations");
 
@@ -658,12 +659,23 @@ async function validateSipTrunk(trunkId) {
 }
 
 // Enhanced menu function based on user type and billing status
+// Enhanced menu function based on user type and APPROVAL STATUS
 function getUserMenu(user) {
   const isAdmin = user.userType === 'admin';
   const hasBilling = user.rateCardId ? true : false;
+  // *** CRITICAL: NO MENU FOR NON-APPROVED USERS ***
+  if (!isAdmin) {
+    // Check approval status - NO MENU if not fully approved and configured
+    if (user.approvalStatus !== 'approved' || !user.campaignSettingsComplete) {
+      return {
+        reply_markup: {
+          inline_keyboard: [] // EMPTY MENU - NO BUTTONS
+        }
+      };
+    }
+  }
   
   let userButtons = [];
-  
   if (hasBilling) {
     // User with billing enabled
     userButtons = [
@@ -685,7 +697,7 @@ function getUserMenu(user) {
       ]
     ];
   } else {
-    // Legacy user or user without billing
+    // Approved legacy user or user without billing
     userButtons = [
       [
         { text: "🚀 Start Campaign", callback_data: "start_campaign" },
@@ -717,14 +729,14 @@ function getUserMenu(user) {
   const adminButtons = [
     [
       { text: "👥 Manage Users", callback_data: "admin_users" },
-      { text: "💳 Manage Rates", callback_data: "admin_rates" }
+      { text: "⏳ Pending Approvals", callback_data: "admin_pending_approvals" }
     ],
     [
-      { text: "💰 Add Credit", callback_data: "admin_add_credit" },
-      { text: "📊 System Stats", callback_data: "admin_system_stats" }
+      { text: "💳 Manage Rates", callback_data: "admin_rates" },
+      { text: "💰 Add Credit", callback_data: "admin_add_credit" }
     ],
     [
-      { text: "🏗️ Create Rate Card", callback_data: "admin_create_rate" },
+      { text: "📊 System Stats", callback_data: "admin_system_stats" },
       { text: "👤 Permit User", callback_data: "permit_user" }
     ]
   ];
@@ -980,22 +992,27 @@ const initializeBot = () => {
     
     const isAdmin = user.userType === 'admin';
     const hasBilling = user.rateCardId ? true : false;
-    
+    const configCompleted = user.campaignSettingsComplete;
+	
     let welcomeMessage = `🤖 *Welcome back`;
     if (isAdmin) {
-      welcomeMessage += `, Administrator!*\n\n${escapeMarkdown(user.firstName || 'Admin')}, you have full system access.`;
+      welcomeMessage += `, Administrator!*\n\n${escapeMarkdown(user.firstName || 'Admin')}, you have full system access.`  + "\n\nSelect an option from the menu below:";
     } else {
-      welcomeMessage += `, ${escapeMarkdown(user.firstName || user.username || 'User')}!*`;
-      if (hasBilling) {
-        welcomeMessage += `\n\n💰 Balance: $${user.balance}\n📊 Rate Card: ${user.rateCardId ? 'Assigned' : 'Not Assigned'}`;
-      } else {
-        welcomeMessage += `\n\nUsing legacy mode - contact admin for billing features.`;
+      welcomeMessage += `, ${escapeMarkdown(user.firstName || user.username || 'User')}!*`  + "\n\nSelect an option from the menu below:" ;
+      if (hasBilling && configCompleted) {
+        welcomeMessage += `\n\n💰 Balance: $${user.balance}\n📊 Rate Card: ${user.rateCardId ? 'Assigned' : 'Not Assigned'}`  + "\n\nSelect an option from the menu below:";
+      } 
+	  else if (hasBilling && configCompleted) {
+		welcomeMessage += `\n\n💰 Balance: $${user.balance}\n📊 Rate Card: ${user.rateCardId ? 'Assigned' : 'Not Assigned'}`  + "\n\nCampaign config is not complete. Contact Administrator";  
+	  }
+	  else {
+        welcomeMessage += `\n\nState not approved or billing not set. Contact admin for billing features.` ;
       }
     }
     
     bot.sendMessage(
       chatId, 
-      welcomeMessage + "\n\nSelect an option from the menu below:",
+      welcomeMessage,
       { 
         ...getUserMenu(user),
         parse_mode: "Markdown"
@@ -1012,6 +1029,9 @@ const initializeBot = () => {
     bot.answerCallbackQuery(query.id);
 
     const user = await checkUserAccess(userId, chatId);
+	const approvalHandled = await handleApprovalCallbacks(bot, query, user, chatId, callbackData, userStates, userId);
+	if (approvalHandled) return;
+
     if (!user) {
       bot.sendMessage(chatId, "❌ Access denied!");
       return;
@@ -1772,72 +1792,143 @@ const initializeBot = () => {
         break;
         
       case "start_campaign":
-        const campaign = await getOrCreateCampaign(userId);
-        
-        // Check if user has billing and validate balance
-        if (user.rateCardId) {
-          try {
-            const balanceCheck = await billingEngine.checkSufficientBalance(user.id, 1.0);
-            if (!balanceCheck.hasSufficientBalance) {
-              bot.sendMessage(
-                chatId,
-                `⚠️ *Insufficient Balance*\n\n` +
-                `Current Balance: $${balanceCheck.currentBalance.toFixed(2)}\n` +
-                `Available: $${balanceCheck.availableBalance.toFixed(2)}\n\n` +
-                `Please contact administrator to add credit.`,
-                { parse_mode: "Markdown" }
-              );
-              return;
-            }
-          } catch (error) {
-            console.error('Balance check error:', error);
-          }
-        }
-        
-        // Validate all required fields
-        const missingFields = [];
-        if (!campaign.sipTrunkId) missingFields.push("SIP Trunk");
-        if (!campaign.callerId) missingFields.push("Caller ID");
-        
-        if (missingFields.length > 0) {
-          bot.sendMessage(
-            chatId, 
-            `⚠️ *Cannot Start Campaign*\n\nThe following required fields are not configured:\n${missingFields.map(f => `• ${f}`).join('\n')}\n\nPlease configure all required fields before starting the campaign.`,
-            { parse_mode: "Markdown", ...getUserMenu(user) }
-          );
-          return;
-        }
+		  // Check if user can create campaigns
+		  if (!user.canCreateCampaign()) {
+			bot.sendMessage(chatId, 
+			  "❌ *Cannot Start Campaign*\n\n" +
+			  "Your account setup is incomplete. Please contact the administrator to complete your configuration.\n\n" +
+			  `Status: ${user.approvalStatus}\n` +
+			  `Settings Complete: ${user.campaignSettingsComplete ? 'Yes' : 'No'}`,
+			  { parse_mode: 'Markdown' }
+			);
+			return;
+		  }
 
-        const trunkValidation = await validateSipTrunk(campaign.sipTrunkId);
-        if (!trunkValidation.valid) {
-          bot.sendMessage(
-            chatId,
-            `⚠️ SIP Trunk Error: ${trunkValidation.message}\n\nPlease reconfigure your SIP trunk.`,
-            { parse_mode: "Markdown" }
-          );
-          return;
-        }
+		  // Get or create campaign with user's settings
+		  let campaign = await Campaign.findOne({
+			where: { createdBy: user.telegramId },
+			include: [
+			  { model: SipPeer, as: 'sipTrunk' },
+			  { model: SipPeer, as: 'callbackTrunk' }
+			]
+		  });
 
-        let campaignMessage = `📤 *Start Campaign*\n\n` +
-          `Campaign: ${escapeMarkdown(campaign.campaignName)}\n` +
-          `SIP Trunk: ${escapeMarkdown(trunkValidation.trunk.name)}\n` +
-          `Caller ID: ${escapeMarkdown(campaign.callerId)}\n` +
-          `Dial Prefix: ${campaign.dialPrefix || 'None'}\n` +
-          `Concurrent Calls: ${campaign.concurrentCalls}\n`;
-          
-        if (user.rateCardId) {
-          campaignMessage += `💰 Available Balance: $${user.balance}\n`;
-        }
-        
-        campaignMessage += `\nPlease upload your leads file (TXT format) containing phone numbers.`;
+		  if (campaign) {
+			// Update existing campaign with user's current settings
+			await campaign.update({
+			  sipTrunkId: user.sipTrunkId,
+			  callbackTrunkId: user.callbackTrunkId,
+			  callerId: user.callerId,
+			  dialPrefix: user.dialPrefix,
+			  concurrentCalls: user.concurrentCalls,
+			  notificationsChatId: chatId
+			});
+			
+			// Reload with associations
+			campaign = await Campaign.findByPk(campaign.id, {
+			  include: [
+				{ model: SipPeer, as: 'sipTrunk' },
+				{ model: SipPeer, as: 'callbackTrunk' }
+			  ]
+			});
+		  } else {
+			// Create new campaign with user's settings
+			campaign = await Campaign.create({
+			  botToken: config.telegram_bot_token,
+			  campaignName: `${user.firstName || user.username || 'User'}'s Campaign`,
+			  createdBy: user.telegramId,
+			  sipTrunkId: user.sipTrunkId,
+			  callbackTrunkId: user.callbackTrunkId,
+			  callerId: user.callerId,
+			  dialPrefix: user.dialPrefix,
+			  concurrentCalls: user.concurrentCalls,
+			  notificationsChatId: chatId,
+			  isActive: true
+			});
+			
+			// Reload with associations
+			campaign = await Campaign.findByPk(campaign.id, {
+			  include: [
+				{ model: SipPeer, as: 'sipTrunk' },
+				{ model: SipPeer, as: 'callbackTrunk' }
+			  ]
+			});
+		  }
 
-        bot.sendMessage(
-          chatId,
-          campaignMessage,
-          { parse_mode: "Markdown" }
-        );
-        userStates[userId] = { action: "waiting_campaign_file", campaignId: campaign.id };
-        break;
+		  // Check if campaign has numbers
+		  const callCount = await Call.count({
+			where: { 
+			  campaignId: campaign.id,
+			  used: false 
+			}
+		  });
+
+		  if (callCount === 0) {
+			bot.sendMessage(
+			  chatId,
+			  `📋 *Campaign Ready*\n\n` +
+			  `Campaign: ${escapeMarkdown(campaign.campaignName)}\n` +
+			  `SIP Trunk: ${escapeMarkdown(campaign.sipTrunk ? campaign.sipTrunk.name : 'N/A')}\n` +
+			  `Caller ID: ${escapeMarkdown(campaign.callerId)}\n` +
+			  `Concurrent Calls: ${campaign.concurrentCalls}\n` +
+			  `Dial Prefix: ${escapeMarkdown(campaign.dialPrefix || 'None')}\n\n` +
+			  `❌ *No leads found!*\n\n` +
+			  `Please upload leads first using "📁 Upload Leads".`,
+			  { 
+				parse_mode: 'Markdown',
+				reply_markup: {
+				  inline_keyboard: [
+					[{ text: '📁 Upload Leads', callback_data: 'upload_leads' }],
+					[{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+				  ]
+				}
+			  }
+			);
+			return;
+		  }
+
+		  // Start campaign with user's settings
+		  const unprocessedCalls = await Call.findAll({
+			where: { 
+			  campaignId: campaign.id,
+			  used: false 
+			}
+		  });
+
+		  const unprocessedData = unprocessedCalls.map(call => ({
+			phoneNumber: call.phoneNumber.replace('+', ''),
+			rawLine: call.rawLine
+		  }));
+
+		  bot.sendMessage(
+			chatId,
+			`🚀 *Campaign Starting*\n\n` +
+			`Campaign: ${escapeMarkdown(campaign.campaignName)}\n` +
+			`Numbers to dial: ${unprocessedData.length}\n` +
+			`SIP Trunk: ${escapeMarkdown(campaign.sipTrunk ? campaign.sipTrunk.name : 'N/A')}\n` +
+			`Caller ID: ${escapeMarkdown(campaign.callerId)}\n` +
+			`Concurrent Calls: ${campaign.concurrentCalls}\n` +
+			`Dial Prefix: ${escapeMarkdown(campaign.dialPrefix || 'None')}\n\n` +
+			`Dialing will begin automatically...`,
+			{ parse_mode: "Markdown" }
+		  );
+
+		  // Set campaign settings from user configuration
+		  set_settings({
+			notifications_chat_id: chatId,
+			concurrent_calls: campaign.concurrentCalls,
+			sip_trunk: campaign.sipTrunk,
+			caller_id: campaign.callerId,
+			dial_prefix: campaign.dialPrefix || '',
+			campaign_id: campaign.id,
+			dtmf_digit: campaign.dtmfDigit || '1',
+			ivr_intro_file: campaign.ivrIntroFile,
+			ivr_outro_file: campaign.ivrOutroFile
+		  });
+
+		  // Start the calling process
+		  startCallingProcess(unprocessedData, campaign, user.telegramId);
+		  break;
 
       case "set_dtmf":
         const campaignForDtmf = await getOrCreateCampaign(userId);
@@ -2451,7 +2542,7 @@ case "debug_billing_data":
         );
         break;
     }
-
+console.log('########################', callbackData)
 	if (callbackData.startsWith('admin_assign_rate_confirm_')) {
 	  if (user.userType !== 'admin') {
 		bot.sendMessage(chatId, "❌ Admin access required!");
@@ -2659,6 +2750,9 @@ case "debug_billing_data":
 					{ text: '🔢 Change DTMF Digit', callback_data: `admin_set_dtmf_${selectedUser.id}` },
 				  ],
 				  [
+					{ text: '✅ Finish Setup', callback_data: `admin_finish_user_setup_${selectedUser.id}` }
+				  ],
+				  [
 					{ text: '🔙 Back to User', callback_data: `admin_manage_user_${selectedUser.id}` }
 				  ]
 				]
@@ -2673,6 +2767,143 @@ case "debug_billing_data":
 	  return;
 	}
 
+	// Handle finish user setup
+	if (callbackData.startsWith('admin_finish_user_setup_')) {
+	  if (user.userType !== 'admin') {
+		bot.sendMessage(chatId, "❌ Admin access required!");
+		return;
+	  }
+	  
+	  const selectedUserId = callbackData.replace('admin_finish_user_setup_', '');
+	  
+	  try {
+		const selectedUser = await User.findByPk(selectedUserId, {
+		  include: [
+			{ model: SipPeer, as: 'sipTrunk' },
+			{ model: SipPeer, as: 'callbackTrunk' },
+			{ model: RateCard, as: 'rateCard' }
+		  ]
+		});
+		
+		if (!selectedUser) {
+		  bot.sendMessage(chatId, "❌ User not found.");
+		  return;
+		}
+		
+		// Check campaign configuration
+		const campaign = await Campaign.findOne({
+		  where: { createdBy: selectedUser.telegramId },
+		  include: [
+			{ model: SipPeer, as: 'sipTrunk' },
+			{ model: SipPeer, as: 'callbackTrunk' }
+		  ]
+		});
+		
+		// Update user settings from campaign if exists
+		if (campaign) {
+		  await selectedUser.update({
+			sipTrunkId: campaign.sipTrunkId,
+			callbackTrunkId: campaign.callbackTrunkId,
+			callerId: campaign.callerId,
+			dialPrefix: campaign.dialPrefix,
+			concurrentCalls: campaign.concurrentCalls
+		  });
+		  
+		  // Reload user with updated data
+		  await selectedUser.reload({
+			include: [
+			  { model: SipPeer, as: 'sipTrunk' },
+			  { model: SipPeer, as: 'callbackTrunk' },
+			  { model: RateCard, as: 'rateCard' }
+			]
+		  });
+		}
+		
+		// Check if setup is complete
+		const hasCompleteSettings = !!(
+		  selectedUser.sipTrunkId && 
+		  selectedUser.callerId && 
+		  selectedUser.concurrentCalls
+		);
+		
+		// Update user's approval and settings status
+		await selectedUser.update({
+		  approvalStatus: 'approved',
+		  approvalDate: new Date(),
+		  approvedBy: user.telegramId,
+		  campaignSettingsComplete: hasCompleteSettings
+		});
+		
+		const settingsStatus = hasCompleteSettings ? '✅ Complete' : '⚠️ Incomplete';
+		const missingSettings = [];
+		if (!selectedUser.sipTrunkId) missingSettings.push('SIP Trunk');
+		if (!selectedUser.callerId) missingSettings.push('Caller ID');
+		if (!selectedUser.concurrentCalls) missingSettings.push('Concurrent Calls');
+		
+		bot.sendMessage(
+		  chatId,
+		  `🎯 *User Setup Summary*\n\n` +
+		  `User: ${escapeMarkdown(selectedUser.firstName || selectedUser.username || 'User')}\n` +
+		  `Status: ${settingsStatus}\n\n` +
+		  `📋 *Configuration:*\n` +
+		  `🌐 SIP Trunk: ${selectedUser.sipTrunk ? escapeMarkdown(selectedUser.sipTrunk.name) : '❌ Not set'}\n` +
+		  `📞 Caller ID: ${selectedUser.callerId ? escapeMarkdown(selectedUser.callerId) : '❌ Not set'}\n` +
+		  `➕ Dial Prefix: ${selectedUser.dialPrefix ? escapeMarkdown(selectedUser.dialPrefix) : '➖ None'}\n` +
+		  `🔢 Concurrent Calls: ${selectedUser.concurrentCalls || '❌ Not set'}\n` +
+		  `💳 Rate Card: ${selectedUser.rateCard ? escapeMarkdown(selectedUser.rateCard.name) : '❌ Not assigned'}\n\n` +
+		  `${missingSettings.length > 0 ? `⚠️ Missing: ${missingSettings.join(', ')}` : '✅ Setup complete!'}`,
+		  {
+			parse_mode: 'Markdown',
+			reply_markup: {
+			  inline_keyboard: [
+				[{ text: '👥 All Users', callback_data: 'admin_users' }],
+				[{ text: '⏳ Pending Approvals', callback_data: 'admin_pending_approvals' }],
+				[{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+			  ]
+			}
+		  }
+		);
+		
+		// Notify user if setup is complete
+		if (hasCompleteSettings) {
+		  try {
+			await bot.sendMessage(
+			  selectedUser.telegramId,
+			  `🎉 *Setup Complete!*\n\n` +
+			  `Your account is now fully configured and ready to use.\n\n` +
+			  `You can now:\n` +
+			  `• Upload leads\n` +
+			  `• Start campaigns\n` +
+			  `• Monitor call statistics\n\n` +
+			  `Welcome to the system! Send /start to begin.`,
+			  { parse_mode: 'Markdown' }
+			);
+		  } catch (error) {
+			console.log(`Could not notify user ${selectedUser.telegramId}: ${error.message}`);
+		  }
+		} else {
+		  // User still has incomplete settings
+		  try {
+			await bot.sendMessage(
+			  selectedUser.telegramId,
+			  `⚠️ *Account Approved - Configuration Incomplete*\n\n` +
+			  `Your account has been approved by the administrator, but some configuration is still missing.\n\n` +
+			  `Missing: ${missingSettings.join(', ')}\n\n` +
+			  `Please contact the administrator to complete your setup.`,
+			  { parse_mode: 'Markdown' }
+			);
+		  } catch (error) {
+			console.log(`Could not notify user ${selectedUser.telegramId}: ${error.message}`);
+		  }
+		}
+		
+	  } catch (error) {
+		console.error('Error finishing user setup:', error);
+		bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+	  }
+	  return;
+	}
+	
 	if (callbackData.startsWith('admin_set_sip_')) {
 	  if (user.userType !== 'admin') {
 		bot.sendMessage(chatId, "❌ Admin access required!");
@@ -3014,6 +3245,32 @@ case "debug_billing_data":
       return;
     }
 	
+	// Handle Add New User callback
+	if (callbackData === 'admin_add_user') {
+	  if (user.userType !== 'admin') {
+		bot.sendMessage(chatId, "❌ Admin access required!");
+		return;
+	  }
+	  
+	  bot.sendMessage(
+		chatId,
+		`➕ *Add New User*\n\n` +
+		`Enter user details in this format:\n\n` +
+		`\`TELEGRAM_ID | FIRST_NAME | LAST_NAME\`\n\n` +
+		`Example:\n` +
+		`\`123456789 | John | Doe\`\n\n` +
+		`Or just:\n` +
+		`\`123456789 | John\`\n\n` +
+		`Note: The user will be created with pending approval status and will need admin configuration before they can use the system.`,
+		{ parse_mode: 'Markdown' }
+	  );
+	  
+	  userStates[userId] = { 
+		action: 'admin_creating_user'
+	  };
+	  return;
+	}
+	
 	// Handle dynamic callbacks for user credit addition
 	if (callbackData.startsWith('admin_add_credit_')) {
 	  if (user.userType !== 'admin') {
@@ -3055,6 +3312,7 @@ case "debug_billing_data":
   bot.on("text", async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
+	
     const text = msg.text;
     
     if (text.startsWith("/")) return; // Ignore commands
@@ -3080,7 +3338,7 @@ case "debug_billing_data":
 			`✅ *Callback Trunk Number Set Successfully!*\n\n` +
 			`Callback Number: ${escapeMarkdown(callbackTrunkNum)}\n\n` +
 			`This number will be dialed on the callback trunk when callbacks are initiated.`,
-			{ parse_mode: "Markdown", ...getUserMenu(user) }
+			{ parse_mode: "Markdown", ...getUserMenu(userId) }
 		  );
 		  delete userStates[userId];
 		  break;
@@ -3109,6 +3367,90 @@ case "debug_billing_data":
 			bot.sendMessage(chatId, "📋 Please upload a CSV file with the rate data.");
 			break;
 		
+		case 'admin_creating_user':
+		try {
+		  const parts = text.split('|').map(part => part.trim());
+		  
+		  if (parts.length < 2) {
+			bot.sendMessage(chatId, "❌ Invalid format. Please use: TELEGRAM_ID | FIRST_NAME | LAST_NAME");
+			return;
+		  }
+		  
+		  const [telegramId, firstName, lastName] = parts;
+		  
+		  // Validate Telegram ID (should be numeric)
+		  if (!/^\d+$/.test(telegramId)) {
+			bot.sendMessage(chatId, "❌ Invalid Telegram ID. It should be numeric (e.g., 123456789)");
+			return;
+		  }
+		  
+		  // Check if user already exists
+		  const existingUser = await User.findOne({ where: { telegramId } });
+		  if (existingUser) {
+			bot.sendMessage(chatId, `❌ User with Telegram ID ${telegramId} already exists.`);
+			delete userStates[userId];
+			return;
+		  }
+		  
+		  // Create new user with pending approval
+		  const newUser = await User.create({
+			telegramId,
+			firstName: firstName || 'User',
+			lastName: lastName || '',
+			userType: 'user',
+			status: 'active',
+			balance: 0,
+			approvalStatus: 'pending',
+			requestedAt: new Date(),
+			createdBy: userId
+		  });
+		  
+		  bot.sendMessage(
+			chatId,
+			`✅ *User Created Successfully!*\n\n` +
+			`Name: ${escapeMarkdown(newUser.firstName)} ${escapeMarkdown(newUser.lastName || '')}\n` +
+			`Telegram ID: ${newUser.telegramId}\n` +
+			`Status: Pending Approval\n\n` +
+			`The user has been created with pending approval status. You can now:\n` +
+			`• Configure their campaign settings\n` +
+			`• Assign a rate card\n` +
+			`• Approve their account\n\n` +
+			`Use "⏳ Pending Approvals" to configure this user.`,
+			{
+			  parse_mode: 'Markdown',
+			  reply_markup: {
+				inline_keyboard: [
+				  [{ text: '⏳ Pending Approvals', callback_data: 'admin_pending_approvals' }],
+				  [{ text: '👥 All Users', callback_data: 'admin_users' }],
+				  [{ text: '🏠 Main Menu', callback_data: 'back_to_menu' }]
+				]
+			  }
+			}
+		  );
+		  
+		  // Try to notify the new user
+		  try {
+			await bot.sendMessage(
+			  telegramId,
+			  `🎉 *Welcome!*\n\n` +
+			  `Your account has been created and is pending administrator approval.\n\n` +
+			  `Please wait for the administrator to configure your account settings. You'll receive another message when your account is ready to use.\n\n` +
+			  `Send /start to check your status at any time.`,
+			  { parse_mode: 'Markdown' }
+			);
+		  } catch (error) {
+			console.log(`Could not notify new user ${telegramId}: ${error.message}`);
+			// This is normal if the user hasn't started the bot yet
+		  }
+		  
+		  delete userStates[userId];
+		  
+		} catch (error) {
+		  console.error('Error creating user:', error);
+		  bot.sendMessage(chatId, `❌ Error creating user: ${error.message}`);
+		  delete userStates[userId];
+		}
+		break;
 		case 'admin_adding_credit_amount':
 		  await handleAddCreditAmount(bot, msg, userStates, userId);
 		  break;		
@@ -3300,7 +3642,7 @@ case "debug_billing_data":
         bot.sendMessage(
           chatId,
           `✅ Concurrent calls set to: ${concurrentNum}`,
-          getUserMenu(userId)
+          getUserMenu(user)
         );
         delete userStates[userId];
         break;
@@ -3315,7 +3657,7 @@ case "debug_billing_data":
 		  bot.sendMessage(
 			chatId,
 			`✅ DTMF digit set to: ${text}`,
-			getUserMenu(userId)
+			getUserMenu(user)
 		  );
 		  delete userStates[userId];
 		  break;
@@ -3333,7 +3675,7 @@ case "debug_billing_data":
         bot.sendMessage(
           chatId,
           `✅ SIP trunk set to: ${selectedTrunk.name}`,
-          getUserMenu(userId)
+          getUserMenu(user)
         );
         delete userStates[userId];
         break;
@@ -3685,7 +4027,7 @@ case "debug_billing_data":
 				`Processing ${unprocessedData.length} phone numbers...\n\n` +
 				`Statistics have been reset for this new campaign.\n` +
 				`You'll receive notifications as calls progress.`,
-				{ parse_mode: "Markdown", ...getUserMenu(userId) }
+				{ parse_mode: "Markdown", ...getUserMenu(user) }
 			  );
 			  
 			  // Update settings with campaign data including DTMF digit
@@ -3726,7 +4068,70 @@ case "debug_billing_data":
 				return;
 			  }
 			  
-			  const currentCampaign = await getOrCreateCampaign();
+			  // Get current user for campaign creation
+			  const currentUser = await User.findOne({ 
+				where: { telegramId: userId.toString() },
+				include: [
+				  { model: SipPeer, as: 'sipTrunk' },
+				  { model: SipPeer, as: 'callbackTrunk' }
+				]
+			  });
+			  
+			  if (!currentUser) {
+				bot.sendMessage(chatId, "❌ User not found. Please contact administrator.");
+				return;
+			  }
+			  
+			  // Get or create campaign with user's settings
+			  let currentCampaign = await Campaign.findOne({
+				where: { createdBy: currentUser.telegramId },
+				include: [
+				  { model: SipPeer, as: 'sipTrunk' },
+				  { model: SipPeer, as: 'callbackTrunk' }
+				]
+			  });
+
+			  if (currentCampaign) {
+				// Update existing campaign with user's current settings
+				await currentCampaign.update({
+				  sipTrunkId: currentUser.sipTrunkId,
+				  callbackTrunkId: currentUser.callbackTrunkId,
+				  callerId: currentUser.callerId,
+				  dialPrefix: currentUser.dialPrefix,
+				  concurrentCalls: currentUser.concurrentCalls,
+				  notificationsChatId: chatId
+				});
+				
+				// Reload with associations
+				currentCampaign = await Campaign.findByPk(currentCampaign.id, {
+				  include: [
+					{ model: SipPeer, as: 'sipTrunk' },
+					{ model: SipPeer, as: 'callbackTrunk' }
+				  ]
+				});
+			  } else {
+				// Create new campaign with user's settings
+				currentCampaign = await Campaign.create({
+				  botToken: config.telegram_bot_token,
+				  campaignName: `${currentUser.firstName || currentUser.username || 'User'}'s Campaign`,
+				  createdBy: currentUser.telegramId,
+				  sipTrunkId: currentUser.sipTrunkId,
+				  callbackTrunkId: currentUser.callbackTrunkId,
+				  callerId: currentUser.callerId,
+				  dialPrefix: currentUser.dialPrefix,
+				  concurrentCalls: currentUser.concurrentCalls,
+				  notificationsChatId: chatId,
+				  isActive: true
+				});
+				
+				// Reload with associations
+				currentCampaign = await Campaign.findByPk(currentCampaign.id, {
+				  include: [
+					{ model: SipPeer, as: 'sipTrunk' },
+					{ model: SipPeer, as: 'callbackTrunk' }
+				  ]
+				});
+			  }
 			  
 			  const unprocessedData2 = await filterProcessedNumbers(data2, currentCampaign.id);
 			  if (unprocessedData2.length === 0) {
@@ -3734,9 +4139,9 @@ case "debug_billing_data":
 				return;
 			  }
 			  
-			  const canAutoStart = currentCampaign.sipTrunkId && currentCampaign.callerId;
-			  
-			  if (canAutoStart) {
+			  // Check if user can create campaigns (approved + complete settings)
+			  if (currentUser.canCreateCampaign() && unprocessedData2.length > 0) {
+				// Validate SIP trunk
 				const trunkValidation = await validateSipTrunk(currentCampaign.sipTrunkId);
 				if (!trunkValidation.valid) {
 				  bot.sendMessage(
@@ -3746,10 +4151,11 @@ case "debug_billing_data":
 					`New numbers: ${unprocessedData2.length}\n` +
 					`Duplicates: ${data2.length - unprocessedData2.length}\n\n` +
 					`❌ SIP Trunk Error: ${escapeMarkdown(trunkValidation.message)}\n\n` +
-					`Please fix the SIP trunk configuration and use "Start Campaign" to begin dialing.`,
-					{ parse_mode: "Markdown", ...getUserMenu(user) }
+					`Please contact administrator to fix the SIP trunk configuration.`,
+					{ parse_mode: "Markdown", ...getUserMenu(currentUser) }
 				  );
 				  
+				  // Still save the leads for when trunk is fixed
 				  for (const entry of unprocessedData2) {
 					await Call.create({
 					  phoneNumber: `+${sanitize_phoneNumber(entry.phoneNumber)}`,
@@ -3762,6 +4168,7 @@ case "debug_billing_data":
 				  return;
 				}
 				
+				// Reset campaign statistics
 				await currentCampaign.update({
 				  totalCalls: 0,
 				  successfulCalls: 0,
@@ -3771,14 +4178,11 @@ case "debug_billing_data":
 				  callCounter: 0
 				});
 				
-				const campaignWithTrunk = await Campaign.findByPk(currentCampaign.id, {
-				  include: [{ model: SipPeer, as: 'sipTrunk' }]
-				});
-				
+				// Clear the pressedNumbers set in asterisk instance
 				const { ami } = require("../asterisk/instance");
 				ami.emit('clear_pressed_numbers');
 				
-				// FIX: Properly escape all dynamic content
+				// Auto-start campaign since user has complete settings
 				bot.sendMessage(
 				  chatId,
 				  `✅ *Leads Uploaded & Campaign Auto-Started!*\n\n` +
@@ -3786,32 +4190,34 @@ case "debug_billing_data":
 				  `New numbers: ${unprocessedData2.length}\n` +
 				  `Duplicates: ${data2.length - unprocessedData2.length}\n\n` +
 				  `🚀 *Auto-Starting Campaign:*\n` +
-				  `SIP Trunk: ${escapeMarkdown(campaignWithTrunk.sipTrunk ? campaignWithTrunk.sipTrunk.name : 'N/A')}\n` +
-				  `Caller ID: ${escapeMarkdown(campaignWithTrunk.callerId || 'Not set')}\n` +
-				  `DTMF Digit: ${escapeMarkdown(campaignWithTrunk.dtmfDigit || '1')}\n` +
-				  `Concurrent Calls: ${campaignWithTrunk.concurrentCalls}\n\n` +
+				  `SIP Trunk: ${escapeMarkdown(currentCampaign.sipTrunk ? currentCampaign.sipTrunk.name : 'N/A')}\n` +
+				  `Caller ID: ${escapeMarkdown(currentCampaign.callerId || 'Not set')}\n` +
+				  `Concurrent Calls: ${currentCampaign.concurrentCalls}\n` +
+				  `Dial Prefix: ${escapeMarkdown(currentCampaign.dialPrefix || 'None')}\n\n` +
 				  `Dialing will begin automatically...`,
-				  { parse_mode: "Markdown", ...getUserMenu(user) }
+				  { parse_mode: "Markdown", ...getUserMenu(currentUser) }
 				);
 				
 				set_settings({
-				  notifications_chat_id: campaignWithTrunk.notificationsChatId || chatId,
-				  concurrent_calls: campaignWithTrunk.concurrentCalls,
-				  sip_trunk: campaignWithTrunk.sipTrunk,
-				  caller_id: campaignWithTrunk.callerId,
-				  dial_prefix: campaignWithTrunk.dialPrefix || '',
-				  campaign_id: campaignWithTrunk.id,
-				  dtmf_digit: campaignWithTrunk.dtmfDigit,
-				  ivr_intro_file: campaignWithTrunk.ivrIntroFile,
-				  ivr_outro_file: campaignWithTrunk.ivrOutroFile
+				  notifications_chat_id: chatId,
+				  concurrent_calls: currentCampaign.concurrentCalls,
+				  sip_trunk: currentCampaign.sipTrunk,
+				  caller_id: currentCampaign.callerId,
+				  dial_prefix: currentCampaign.dialPrefix || '',
+				  campaign_id: currentCampaign.id,
+				  dtmf_digit: currentCampaign.dtmfDigit || '1',
+				  ivr_intro_file: currentCampaign.ivrIntroFile,
+				  ivr_outro_file: currentCampaign.ivrOutroFile
 				});
 				
-				startCallingProcess(unprocessedData2, campaignWithTrunk, campaignWithTrunk?.createdBy);
-				
+				startCallingProcess(unprocessedData2, currentCampaign, currentUser.telegramId);
 			  } else {
-				const missingFields = [];
-				if (!currentCampaign.sipTrunkId) missingFields.push("SIP Trunk");
-				if (!currentCampaign.callerId) missingFields.push("Caller ID");
+				// User doesn't have complete settings
+				const missingSettings = [];
+				if (!currentUser.sipTrunkId) missingSettings.push("SIP Trunk");
+				if (!currentUser.callerId) missingSettings.push("Caller ID");
+				if (!currentUser.concurrentCalls) missingSettings.push("Concurrent Calls");
+				if (currentUser.approvalStatus !== 'approved') missingSettings.push("Account Approval");
 				
 				bot.sendMessage(
 				  chatId,
@@ -3820,11 +4226,12 @@ case "debug_billing_data":
 				  `New numbers: ${unprocessedData2.length}\n` +
 				  `Duplicates: ${data2.length - unprocessedData2.length}\n\n` +
 				  `⚠️ *Campaign NOT Started - Missing Configuration:*\n` +
-				  `${missingFields.map(f => `• ${f}`).join('\n')}\n\n` +
-				  `Please configure the missing fields and use "Start Campaign" to begin dialing.`,
-				  { parse_mode: "Markdown", ...getUserMenu(user) }
+				  `${missingSettings.map(f => `• ${f}`).join('\n')}\n\n` +
+				  `Please contact the administrator to complete your setup.`,
+				  { parse_mode: "Markdown", ...getUserMenu(currentUser) }
 				);
 				
+				// Still save the leads for when user is configured
 				for (const entry of unprocessedData2) {
 				  await Call.create({
 					phoneNumber: `+${sanitize_phoneNumber(entry.phoneNumber)}`,

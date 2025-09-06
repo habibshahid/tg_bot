@@ -107,6 +107,11 @@ const Campaign = sequelize.define('Campaign', {
     defaultValue: 0,
     field: 'call_counter'
   },
+  destinationRoute: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+    field: 'destination_route'
+  },
   isActive: {
     type: DataTypes.BOOLEAN,
     defaultValue: true,

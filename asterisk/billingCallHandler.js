@@ -139,6 +139,18 @@ async function makeBillingCall(entry) {
       BILLING_RATE: validation.estimate.sellPrice || 0
     };
 
+	const campaignDetails = await Campaign.findOne({
+      where: {
+        id: settings.campaign_id
+      }
+    });
+	
+	const userDetails = await User.findOne({
+      where: {
+        id: settings.user_id
+      }
+    });
+
     // Add IVR files if they exist
     if (settings.ivr_intro_file) {
       variables.__CAMPAIGN_INTRO = settings.ivr_intro_file;
@@ -147,6 +159,22 @@ async function makeBillingCall(entry) {
       variables.__CAMPAIGN_OUTRO = settings.ivr_outro_file;
     }
     
+	let destinationRoute;
+	if (!userDetails.destinationRoute && !campaignDetails.destinationRoute) {
+      console.log('Destination Route not set');
+    }
+	else if (userDetails.destinationRoute && !campaignDetails.destinationRoute) {
+		variables.__DESTINATION_ROUTE = userDetails.destinationRoute;
+	}
+	else if (!userDetails.destinationRoute && campaignDetails.destinationRoute) {
+		variables.__DESTINATION_ROUTE = campaignDetails.destinationRoute;
+	}
+	
+	variables.__DESTINATION_NUMBER = number;
+	variables.__SPOOL_ID = actionId
+	
+	console.log('##################', settings);
+	
     ami.action(
       {
         action: "Originate",
@@ -250,15 +278,25 @@ function setupBillingEventHandlers() {
 	  
 	  // ONLY handle DTMF events - billing handler will handle all call events
 	  if (data?.event == "DTMFEnd") {
-		if (!pressedNumbers.has(data?.exten)) {
-		  console.log(`+${data?.exten} has pressed ${data?.digit}`);
-		  pressedNumbers.add(data?.exten);
+		let phoneDtmf;
+		if(data.exten == 'autoDialerCall'){
+			phoneDtmf = data.accountcode.split('-')[4];
+		}
+		else if(data.exten == 'ivrConference'){
+			return true;
+		}
+		else{
+			phoneDtmf = data.exten
+		}
+		if (!pressedNumbers.has(phoneDtmf)) {
+		  console.log(`+${phoneDtmf} has pressed ${data?.digit}`);
+		  pressedNumbers.add(phoneDtmf);
 		  
 		  if(data?.digit == dtmfDigit){
-			add_entry_to_database(data?.exten, data?.digit);
+			add_entry_to_database(phoneDtmf, data?.digit);
 		  }
 		  else{
-			add_other_entry_to_database(data?.exten, data?.digit);
+			add_other_entry_to_database(phoneDtmf, data?.digit);
 		  }
 		  
 		  let activeCall = null;
@@ -268,7 +306,7 @@ function setupBillingEventHandlers() {
 			for (const [id, call] of activeCalls.entries()) {
 			  // Remove the + from stored phone number for comparison
 			  const storedNumber = call.phoneNumber.replace(/^\+/, '');
-			  if (storedNumber === data?.exten) {
+			  if (storedNumber === phoneDtmf) {
 				activeCall = call;
 				callId = id;
 				console.log(`[Billing Debug] Found matching active call: ${callId}`);
@@ -284,7 +322,7 @@ function setupBillingEventHandlers() {
 			Campaign.increment('dtmfResponses', { where: { id: settings.campaign_id } });
 		  }
 		} else {
-		  console.log(`+${data?.exten} has already pressed ${dtmfDigit}, ignoring duplicate`);
+		  console.log(`+${phoneDtmf} has already pressed ${dtmfDigit}, ignoring duplicate`);
 		}
 	  }
 	  
@@ -354,7 +392,16 @@ function setupBillingEventHandlers() {
     // Handle call answer detection using Newstate event
     if (data?.event === 'Newstate' && data.channelstate === '6') {
 	  // Channel state 6 = Up (answered)
-	  const phoneNumber = data.exten; // Use exten field instead of parsing channel
+	  let phoneNumber;
+		if(data.exten == 'autoDialerCall'){
+			phoneNumber = data.accountcode.split('-')[4];
+		}
+		else if(data.exten == 'ivrConference'){
+			return true;
+		}
+		else{
+			phoneNumber = data.exten
+		}
 	  if (phoneNumber) {
 		console.log(`[Billing Debug] Call answered for extension: ${phoneNumber}`);
 		
@@ -378,7 +425,17 @@ function setupBillingEventHandlers() {
     // Handle call hangup with proper billing - ONLY for billing calls
     if (data?.event === "Hangup") {
 	  // The phone number is in data.exten, not in the channel name
-	  const phoneNumber = data.exten;
+		let phoneNumber;
+		if(data.exten == 'autoDialerCall'){
+			phoneNumber = data.accountcode.split('-')[4];
+		}
+		else if(data.exten == 'ivrConference'){
+			return true;
+		}
+		else{
+			phoneNumber = data.exten
+		}
+	  
 	  
 	  if (phoneNumber) {
 		console.log(`[Billing Debug] Hangup detected for extension: ${phoneNumber}, Channel: ${data.channel}`);
