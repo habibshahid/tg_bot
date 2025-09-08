@@ -108,7 +108,7 @@ const Campaign = sequelize.define('Campaign', {
     field: 'call_counter'
   },
   destinationRoute: {
-    type: DataTypes.INTEGER,
+    type: DataTypes.STRING(100),
     allowNull: true,
     field: 'destination_route'
   },

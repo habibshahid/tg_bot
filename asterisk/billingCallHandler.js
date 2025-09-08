@@ -170,10 +170,9 @@ async function makeBillingCall(entry) {
 		variables.__DESTINATION_ROUTE = campaignDetails.destinationRoute;
 	}
 	
+	variables.__DTMF_DIGIT = settings.dtmf_digit || '1';
 	variables.__DESTINATION_NUMBER = number;
 	variables.__SPOOL_ID = actionId
-	
-	console.log('##################', settings);
 	
     ami.action(
       {

@@ -630,6 +630,12 @@ async function estimateCampaignCost(userId, phoneNumbers) {
   }
 }
 
+function checkUserPermissions(user, userId, adminId) {
+  const isApprovedUser = user.approvalStatus === 'approved' && user.campaignSettingsComplete;
+  const isAdminUser = userId == adminId || user.userType === 'admin';
+  return { isApprovedUser, isAdminUser };
+}
+
 async function getSipTrunks() {
   return await SipPeer.findAll({
     where: { 
@@ -686,6 +692,10 @@ function getUserMenu(user) {
       [
         { text: "📊 My Statistics", callback_data: "my_stats" },
         { text: "📋 Recent Calls", callback_data: "recent_calls" }
+      ],
+	  [
+        { text: "🎵 Upload IVR", callback_data: "upload_ivr" },         // *** ADDED ***
+        { text: "🔢 Set DTMF Digit", callback_data: "set_dtmf" }      // *** ADDED ***
       ],
       [
         { text: "💳 My Rate Card", callback_data: "my_rates" },
@@ -1931,16 +1941,44 @@ const initializeBot = () => {
 		  break;
 
       case "set_dtmf":
-        const campaignForDtmf = await getOrCreateCampaign(userId);
-        bot.sendMessage(
-          chatId,
-          `🔢 *Set DTMF Digit*\n\n` +
-          `Current DTMF digit: ${campaignForDtmf.dtmfDigit || '1'}\n\n` +
-          `Enter a single digit (0-9) that callers should press:`,
-          { parse_mode: "Markdown" }
-        );
-        userStates[userId] = { action: "waiting_dtmf_digit", campaignId: campaignForDtmf.id };
-        break;
+		  // Updated permission check: Allow approved users with complete campaign settings
+		  const isApprovedUserDtmf = user.approvalStatus === 'approved' && user.campaignSettingsComplete;
+		  const isAdminUserDtmf = userId == adminId || user.userType === 'admin';
+		  
+		  // Check if user is in the Allowed table (legacy permission system)
+		  let permittedUserDtmf = await Allowed.findOne({ 
+			  where: { telegramId: userId } 
+		  });
+		  
+		  console.log(`Request from User ${userId} for set_dtmf`);
+		  console.log(`User approval status: ${user.approvalStatus}, Campaign complete: ${user.campaignSettingsComplete}`);
+		  console.log(`Is admin: ${isAdminUserDtmf}, Is permitted (legacy): ${!!permittedUserDtmf}, Is approved user: ${isApprovedUserDtmf}`);
+		  
+		  // Allow access if user is admin OR approved with complete settings OR in legacy allowed list
+		  if (!isAdminUserDtmf && !isApprovedUserDtmf && !permittedUserDtmf) {
+			console.log("❌ Access denied for set_dtmf!", userId);
+			bot.sendMessage(chatId, 
+			  "❌ *Access Required*\n\n" +
+			  "DTMF setup requires:\n" +
+			  "• Account approval\n" +
+			  "• Complete campaign setup\n\n" +
+			  "Please contact the administrator if you believe this is an error.",
+			  { parse_mode: "Markdown" }
+			);
+			return;
+		  }
+		  
+		  const campaignForDtmf = await getOrCreateCampaign(userId);
+		  bot.sendMessage(
+			chatId,
+			`🔢 *Set DTMF Digit*\n\n` +
+			`Current DTMF digit: ${campaignForDtmf.dtmfDigit || '1'}\n\n` +
+			`Please enter the DTMF digit (0-9) to track for responses.\n\n` +
+			`This digit will be detected when callers press it during the call.`,
+			{ parse_mode: "Markdown" }
+		  );
+		  userStates[userId] = { action: "waiting_dtmf_digit", campaignId: campaignForDtmf.id };
+		  break;
 
       case "call_status":
         const currentCampaign = await getOrCreateCampaign(userId);
@@ -2056,18 +2094,31 @@ const initializeBot = () => {
         break;
 
       case "upload_ivr":
-        let permittedUser3 = await Allowed.findOne({ 
+        const isApprovedUser = user.approvalStatus === 'approved' && user.campaignSettingsComplete;
+		const isAdminUser = userId == adminId || user.userType === 'admin';
+  
+		let permittedUser3 = await Allowed.findOne({ 
             where: { telegramId: userId } 
         });
-        console.log(`Request from User ${userId} for upload_ivr`)
-        if(userId == adminId){
-          permittedUser3 = true;
-        }
-        if (!permittedUser3 && user.userType !== 'admin') {
-          console.log("❌ Admin access required to upload_ivr!", userId);
-          bot.sendMessage(chatId, "❌ Admin access required!");
-          return;
-        }
+        
+		console.log(`Request from User ${userId} for upload_ivr`);
+		console.log(`User approval status: ${user.approvalStatus}, Campaign complete: ${user.campaignSettingsComplete}`);
+		console.log(`Is admin: ${isAdminUser}, Is permitted (legacy): ${!!permittedUser3}, Is approved user: ${isApprovedUser}`);
+		  
+		if (!isAdminUser && !isApprovedUser && !permittedUser3) {
+			console.log("❌ Access denied for upload_ivr!", userId);
+			bot.sendMessage(chatId, 
+			  "❌ *Access Required*\n\n" +
+			  "IVR management requires:\n" +
+			  "• Account approval\n" +
+			  "• Complete campaign setup\n\n" +
+			  "Please contact the administrator if you believe this is an error.",
+			  { parse_mode: "Markdown" }
+			);
+			return;
+		}
+		  
+        
         bot.sendMessage(
           chatId,
           "🎵 *Upload IVR Audio*\n\n" +
@@ -2090,6 +2141,23 @@ const initializeBot = () => {
 
       case "ivr_intro":
       case "ivr_outro":
+		  const { isApprovedUser: isApprovedUserIvr, isAdminUser: isAdminUserIvr } = checkUserPermissions(user, userId, adminId);
+		  let permittedUserIvr = await Allowed.findOne({ 
+			  where: { telegramId: userId } 
+		  });
+		  
+		  if (!isAdminUserIvr && !isApprovedUserIvr && !permittedUserIvr) {
+			bot.sendMessage(chatId, 
+			  "❌ *Access Required*\n\n" +
+			  "IVR management requires:\n" +
+			  "• Account approval\n" +
+			  "• Complete campaign setup\n\n" +
+			  "Please contact the administrator if you believe this is an error.",
+			  { parse_mode: "Markdown" }
+			);
+			return;
+		  }
+
         const ivrType = callbackData.split("_")[1];
         const campaign3 = await getOrCreateCampaign(userId);
         
@@ -2542,7 +2610,7 @@ case "debug_billing_data":
         );
         break;
     }
-console.log('########################', callbackData)
+	console.log('########################', callbackData)
 	if (callbackData.startsWith('admin_assign_rate_confirm_')) {
 	  if (user.userType !== 'admin') {
 		bot.sendMessage(chatId, "❌ Admin access required!");
@@ -3312,6 +3380,10 @@ console.log('########################', callbackData)
   bot.on("text", async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
+	let user = await User.findByPk(userId);
+	if(!user?.userType){
+		user = await User.findOne({where: {telegramId: userId}});
+	}
 	
     const text = msg.text;
     

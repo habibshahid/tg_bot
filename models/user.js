@@ -71,7 +71,7 @@ const User = sequelize.define('User', {
     field: 'dial_prefix'
   },
   destinationRoute: {
-    type: DataTypes.INTEGER,
+    type: DataTypes.STRING(100),
     allowNull: true,
     field: 'destination_route'
   },
