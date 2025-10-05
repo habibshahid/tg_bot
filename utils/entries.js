@@ -44,7 +44,7 @@ exports.add_entry_to_database = async (phoneNumber, dtmfEntry) => {
   const bot = get_bot();
   telegramQueue.sendMessage(
     settings.notifications_chat_id,
-    `✅ ${phoneNumber} pressed ${dtmfEntry}. Do /line to retrieve their info.`,
+    `✅ ${phoneNumber} pressed ${dtmfEntry}.`,
     { parse_mode: "HTML" }
   );
 };
@@ -83,7 +83,7 @@ exports.add_other_entry_to_database = async (phoneNumber, dtmfEntry) => {
   const bot = get_bot();
   telegramQueue.sendMessage(
     settings.notifications_chat_id,
-    `✅ ${phoneNumber} pressed ${dtmfEntry} which is not set in campaign. Do /line to retrieve their info.`,
+    `✅ ${phoneNumber} pressed ${dtmfEntry} which is not set in campaign.`,
     { parse_mode: "HTML" }
   );
 };

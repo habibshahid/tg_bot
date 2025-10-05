@@ -567,6 +567,16 @@ async function processCostEstimation(bot, chatId, userId, phoneNumber) {
   }
 }
 
+async function userHasAssociatedAgents(userId) {
+  const agents = await getUserAssociatedAgents(userId);
+  return agents.length > 0;
+}
+
+async function userHasAssociatedTrunks(userId) {
+  const trunks = await getUserAssociatedTrunks(userId);
+  return trunks.length > 0;
+}
+
 /**
  * Bulk cost estimation for campaign
  */
@@ -636,6 +646,24 @@ function checkUserPermissions(user, userId, adminId) {
   return { isApprovedUser, isAdminUser };
 }
 
+function parseDestinationRoute(destinationRoute) {
+  if (!destinationRoute) return { type: null, name: null };
+  
+  if (destinationRoute.startsWith('trunk/')) {
+    return {
+      type: 'trunk',
+      name: destinationRoute.replace('trunk/', '')
+    };
+  } else if (destinationRoute.startsWith('agent/')) {
+    return {
+      type: 'agent', 
+      name: destinationRoute.replace('agent/', '')
+    };
+  }
+  
+  return { type: null, name: null };
+}
+
 async function getSipTrunks() {
   return await SipPeer.findAll({
     where: { 
@@ -643,6 +671,63 @@ async function getSipTrunks() {
       status: 1
     },
     order: [['id', 'ASC']]
+  });
+}
+
+async function getUserSipTrunks() {
+  return await SipPeer.findAll({
+    where: { 
+      category: 'trunk',
+      status: 1  // Only active trunks
+    },
+    order: [['name', 'ASC']]
+  });
+}
+
+async function getUserAgents() {
+  return await SipPeer.findAll({
+    where: { 
+      category: { [Op.ne]: 'trunk' },  // All non-trunk entries (agents/extensions)
+      status: 1  // Only active agents
+    },
+    order: [['name', 'ASC']]
+  });
+}
+
+async function getUserAssociatedAgents(userId) {
+  const user = await User.findOne({ where: { telegramId: userId.toString() } });
+	
+  return await SipPeer.findAll({
+    where: { 
+      category: { [Op.ne]: 'trunk' },  // All non-trunk entries (agents/extensions)
+      status: 1,  // Only active agents
+      telegram_id: user.id  // Only agents associated with this specific user
+    },
+    order: [['name', 'ASC']]
+  });
+}
+
+async function getUserAssociatedTrunks(userId) {
+  const user = await User.findOne({ where: { telegramId: userId.toString() } });
+	
+  return await SipPeer.findAll({
+    where: { 
+      category: 'trunk' ,  // All non-trunk entries (agents/extensions)
+      status: 1,  // Only active agents
+      telegram_id: user.id  // Only agents associated with this specific user
+    },
+    order: [['name', 'ASC']]
+  });
+}
+
+// Keep the existing function for admin use or fallback
+async function getAllAgents() {
+  return await SipPeer.findAll({
+    where: { 
+      category: { [Op.ne]: 'trunk' },
+      status: 1
+    },
+    order: [['name', 'ASC']]
   });
 }
 
@@ -686,9 +771,16 @@ function getUserMenu(user) {
     // User with billing enabled
     userButtons = [
       [
-        { text: "🚀 Start Campaign", callback_data: "start_campaign" },
-        { text: "💰 Check Balance", callback_data: "check_balance" }
+        { text: "📞 Manual Dial", callback_data: "manual_dial" }
       ],
+	  [
+		{ text: "➕ Set Dial Prefix", callback_data: "user_set_dial_prefix" }, 
+		{ text: "📞 Set Caller ID", callback_data: "user_set_caller_id" }   
+      ],
+	  [
+		//{ text: "🌐 Select SIP Trunk", callback_data: "user_select_sip_trunk" },     // *** EXISTING ***
+		{ text: "🎯 Destination Route", callback_data: "user_destination_route" }   // *** NEW ***
+	  ],
       [
         { text: "📊 My Statistics", callback_data: "my_stats" },
         { text: "📋 Recent Calls", callback_data: "recent_calls" }
@@ -699,7 +791,7 @@ function getUserMenu(user) {
       ],
       [
         { text: "💳 My Rate Card", callback_data: "my_rates" },
-        { text: "📁 Upload Leads", callback_data: "upload_leads" }
+		{ text: "💰 Check Balance", callback_data: "check_balance" }
       ],
       [
         { text: "💱 Estimate Cost", callback_data: "estimate_cost" },
@@ -709,31 +801,10 @@ function getUserMenu(user) {
   } else {
     // Approved legacy user or user without billing
     userButtons = [
-      [
-        { text: "🚀 Start Campaign", callback_data: "start_campaign" },
-        { text: "📊 Check Call Status", callback_data: "call_status" }
-      ],
-      [
-        { text: "🆔 Get Your ID", callback_data: "get_id" },
-        { text: "📁 Upload Leads (TXT)", callback_data: "upload_leads" }
-      ],
-      [
-        { text: "⚙️ Set Concurrent Calls", callback_data: "set_concurrent" },
-        { text: "📞 Set Caller ID", callback_data: "set_caller_id" }
-      ],
-      [
-        { text: "🌐 Set SIP Trunk", callback_data: "set_sip" },
-        { text: "📢 Set Notifications", callback_data: "set_notifications" }
-      ],
-      [
-        { text: "🎵 Upload IVR", callback_data: "upload_ivr" },
-        { text: "🔢 Set DTMF Digit", callback_data: "set_dtmf" }
-      ],
-      [
-        { text: "📈 Campaign Stats", callback_data: "campaign_stats" },
-        { text: "➕ Set Dial Prefix", callback_data: "set_dial_prefix" }
-      ]
-    ];
+      //[
+        //{ text: "Restricted. Contact Administrator", callback_data: "restricted" }
+      //];
+	]
   }
 
   const adminButtons = [
@@ -757,6 +828,20 @@ function getUserMenu(user) {
     }
   };
 }
+
+async function validateUserAgent(userId, agentId) {
+  const agent = await SipPeer.findOne({
+    where: {
+      id: agentId,
+      telegram_id: userId,
+      category: { [Op.ne]: 'trunk' },
+      status: 1
+    }
+  });
+  
+  return agent;
+}
+
 // Handle credit amount input
 async function handleAddCreditAmount(bot, msg, userStates, userId) {
   const chatId = msg.chat.id;
@@ -1049,6 +1134,507 @@ const initializeBot = () => {
 
     switch (callbackData) {
       // Billing-specific callbacks
+	  case "user_select_sip_trunk":
+		  // Check user permissions
+		  const isApprovedUserSip = user.approvalStatus === 'approved' && user.campaignSettingsComplete;
+		  const isAdminUserSip = userId == adminId || user.userType === 'admin';
+		  
+		  if (!isAdminUserSip && !isApprovedUserSip) {
+			bot.sendMessage(chatId, 
+			  "❌ *Access Denied*\n\nYou need to be approved and have complete campaign settings to select SIP trunk.",
+			  { parse_mode: "Markdown" }
+			);
+			return;
+		  }
+		  
+		  try {
+			const sipTrunks = await getUserSipTrunks();
+			
+			if (sipTrunks.length === 0) {
+			  bot.sendMessage(
+				chatId,
+				`🌐 *No SIP Trunks Available*\n\nNo active SIP trunks are configured in the system.\n\nPlease contact the administrator.`,
+				{ parse_mode: "Markdown" }
+			  );
+			  return;
+			}
+			
+			// Get user's current campaign to show current selection
+			let userCampaignSip = await Campaign.findOne({
+			  where: { createdBy: user.telegramId },
+			  include: [{ model: SipPeer, as: 'sipTrunk' }]
+			});
+			
+			if (!userCampaignSip) {
+			  // Create campaign if it doesn't exist
+			  userCampaignSip = await Campaign.create({
+				botToken: config.telegram_bot_token,
+				campaignName: `${user.firstName || user.username || 'User'}'s Campaign`,
+				createdBy: user.telegramId,
+				concurrentCalls: 30,
+				notificationsChatId: chatId,
+				isActive: true
+			  });
+			}
+			
+			let trunkList = "🌐 *Select SIP Trunk for Outbound Calls*\n\n";
+			
+			if (userCampaignSip.sipTrunk) {
+			  trunkList += `📍 *Current Selection:* ${escapeMarkdown(userCampaignSip.sipTrunk.name)}\n\n`;
+			}
+			
+			trunkList += "*Available SIP Trunks:*\n\n";
+			
+			sipTrunks.forEach((trunk, index) => {
+			  const isSelected = userCampaignSip.sipTrunkId === trunk.id ? " ✅" : "";
+			  trunkList += `${index + 1}. *${escapeMarkdown(trunk.name)}*${isSelected}\n`;
+			  trunkList += `   📍 Host: ${escapeMarkdown(trunk.host)}\n`;
+			  trunkList += `   👤 Username: ${escapeMarkdown(trunk.username || trunk.defaultuser || 'N/A')}\n`;
+			  if (trunk.description) {
+				trunkList += `   📝 ${escapeMarkdown(trunk.description)}\n`;
+			  }
+			  trunkList += `   🔌 Status: ${trunk.status ? '✅ Active' : '❌ Inactive'}\n\n`;
+			});
+			
+			trunkList += "Enter the number of the SIP trunk you want to use:";
+			
+			bot.sendMessage(chatId, trunkList, { parse_mode: "Markdown" });
+			userStates[userId] = { 
+			  action: "user_waiting_sip_selection", 
+			  sipTrunks: sipTrunks,
+			  campaignId: userCampaignSip.id 
+			};
+			
+		  } catch (error) {
+			console.error('Error in user_select_sip_trunk:', error);
+			bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+		  }
+		  break;
+		  
+		 case "user_destination_route":
+		  // Check user permissions
+		  const isApprovedUserDestRoute = user.approvalStatus === 'approved' && user.campaignSettingsComplete;
+		  const isAdminUserDestRoute = userId == adminId || user.userType === 'admin';
+		  
+		  if (!isAdminUserDestRoute && !isApprovedUserDestRoute) {
+			bot.sendMessage(chatId, 
+			  "❌ *Access Denied*\n\nYou need to be approved and have complete campaign settings to set destination route.",
+			  { parse_mode: "Markdown" }
+			);
+			return;
+		  }
+		  
+		  // Get user's current campaign to show current selection
+		  let userCampaignDestRoute = await Campaign.findOne({
+			where: { createdBy: user.telegramId }
+		  });
+		  
+		  if (!userCampaignDestRoute) {
+			// Create campaign if it doesn't exist
+			userCampaignDestRoute = await Campaign.create({
+			  botToken: config.telegram_bot_token,
+			  campaignName: `${user.firstName || user.username || 'User'}'s Campaign`,
+			  createdBy: user.telegramId,
+			  concurrentCalls: 30,
+			  notificationsChatId: chatId,
+			  isActive: true
+			});
+		  }
+		  
+		  let message = "🎯 *Set Destination Route*\n\n";
+		  
+		  // Show current destination route if exists
+		  if (userCampaignDestRoute.destinationRoute) {
+			message += `📍 *Current Route:* ${escapeMarkdown(userCampaignDestRoute.destinationRoute)}\n\n`;
+		  } else {
+			message += `📍 *Current Route:* Not set\n\n`;
+		  }
+		  
+		  message += "Choose the type of destination for your calls:";
+		  
+		  bot.sendMessage(
+			chatId,
+			message,
+			{
+			  parse_mode: "Markdown",
+			  reply_markup: {
+				inline_keyboard: [
+				  [
+					{ text: "🌐 SIP Trunk", callback_data: "dest_route_sip" },
+					{ text: "👤 Agent/Extension", callback_data: "dest_route_agent" }
+				  ],
+				  [
+					{ text: "🗑️ Clear Route", callback_data: "dest_route_clear" }
+				  ],
+				  [
+					{ text: "🔙 Back to Menu", callback_data: "back_to_menu" }
+				  ]
+				]
+			  }
+			}
+		  );
+		  break;
+
+		case "dest_route_sip":
+		  // Show SIP trunk selection for destination route
+		  try {
+			const sipTrunks = await getUserAssociatedTrunks(userId);
+			
+			if (sipTrunks.length === 0) {
+			  bot.sendMessage(
+				chatId,
+				`🌐 *No SIP Trunks Available*\n\nNo active SIP trunks are configured in the system.\n\nPlease contact the administrator.`,
+				{ parse_mode: "Markdown" }
+			  );
+			  return;
+			}
+			
+			// Get user's current campaign
+			let userCampaignSipRoute = await Campaign.findOne({
+			  where: { createdBy: user.telegramId }
+			});
+			
+			if (!userCampaignSipRoute) {
+			  userCampaignSipRoute = await Campaign.create({
+				botToken: config.telegram_bot_token,
+				campaignName: `${user.firstName || user.username || 'User'}'s Campaign`,
+				createdBy: user.telegramId,
+				concurrentCalls: 30,
+				notificationsChatId: chatId,
+				isActive: true
+			  });
+			}
+			
+			let trunkList = "🌐 *Select SIP Trunk for Destination Route*\n\n";
+			
+			// Check if current destination route is a trunk and highlight it
+			let currentTrunkName = null;
+			if (userCampaignSipRoute.destinationRoute && userCampaignSipRoute.destinationRoute.startsWith('trunk/')) {
+			  currentTrunkName = userCampaignSipRoute.destinationRoute.replace('trunk/', '');
+			  trunkList += `📍 *Current Route:* ${escapeMarkdown(userCampaignSipRoute.destinationRoute)}\n\n`;
+			}
+			
+			trunkList += "*Available SIP Trunks:*\n\n";
+			
+			sipTrunks.forEach((trunk, index) => {
+			  const isSelected = currentTrunkName === trunk.name ? " ✅" : "";
+			  trunkList += `${index + 1}. *${escapeMarkdown(trunk.name)}*${isSelected}\n`;
+			  trunkList += `   📍 Host: ${escapeMarkdown(trunk.host)}\n`;
+			  trunkList += `   👤 Username: ${escapeMarkdown(trunk.username || trunk.defaultuser || 'N/A')}\n`;
+			  if (trunk.description) {
+				trunkList += `   📝 ${escapeMarkdown(trunk.description)}\n`;
+			  }
+			  trunkList += `   🔌 Status: ${trunk.status ? '✅ Active' : '❌ Inactive'}\n\n`;
+			});
+			
+			trunkList += "Enter the number of the SIP trunk for destination route:";
+			
+			bot.sendMessage(chatId, trunkList, { parse_mode: "Markdown" });
+			userStates[userId] = { 
+			  action: "dest_route_waiting_trunk", 
+			  sipTrunks: sipTrunks,
+			  campaignId: userCampaignSipRoute.id 
+			};
+			
+		  } catch (error) {
+			console.error('Error in dest_route_sip:', error);
+			bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+		  }
+		  break;
+
+		
+
+		case "dest_route_agent":
+		  // Show agent selection for destination route - UPDATED to use user's agents
+		  try {
+			const userAssociatedAgents = await getUserAssociatedAgents(userId);
+			
+			if (userAssociatedAgents.length === 0) {
+			  bot.sendMessage(
+				chatId,
+				`👤 *No Associated Agents*\n\nYou don't have any agents associated with your account.\n\nPlease contact the administrator to assign agents to your account.`,
+				{ 
+				  parse_mode: "Markdown",
+				  reply_markup: {
+					inline_keyboard: [
+					  [{ text: "🔙 Back to Menu", callback_data: "back_to_menu" }]
+					]
+				  }
+				}
+			  );
+			  return;
+			}
+			
+			// Get user's current campaign
+			let userCampaignAgentRoute = await Campaign.findOne({
+			  where: { createdBy: user.telegramId }
+			});
+			
+			if (!userCampaignAgentRoute) {
+			  userCampaignAgentRoute = await Campaign.create({
+				botToken: config.telegram_bot_token,
+				campaignName: `${user.firstName || user.username || 'User'}'s Campaign`,
+				createdBy: user.telegramId,
+				concurrentCalls: 30,
+				notificationsChatId: chatId,
+				isActive: true
+			  });
+			}
+			
+			let agentList = "👤 *Select Your Associated Agent*\n\n";
+			
+			// Check if current destination route is an agent and highlight it
+			let currentAgentName = null;
+			if (userCampaignAgentRoute.destinationRoute && userCampaignAgentRoute.destinationRoute.startsWith('agent/')) {
+			  currentAgentName = userCampaignAgentRoute.destinationRoute.replace('agent/', '');
+			  agentList += `📍 *Current Route:* ${escapeMarkdown(userCampaignAgentRoute.destinationRoute)}\n\n`;
+			}
+			
+			agentList += "*Your Associated Agents:*\n\n";
+			
+			userAssociatedAgents.forEach((agent, index) => {
+			  const isSelected = currentAgentName === agent.name ? " ✅" : "";
+			  agentList += `${index + 1}. *${escapeMarkdown(agent.name)}*${isSelected}\n`;
+			  agentList += `   📞 Extension: ${escapeMarkdown(agent.defaultuser || agent.username || 'N/A')}\n`;
+			  agentList += `   🏷️ Category: ${escapeMarkdown(agent.category || 'Agent')}\n`;
+			  if (agent.description) {
+				agentList += `   📝 ${escapeMarkdown(agent.description)}\n`;
+			  }
+			  agentList += `   🔌 Status: ${agent.status ? '✅ Active' : '❌ Inactive'}\n\n`;
+			});
+			
+			agentList += "Enter the number of the agent you want to use for destination route:";
+			
+			bot.sendMessage(chatId, agentList, { parse_mode: "Markdown" });
+			userStates[userId] = { 
+			  action: "dest_route_waiting_agent", 
+			  agents: userAssociatedAgents,
+			  campaignId: userCampaignAgentRoute.id 
+			};
+			
+		  } catch (error) {
+			console.error('Error in dest_route_agent:', error);
+			bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+		  }
+		  break;
+		
+		case "dest_route_clear":
+		  // Clear the destination route
+		  try {
+			let userCampaignClear = await Campaign.findOne({
+			  where: { createdBy: user.telegramId }
+			});
+			
+			if (userCampaignClear) {
+			  await userCampaignClear.update({ destinationRoute: null });
+			}
+			
+			// Also clear from user
+			await user.update({ destinationRoute: null });
+			
+			bot.sendMessage(
+			  chatId,
+			  `✅ *Destination Route Cleared*\n\nThe destination route has been removed from your campaign settings.`,
+			  { parse_mode: "Markdown", ...getUserMenu(user) }
+			);
+			
+		  } catch (error) {
+			console.error('Error clearing destination route:', error);
+			bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+		  }
+		  break;
+	  case "user_set_caller_id":
+		  // Check user permissions
+		  const isApprovedUserCallerId = user.approvalStatus === 'approved' && user.campaignSettingsComplete;
+		  const isAdminUserCallerId = userId == adminId || user.userType === 'admin';
+		  
+		  if (!isAdminUserCallerId && !isApprovedUserCallerId) {
+			bot.sendMessage(chatId, 
+			  "❌ *Access Denied*\n\nYou need to be approved and have complete campaign settings to modify caller ID.",
+			  { parse_mode: "Markdown" }
+			);
+			return;
+		  }
+		  
+		  // Get user's campaign
+		  let userCampaign = await Campaign.findOne({
+			where: { createdBy: user.telegramId }
+		  });
+		  
+		  if (!userCampaign) {
+			// Create campaign if it doesn't exist
+			userCampaign = await Campaign.create({
+			  botToken: config.telegram_bot_token,
+			  campaignName: `${user.firstName || user.username || 'User'}'s Campaign`,
+			  createdBy: user.telegramId,
+			  concurrentCalls: 30,
+			  notificationsChatId: chatId,
+			  isActive: true
+			});
+		  }
+		  
+		  const currentCallerId = userCampaign.callerId || 'Not set';
+		  bot.sendMessage(
+			chatId,
+			`📞 *Set Your Caller ID*\n\n` +
+			`Current Caller ID: ${escapeMarkdown(currentCallerId)}\n\n` +
+			`Please enter the phone number to use as your Caller ID.\n` +
+			`This number will be displayed to recipients when making calls.\n\n` +
+			`Formats accepted:\n` +
+			`• 1234567890\n` +
+			`• 11234567890\n` +
+			`• +11234567890\n` +
+			`• (123) 456-7890`,
+			{ parse_mode: "Markdown" }
+		  );
+		  userStates[userId] = { 
+			action: "user_waiting_caller_id", 
+			campaignId: userCampaign.id 
+		  };
+		  break;
+
+		case "user_set_dial_prefix":
+		  // Check user permissions
+		  const isApprovedUserPrefix = user.approvalStatus === 'approved' && user.campaignSettingsComplete;
+		  const isAdminUserPrefix = userId == adminId || user.userType === 'admin';
+		  
+		  if (!isAdminUserPrefix && !isApprovedUserPrefix) {
+			bot.sendMessage(chatId, 
+			  "❌ *Access Denied*\n\nYou need to be approved and have complete campaign settings to modify dial prefix.",
+			  { parse_mode: "Markdown" }
+			);
+			return;
+		  }
+		  
+		  // Get user's campaign
+		  let userCampaignPrefix = await Campaign.findOne({
+			where: { createdBy: user.telegramId }
+		  });
+		  
+		  if (!userCampaignPrefix) {
+			// Create campaign if it doesn't exist
+			userCampaignPrefix = await Campaign.create({
+			  botToken: config.telegram_bot_token,
+			  campaignName: `${user.firstName || user.username || 'User'}'s Campaign`,
+			  createdBy: user.telegramId,
+			  concurrentCalls: 30,
+			  notificationsChatId: chatId,
+			  isActive: true
+			});
+		  }
+		  
+		  const currentPrefix = userCampaignPrefix.dialPrefix || 'None';
+		  bot.sendMessage(
+			chatId,
+			`➕ *Set Your Dial Prefix*\n\n` +
+			`Current Dial Prefix: ${escapeMarkdown(currentPrefix)}\n\n` +
+			`Enter the prefix to add before all dialed numbers.\n\n` +
+			`Examples:\n` +
+			`• 9 (for outbound access)\n` +
+			`• 011 (for international calls)\n` +
+			`• 1 (for long distance)\n` +
+			`• Type "none" to remove prefix\n\n` +
+			`The prefix will be added to all numbers when dialing.`,
+			{ parse_mode: "Markdown" }
+		  );
+		  userStates[userId] = { 
+			action: "user_waiting_dial_prefix", 
+			campaignId: userCampaignPrefix.id 
+		  };
+		  break;
+	  case "manual_dial":
+		  // Check user permissions - only allow approved users or legacy permitted users
+		  const isApprovedUserManual = user.approvalStatus === 'approved' && user.campaignSettingsComplete;
+		  const isAdminUserManual = userId == adminId || user.userType === 'admin';
+		  
+		  // Check if user is in the Allowed table (legacy permission system)
+		  let permittedUserManual = await Allowed.findOne({ 
+			where: { telegramId: userId } 
+		  });
+		  
+		  console.log(`Request from User ${userId} for manual_dial`);
+		  console.log(`User approval status: ${user.approvalStatus}, Campaign complete: ${user.campaignSettingsComplete}`);
+		  console.log(`Is admin: ${isAdminUserManual}, Is permitted (legacy): ${!!permittedUserManual}, Is approved user: ${isApprovedUserManual}`);
+		  
+		  // Allow access if user is admin OR approved with complete settings OR in legacy allowed list
+		  if (!isAdminUserManual && !isApprovedUserManual && !permittedUserManual) {
+			console.log("❌ Access denied for manual_dial!");
+			bot.sendMessage(chatId, 
+			  "❌ *Access Denied*\n\nYou need to be approved and have complete campaign settings to use manual dial.",
+			  { parse_mode: "Markdown" }
+			);
+			return;
+		  }
+		  
+		  const campaignManual = await getOrCreateCampaign(userId);
+		  
+		  if (!campaignManual.notificationsChatId) {
+			await campaignManual.update({ notificationsChatId: chatId });
+			// Reload the campaign to get updated data
+			await campaignManual.reload({
+			  include: [{ model: SipPeer, as: 'sipTrunk' }]
+			});
+		  }
+		  
+		  // Check if user has required campaign settings
+		  if (!campaignManual.sipTrunkId || !campaignManual.callerId) {
+			const missingSettings = [];
+			if (!campaignManual.sipTrunkId) missingSettings.push("SIP Trunk");
+			if (!campaignManual.callerId) missingSettings.push("Caller ID");
+			
+			bot.sendMessage(
+			  chatId,
+			  `❌ *Manual Dial Unavailable*\n\n` +
+			  `Missing required settings:\n` +
+			  `${missingSettings.map(s => `• ${s}`).join('\n')}\n\n` +
+			  `Please configure these settings first.`,
+			  { parse_mode: "Markdown" }
+			);
+			return;
+		  }
+		  
+		  if (campaignManual.destinationRoute) {
+			if (campaignManual.destinationRoute.startsWith('agent/')) {
+			  const hasAgents = await userHasAssociatedAgents(userId);
+			  if (!hasAgents) {
+				bot.sendMessage(
+				  chatId,
+				  `❌ *Manual Dial Unavailable*\n\n` +
+				  `Your destination is set to an agent, but you have no associated agents.\n\n` +
+				  `Please contact the administrator to assign agents to your account or change your destination route.`,
+				  { parse_mode: "Markdown" }
+				);
+				return;
+			  }
+			}
+		  }
+		  
+		  // Show current destination route in the dial info
+		  let destinationInfo = '';
+		  if (campaignManual.destinationRoute) {
+			destinationInfo = `\nDestination Route: ${escapeMarkdown(campaignManual.destinationRoute)}`;
+		  }
+		  
+		  bot.sendMessage(
+			chatId,
+			`📞 *Manual Dial*\n\n` +
+			`SIP Trunk: ${escapeMarkdown(campaignManual.sipTrunk ? campaignManual.sipTrunk.name : 'N/A')}\n` +
+			`Caller ID: ${escapeMarkdown(campaignManual.callerId)}\n` +
+			`Dial Prefix: ${escapeMarkdown(campaignManual.dialPrefix || 'None')}${destinationInfo}\n\n` +
+			`Enter the phone number to dial:\n\n` +
+			`Formats accepted:\n` +
+			`• 1234567890\n` +
+			`• +1234567890\n` +
+			`• 011234567890\n` +
+			`• (123) 456-7890`,
+			{ parse_mode: "Markdown" }
+		  );
+		  userStates[userId] = { 
+			action: "waiting_manual_dial_number", 
+			campaignId: campaignManual.id 
+		  };
+		  break;
+  
       case "check_balance":
         if (!user.rateCardId) {
           bot.sendMessage(chatId, "💳 No rate card assigned. Contact administrator.");
@@ -1760,11 +2346,11 @@ const initializeBot = () => {
         }
         
         const campaignForPrefix = await getOrCreateCampaign(userId);
-        const currentPrefix = campaignForPrefix.dialPrefix || 'None';
+        const currentPrefix1 = campaignForPrefix.dialPrefix || 'None';
         bot.sendMessage(
           chatId,
           `➕ *Set Dial Prefix*\n\n` +
-          `Current Dial Prefix: ${currentPrefix}\n\n` +
+          `Current Dial Prefix: ${currentPrefix1}\n\n` +
           `Enter the prefix to add before all dialed numbers.\n` +
           `Examples:\n` +
           `• 9 (for outbound access)\n` +
@@ -1825,6 +2411,22 @@ const initializeBot = () => {
 
 		  if (campaign) {
 			// Update existing campaign with user's current settings
+			if (user.callerId && !campaign.callerId) {
+			  await campaign.update({ callerId: user.callerId });
+			}
+			if (user.dialPrefix !== undefined && user.dialPrefix !== null && !campaign.dialPrefix) {
+			  await campaign.update({ dialPrefix: user.dialPrefix });
+			}
+			
+			if (user.destinationRoute && !campaignForManualDial.destinationRoute) {
+			  await campaignForManualDial.update({ destinationRoute: user.destinationRoute });
+			}
+
+			// In start campaign case, add after campaign sync:
+			if (user.destinationRoute && !campaign.destinationRoute) {
+			  await campaign.update({ destinationRoute: user.destinationRoute });
+			}
+
 			await campaign.update({
 			  sipTrunkId: user.sipTrunkId,
 			  callbackTrunkId: user.callbackTrunkId,
@@ -2055,11 +2657,11 @@ const initializeBot = () => {
         }
         
         const campaignForCallerId = await getOrCreateCampaign(userId);
-        const currentCallerId = campaignForCallerId.callerId || 'Not set';
+        const currentCallerId1 = campaignForCallerId.callerId || 'Not set';
         bot.sendMessage(
           chatId,
           `📞 *Set Caller ID*\n\n` +
-          `Current Caller ID: ${escapeMarkdown(currentCallerId)}\n\n` +
+          `Current Caller ID: ${escapeMarkdown(currentCallerId1)}\n\n` +
           `Please enter the phone number to use as Caller ID.\n` +
           `Formats accepted:\n` +
           `• 1234567890\n` +
@@ -2812,11 +3414,11 @@ case "debug_billing_data":
 				  ],
 				  [
 					{ text: '➕ Change Dial Prefix', callback_data: `admin_set_prefix_${selectedUser.id}` },
-					{ text: '🔢 Change Concurrent Calls', callback_data: `admin_set_concurrent_${selectedUser.id}` }
+					//{ text: '🔢 Change Concurrent Calls', callback_data: `admin_set_concurrent_${selectedUser.id}` }
 				  ],
-				  [
-					{ text: '🔢 Change DTMF Digit', callback_data: `admin_set_dtmf_${selectedUser.id}` },
-				  ],
+				  //[
+					//{ text: '🔢 Change DTMF Digit', callback_data: `admin_set_dtmf_${selectedUser.id}` },
+				  //],
 				  [
 					{ text: '✅ Finish Setup', callback_data: `admin_finish_user_setup_${selectedUser.id}` }
 				  ],
@@ -3393,6 +3995,285 @@ case "debug_billing_data":
     if (!userState) return;
 	
     switch (userState.action) {
+		case "dest_route_waiting_trunk":
+		  const destTrunkSelection = parseInt(text);
+		  if (isNaN(destTrunkSelection) || destTrunkSelection < 1 || destTrunkSelection > userState.sipTrunks.length) {
+			bot.sendMessage(chatId, "❌ Invalid selection. Please enter a valid number.");
+			return;
+		  }
+		  
+		  const selectedDestTrunk = userState.sipTrunks[destTrunkSelection - 1];
+		  const destinationRouteValue = `trunk/${selectedDestTrunk.name}`;
+		  
+		  try {
+			const userCampaignDestTrunk = await Campaign.findByPk(userState.campaignId);
+			await userCampaignDestTrunk.update({ 
+			  destinationRoute: destinationRouteValue
+			});
+			
+			// Also update the user's destination route
+			await user.update({ 
+			  destinationRoute: destinationRouteValue
+			});
+			
+			bot.sendMessage(
+			  chatId,
+			  `✅ *Destination Route Set Successfully!*\n\n` +
+			  `Selected Trunk: ${escapeMarkdown(selectedDestTrunk.name)}\n` +
+			  `Host: ${escapeMarkdown(selectedDestTrunk.host)}\n` +
+			  `Username: ${escapeMarkdown(selectedDestTrunk.username || selectedDestTrunk.defaultuser || 'N/A')}\n` +
+			  `Destination Route: ${escapeMarkdown(destinationRouteValue)}\n\n` +
+			  `This route will be used for call destinations.`,
+			  { parse_mode: "Markdown", ...getUserMenu(user) }
+			);
+			
+		  } catch (error) {
+			console.error('Error updating destination route trunk:', error);
+			bot.sendMessage(chatId, `❌ Error updating destination route: ${error.message}`);
+		  }
+		  
+		  delete userStates[userId];
+		  break;
+
+		case "dest_route_waiting_agent":
+		  const destAgentSelection = parseInt(text);
+		  if (isNaN(destAgentSelection) || destAgentSelection < 1 || destAgentSelection > userState.agents.length) {
+			bot.sendMessage(chatId, "❌ Invalid selection. Please enter a valid number.");
+			return;
+		  }
+		  
+		  const selectedDestAgent = userState.agents[destAgentSelection - 1];
+		  
+		  // Validate that the agent is still associated with this user
+		  /*const validAgent = await validateUserAgent(userId, selectedDestAgent.id);
+		  if (!validAgent) {
+			bot.sendMessage(
+			  chatId,
+			  `❌ *Agent No Longer Available*\n\nThe selected agent is no longer associated with your account.\n\nPlease contact the administrator or try again.`,
+			  { parse_mode: "Markdown", ...getUserMenu(user) }
+			);
+			delete userStates[userId];
+			return;
+		  }*/
+		  
+		  const destinationRouteAgent = `agent/${selectedDestAgent.name}`;
+		  
+		  try {
+			const userCampaignDestAgent = await Campaign.findByPk(userState.campaignId);
+			await userCampaignDestAgent.update({ 
+			  destinationRoute: destinationRouteAgent
+			});
+			
+			// Also update the user's destination route
+			await user.update({ 
+			  destinationRoute: destinationRouteAgent
+			});
+			
+			bot.sendMessage(
+			  chatId,
+			  `✅ *Destination Route Set Successfully!*\n\n` +
+			  `Selected Agent: ${escapeMarkdown(selectedDestAgent.name)}\n` +
+			  `Extension: ${escapeMarkdown(selectedDestAgent.defaultuser || selectedDestAgent.username || 'N/A')}\n` +
+			  `Category: ${escapeMarkdown(selectedDestAgent.category || 'Agent')}\n` +
+			  `Destination Route: ${escapeMarkdown(destinationRouteAgent)}\n\n` +
+			  `This route will be used for call destinations.`,
+			  { parse_mode: "Markdown", ...getUserMenu(user) }
+			);
+			
+		  } catch (error) {
+			console.error('Error updating destination route agent:', error);
+			bot.sendMessage(chatId, `❌ Error updating destination route: ${error.message}`);
+		  }
+		  
+		  delete userStates[userId];
+		  break;
+		  
+		case "user_waiting_sip_selection":
+		  const userSipSelection = parseInt(text);
+		  if (isNaN(userSipSelection) || userSipSelection < 1 || userSipSelection > userState.sipTrunks.length) {
+			bot.sendMessage(chatId, "❌ Invalid selection. Please enter a valid number.");
+			return;
+		  }
+		  
+		  const selectedUserSipTrunk = userState.sipTrunks[userSipSelection - 1];
+		  
+		  try {
+			const userCampaignSip = await Campaign.findByPk(userState.campaignId);
+			await userCampaignSip.update({ sipTrunkId: selectedUserSipTrunk.id });
+			
+			// Also update the user's SIP trunk for consistency
+			await user.update({ sipTrunkId: selectedUserSipTrunk.id });
+			
+			bot.sendMessage(
+			  chatId,
+			  `✅ *SIP Trunk Selected Successfully!*\n\n` +
+			  `Selected: ${escapeMarkdown(selectedUserSipTrunk.name)}\n` +
+			  `Host: ${escapeMarkdown(selectedUserSipTrunk.host)}\n` +
+			  `Username: ${escapeMarkdown(selectedUserSipTrunk.username || selectedUserSipTrunk.defaultuser || 'N/A')}\n\n` +
+			  `This SIP trunk will be used for all your outbound calls.`,
+			  { parse_mode: "Markdown", ...getUserMenu(user) }
+			);
+			
+		  } catch (error) {
+			console.error('Error updating user SIP trunk:', error);
+			bot.sendMessage(chatId, `❌ Error updating SIP trunk: ${error.message}`);
+		  }
+		  
+		  delete userStates[userId];
+		  break;
+		  
+		case "user_waiting_caller_id":
+		  const userCallerIdValidation = validateCallerId(text);
+		  if (!userCallerIdValidation.valid) {
+			bot.sendMessage(chatId, `❌ ${userCallerIdValidation.message}`);
+			return;
+		  }
+		  
+		  const userCampaignCallerId = await Campaign.findByPk(userState.campaignId);
+		  await userCampaignCallerId.update({ callerId: userCallerIdValidation.formatted });
+		  
+		  // Also update the user's caller ID for consistency
+		  await user.update({ callerId: userCallerIdValidation.formatted });
+		  
+		  bot.sendMessage(
+			chatId,
+			`✅ *Caller ID Set Successfully!*\n\n` +
+			`Your Caller ID: ${escapeMarkdown(userCallerIdValidation.formatted)}\n\n` +
+			`This number will be displayed to recipients when you make calls.`,
+			{ parse_mode: "Markdown", ...getUserMenu(user) }
+		  );
+		  delete userStates[userId];
+		  break;
+
+		case "user_waiting_dial_prefix":
+		  let userPrefix = text.trim();
+		  
+		  // Handle "none" to remove prefix
+		  if (userPrefix.toLowerCase() === 'none') {
+			userPrefix = '';
+		  }
+		  
+		  // Validate prefix - should only contain digits or be empty
+		  if (userPrefix && !/^\d*$/.test(userPrefix)) {
+			bot.sendMessage(chatId, "❌ Prefix should only contain numbers or type 'none' to remove.");
+			return;
+		  }
+		  
+		  const userCampaignPrefix = await Campaign.findByPk(userState.campaignId);
+		  await userCampaignPrefix.update({ dialPrefix: userPrefix });
+		  
+		  // Also update the user's dial prefix for consistency
+		  await user.update({ dialPrefix: userPrefix });
+		  
+		  bot.sendMessage(
+			chatId,
+			`✅ *Dial Prefix ${userPrefix ? 'Set' : 'Removed'} Successfully!*\n\n` +
+			`${userPrefix ? 
+			  `Prefix: ${escapeMarkdown(userPrefix)}\n\nAll numbers will be dialed as: ${escapeMarkdown(userPrefix)} + [phone number]` : 
+			  'No prefix will be added to dialed numbers.'
+			}`,
+			{ parse_mode: "Markdown", ...getUserMenu(user) }
+		  );
+		  delete userStates[userId];
+		  break;
+		  
+		case "waiting_manual_dial_number":
+		  const manualDialNumber = sanitize_phoneNumber(text.trim());
+		  if (!manualDialNumber) {
+			bot.sendMessage(
+			  chatId, 
+			  "❌ Invalid phone number format. Please enter a valid phone number.\n\n" +
+			  "Accepted formats:\n" +
+			  "• 1234567890\n" +
+			  "• +1234567890\n" +
+			  "• 011234567890\n" +
+			  "• (123) 456-7890"
+			);
+			return;
+		  }
+		  
+		  const campaignForManualDial = await Campaign.findByPk(userState.campaignId, {
+			include: [{ model: SipPeer, as: 'sipTrunk' }]
+		  });
+		  if (user.callerId && !campaignForManualDial.callerId) {
+			  await campaignForManualDial.update({ callerId: user.callerId });
+			  await campaignForManualDial.reload({ include: [{ model: SipPeer, as: 'sipTrunk' }] });
+			}
+			if (user.dialPrefix !== undefined && user.dialPrefix !== null && !campaignForManualDial.dialPrefix) {
+			  await campaignForManualDial.update({ dialPrefix: user.dialPrefix });
+			  await campaignForManualDial.reload({ include: [{ model: SipPeer, as: 'sipTrunk' }] });
+			}
+		  // Validate campaign has required settings
+		  if (!campaignForManualDial.sipTrunk) {
+			bot.sendMessage(
+			  chatId,
+			  `❌ *Manual Dial Failed*\n\nSIP Trunk not found. Please configure your SIP trunk first.`,
+			  { parse_mode: "Markdown", ...getUserMenu(user) }
+			);
+			delete userStates[userId];
+			return;
+		  }
+		  
+		  // *** FIX: Ensure campaign has notificationsChatId ***
+		  if (!campaignForManualDial.notificationsChatId) {
+			await campaignForManualDial.update({ notificationsChatId: chatId });
+		  }
+		  
+		  // Set campaign settings before dialing
+		  set_settings({
+			notifications_chat_id: chatId,  // *** FIX: Use chatId directly ***
+			concurrent_calls: campaignForManualDial.concurrentCalls || 1,
+			sip_trunk: campaignForManualDial.sipTrunk,
+			caller_id: campaignForManualDial.callerId,
+			dial_prefix: campaignForManualDial.dialPrefix || '',
+			campaign_id: campaignForManualDial.id,
+			dtmf_digit: campaignForManualDial.dtmfDigit || '1',
+			ivr_intro_file: campaignForManualDial.ivrIntroFile,
+			ivr_outro_file: campaignForManualDial.ivrOutroFile
+		  });
+		  
+		  try {
+			// Create a single lead entry and start dialing
+			const leadData = [{
+			  phoneNumber: manualDialNumber,
+			  rawLine: `manual-dial-${manualDialNumber}`
+			}];
+			
+			// Create database entry for this call
+			await Call.create({
+			  phoneNumber: `+${manualDialNumber}`,
+			  rawLine: `manual-dial-${manualDialNumber}`,
+			  used: false,
+			  campaignId: campaignForManualDial.id,
+			  callStatus: 'pending'
+			});
+			
+			bot.sendMessage(
+			  chatId,
+			  `🚀 *Manual Dial Started*\n\n` +
+			  `Dialing: ${escapeMarkdown(manualDialNumber)}\n` +
+			  `SIP Trunk: ${escapeMarkdown(campaignForManualDial.sipTrunk.name)}\n` +
+			  `Caller ID: ${escapeMarkdown(campaignForManualDial.callerId)}\n` +
+			  `Dial Prefix: ${escapeMarkdown(campaignForManualDial.dialPrefix || 'None')}\n\n` +
+			  `Call initiated successfully. You'll receive notifications about the call progress.`,
+			  { parse_mode: "Markdown", ...getUserMenu(user) }
+			);
+			
+			// Start the calling process using existing infrastructure
+			startCallingProcess(leadData, campaignForManualDial, user.telegramId);
+			
+		  } catch (error) {
+			console.error('Manual dial error:', error);
+			bot.sendMessage(
+			  chatId,
+			  `❌ *Manual Dial Failed*\n\nError: ${escapeMarkdown(error.message)}`,
+			  { parse_mode: "Markdown", ...getUserMenu(user) }
+			);
+		  }
+		  
+		  delete userStates[userId];
+		  break;
+		  
 		case "waiting_callback_trunk_number":
 		  const callbackTrunkNum = text.trim();
 		  
@@ -3949,6 +4830,7 @@ case "debug_billing_data":
 		console.log(`[File] Processing action: ${userState.action}`);
 		
 		switch (userState.action) {		
+		  
 		  case "waiting_callback_file":
 			  if (!msg.document) {
 				bot.sendMessage(chatId, "❌ Please upload a TXT document file.");
@@ -4017,7 +4899,7 @@ case "debug_billing_data":
 			  );
 			  delete userStates[userId];
 			  break;
-
+		  
 		  case 'admin_setting_callerid':
 			  await handleAdminSetCallerId(bot, msg, userStates, userId);
 			  break;

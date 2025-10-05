@@ -159,7 +159,6 @@ async function makeBillingCall(entry) {
       variables.__CAMPAIGN_OUTRO = settings.ivr_outro_file;
     }
     
-	let destinationRoute;
 	if (!userDetails.destinationRoute && !campaignDetails.destinationRoute) {
       console.log('Destination Route not set');
     }
@@ -169,11 +168,26 @@ async function makeBillingCall(entry) {
 	else if (!userDetails.destinationRoute && campaignDetails.destinationRoute) {
 		variables.__DESTINATION_ROUTE = campaignDetails.destinationRoute;
 	}
+	else if (userDetails.destinationRoute && campaignDetails.destinationRoute) {
+		variables.__DESTINATION_ROUTE = campaignDetails.destinationRoute;
+	}
 	
 	variables.__DTMF_DIGIT = settings.dtmf_digit || '1';
 	variables.__DESTINATION_NUMBER = number;
 	variables.__SPOOL_ID = actionId
 	
+	console.log(userDetails.destinationRoute, campaignDetails.destinationRoute, {
+        action: "Originate",
+        channel: `SIP/${trunkName}/${dialedNumber}`,
+        context: `outbound-${settings?.agent || "coinbase"}`,
+        exten: number,
+        priority: 1,
+        actionid: actionId,
+        variable: Object.entries(variables).map(([key, value]) => `${key}=${value}`),
+        CallerID: callerId,
+        async: true,
+      })
+	  
     ami.action(
       {
         action: "Originate",

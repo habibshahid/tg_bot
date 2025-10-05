@@ -423,11 +423,6 @@ const SipPeer = sequelize.define('SipPeer', {
     type: DataTypes.STRING(10),
     allowNull: true
   },
-  telegramId: {
-    type: DataTypes.STRING(50),
-    allowNull: true,
-	field: 'telegram_id'
-  },
   auto_answer: {
     type: DataTypes.INTEGER,
     defaultValue: 0
