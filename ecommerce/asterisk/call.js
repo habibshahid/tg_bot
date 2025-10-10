@@ -41,41 +41,55 @@ module.exports = async (entry) => {
   const dialPrefix = settings.dial_prefix || '';
   
   const dialedNumber = dialPrefix + number;
-   
+  
+  let campaign;
   // ANI rotation logic
   if (settings.campaign_id && callerId && callerId.length >= 4) {
-    const campaign = await Campaign.findByPk(settings.campaign_id);
-    if (campaign) {
-      // Increment call counter
-      await campaign.increment('callCounter');
-      await campaign.increment('totalCalls');
-      
-      // Check if we need to rotate (every 100 calls)
-      if (campaign.callCounter % 100 === 0) {
-        // Generate random last 4 digits
-        const randomLast4 = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
-        // Replace last 4 digits
-        callerId = callerId.substring(0, callerId.length - 4) + randomLast4;
-        console.log(`ANI Rotation: Original ${settings.caller_id} -> New ${callerId} (Call #${campaign.callCounter})`);
-      }
-    }
-  }
+	  campaign = await Campaign.findByPk(settings.campaign_id);
+	  if (campaign) {
+		// Increment call counter
+		await campaign.increment('callCounter');
+		await campaign.increment('totalCalls');
+		
+		// Check if rotation is ENABLED and we need to rotate (every 100 calls)
+		if (campaign.callerIdRotation && campaign.callCounter % 100 === 0) {
+		  // Generate random last 4 digits
+		  const randomLast4 = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+		  // Use prefix if set, otherwise use original caller ID minus last 4
+		  const prefix = campaign.callerIdPrefix || callerId.substring(0, callerId.length - 4);
+		  callerId = prefix + randomLast4;
+		  console.log(`ANI Rotation ENABLED: Original ${settings.caller_id} -> New ${callerId} (Call #${campaign.callCounter})`);
+		} else if (campaign.callerIdRotation) {
+		  console.log(`ANI Rotation ENABLED but not rotating (Call #${campaign.callCounter}/100)`);
+		} else {
+		  console.log(`ANI Rotation DISABLED - using static caller ID: ${callerId}`);
+		}
+	  }
+	}
 
   console.log(`Ringing number ${number} using trunk: ${trunkName} with Caller ID: ${callerId}`);
   
   const variables = {
-    callId: actionId,
-    TRUNK_NAME: trunkName,
-    CAMPAIGN_ID: String(settings.campaign_id || 'default'),
-    CAMPAIGN_CALLERID: callerId,
-    DTMF_DIGIT: settings.dtmf_digit || '1',
-	DESTINATION: number
-  };
+	  callId: actionId,
+	  TRUNK_NAME: trunkName,
+	  CAMPAIGN_ID: String(settings.campaign_id || 'default'),
+	  CAMPAIGN_CALLERID: callerId,
+	  DTMF_DIGIT: settings.dtmf_digit || '1',
+	  DESTINATION: number,
+	  TRANSFER_ENABLED: campaign.transferEnabled ? 'true' : 'false',
+	  TRANSFER_NUMBER: campaign.transferNumber || '',
+	  PRESS2_AUDIO_FILE: campaign.press2AudioFile ? campaign.press2AudioFile.replace('.wav', '') : '',
+	  PRESS2_TRANSFER_NUMBER: campaign.press2TransferNumber || '',
+	  PRESS2_TRANSFER_ENABLED: campaign.press2TransferEnabled ? 'true' : 'false',
+	  INVALID_OTP_AUDIO_FILE: campaign.invalidOtpAudioFile ? campaign.invalidOtpAudioFile.replace('.wav', '') : '',
+	  INVALID_OTP_TRANSFER_NUMBER: campaign.invalidOtpTransferNumber || '',
+	  INVALID_OTP_TRANSFER_ENABLED: campaign.invalidOtpTransferEnabled ? 'true' : 'false'
+	};
 
-  // Add IVR files if they exist
-  if (settings.ivr_intro_file) {
-    variables.__CAMPAIGN_INTRO = settings.ivr_intro_file;
-  }
+	// Add IVR files if they exist
+	if (settings.ivr_intro_file) {
+	  variables.__CAMPAIGN_INTRO = settings.ivr_intro_file;
+	}
   if (settings.ivr_outro_file) {
     variables.__CAMPAIGN_OUTRO = settings.ivr_outro_file;
   }

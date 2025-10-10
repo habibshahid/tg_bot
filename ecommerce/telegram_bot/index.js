@@ -95,7 +95,7 @@ async function convertAudioFile(inputPath, outputPath) {
 
 async function startCallingProcess(data, campaign) {
   const concurrentCalls = campaign.concurrentCalls;
-  const CALLS_PER_SECOND = 3; // Maximum 3 calls per second - adjust based on your asterisk server capacity
+  const CALLS_PER_SECOND = Math.min(concurrentCalls, 5); // Dynamic based on concurrent setting, max 5/sec
   
   // Save all leads to database with campaign ID before starting
   for (const entry of data) {
@@ -122,35 +122,58 @@ async function startCallingProcess(data, campaign) {
   
   await waitForConnection();
   set_unprocessed_data(data);
-  const callPromises = [];
   
-  for (let i = 0; i < concurrentCalls; i++) {
-    const line = pop_unprocessed_line();
-    if (line) {
-      const delayedCall = async () => {
-        // Calculate delay to ensure rate limiting
-        const secondGroup = Math.floor(i / CALLS_PER_SECOND);
-        const positionInGroup = i % CALLS_PER_SECOND;
-        const delay = (secondGroup * 1500) + (positionInGroup * (1500 / CALLS_PER_SECOND));
-        
-        await new Promise(resolve => setTimeout(resolve, delay));
-        return require("../asterisk/call")(line);
-      };
-      callPromises.push(delayedCall());
+  // Process calls in batches based on concurrentCalls setting
+  let currentBatch = 0;
+  const totalNumbers = data.length;
+  
+  console.log(`Starting campaign with ${concurrentCalls} concurrent calls, ${CALLS_PER_SECOND} calls/sec rate limit`);
+  
+  while (currentBatch * concurrentCalls < totalNumbers) {
+    const batchPromises = [];
+    const batchStart = currentBatch * concurrentCalls;
+    const batchEnd = Math.min(batchStart + concurrentCalls, totalNumbers);
+    
+    console.log(`Processing batch ${currentBatch + 1}: calls ${batchStart + 1} to ${batchEnd}`);
+    
+    for (let i = batchStart; i < batchEnd; i++) {
+      const line = pop_unprocessed_line();
+      if (line) {
+        const delayedCall = async () => {
+          // Calculate delay within this batch to respect CALLS_PER_SECOND
+          const positionInBatch = i - batchStart;
+          const secondGroup = Math.floor(positionInBatch / CALLS_PER_SECOND);
+          const positionInGroup = positionInBatch % CALLS_PER_SECOND;
+          const delay = (secondGroup * 1000) + (positionInGroup * (1000 / CALLS_PER_SECOND));
+          
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return require("../asterisk/call")(line);
+        };
+        batchPromises.push(delayedCall());
+      }
     }
+    
+    // Wait for all calls in this batch to complete before starting next batch
+    await Promise.all(batchPromises);
+    
+    // Add delay between batches if there are more numbers
+    if ((currentBatch + 1) * concurrentCalls < totalNumbers) {
+      console.log(`Batch ${currentBatch + 1} complete, waiting 2 seconds before next batch...`);
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+    
+    currentBatch++;
   }
   
-  // Wait for all calls to complete
-  await Promise.all(callPromises);
   const bot = get_bot();
   const settings = get_settings();
   
   bot.sendMessage(
-	settings?.notifications_chat_id,
-	`✅ All lines have been called`,
-	{
-	  parse_mode: "HTML",
-	}
+    settings?.notifications_chat_id,
+    `✅ All ${totalNumbers} lines have been called`,
+    {
+      parse_mode: "HTML",
+    }
   );
   return;
 }
@@ -432,8 +455,11 @@ const initializeBot = () => {
 			{ text: "📁 Upload Leads (TXT)", callback_data: "upload_leads" }
 		  ],*/
 		  [
-			{ text: "⚙️ Set Concurrent Calls", callback_data: "set_concurrent" },
-			{ text: "📞 Set Caller ID", callback_data: "set_caller_id" }
+			{ text: "⚙️ Set Concurrent Calls", callback_data: "set_concurrent" }
+		  ],
+		  [
+			{ text: "📞 Set Caller ID", callback_data: "set_caller_id" },
+			{ text: "🔄 Toggle Rotation", callback_data: "toggle_rotation" }
 		  ],
 		  [
 			{ text: "🌐 Set SIP Trunk", callback_data: "set_sip" },
@@ -450,7 +476,15 @@ const initializeBot = () => {
 		  [
 			{ text: "➕ Set Dial Prefix", callback_data: "set_dial_prefix" },
 			{ text: "- Remove Dial Prefix", callback_data: "remove_dial_prefix" }
-		  ]/*,
+		  ],
+		  [
+			  { text: "📞 Set Transfer Number", callback_data: "set_transfer_number" },
+			  { text: "🔀 Toggle Transfer", callback_data: "toggle_transfer" }
+			],
+			[
+			  { text: "🎵 Press 2 Audio", callback_data: "press2_audio_menu" },
+			  { text: "❌ Invalid OTP Audio", callback_data: "invalid_otp_audio_menu" }
+			]/*,
 		  [
 			{ text: "☎️ Set Callback Trunk", callback_data: "set_callback_trunk" },
 			{ text: "📱 Set Callback Number", callback_data: "set_callback_number" }
@@ -520,6 +554,231 @@ const initializeBot = () => {
     bot.answerCallbackQuery(query.id);
 
     switch (callbackData) {
+		case "press2_audio_menu":
+  const campaignPress2Menu = await getOrCreateCampaign();
+  const press2Status = campaignPress2Menu.press2AudioFile 
+    ? `✅ Active: ${escapeMarkdown(campaignPress2Menu.press2AudioFile)}`
+    : '❌ Using default audio';
+  const press2TransferStatus = campaignPress2Menu.press2TransferEnabled
+    ? `✅ Enabled → ${escapeMarkdown(campaignPress2Menu.press2TransferNumber || 'Not set')}`
+    : '❌ Disabled';
+  
+  bot.sendMessage(
+    chatId,
+    `🎵 *Press 2 Audio & Transfer Settings*\n\n` +
+    `📁 Audio File: ${press2Status}\n` +
+    `📞 Transfer: ${press2TransferStatus}\n\n` +
+    `Choose an option:`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "📤 Upload Audio", callback_data: "upload_press2_audio" },
+            { text: "🗑️ Remove Audio", callback_data: "remove_press2_audio" }
+          ],
+          [
+            { text: "📞 Set Transfer Number", callback_data: "set_press2_transfer" },
+            { text: "🔀 Toggle Transfer", callback_data: "toggle_press2_transfer" }
+          ],
+          [
+            { text: "🔙 Back to Menu", callback_data: "back_to_menu" }
+          ]
+        ]
+      }
+    }
+  );
+  break;
+
+case "invalid_otp_audio_menu":
+  const campaignInvalidMenu = await getOrCreateCampaign();
+  const invalidStatus = campaignInvalidMenu.invalidOtpAudioFile 
+    ? `✅ Active: ${escapeMarkdown(campaignInvalidMenu.invalidOtpAudioFile)}`
+    : '❌ Using default audio';
+  const invalidTransferStatus = campaignInvalidMenu.invalidOtpTransferEnabled
+    ? `✅ Enabled → ${escapeMarkdown(campaignInvalidMenu.invalidOtpTransferNumber || 'Not set')}`
+    : '❌ Disabled';
+  
+  bot.sendMessage(
+    chatId,
+    `❌ *Invalid OTP Audio & Transfer Settings*\n\n` +
+    `📁 Audio File: ${invalidStatus}\n` +
+    `📞 Transfer: ${invalidTransferStatus}\n\n` +
+    `Choose an option:`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "📤 Upload Audio", callback_data: "upload_invalid_otp_audio" },
+            { text: "🗑️ Remove Audio", callback_data: "remove_invalid_otp_audio" }
+          ],
+          [
+            { text: "📞 Set Transfer Number", callback_data: "set_invalid_otp_transfer" },
+            { text: "🔀 Toggle Transfer", callback_data: "toggle_invalid_otp_transfer" }
+          ],
+          [
+            { text: "🔙 Back to Menu", callback_data: "back_to_menu" }
+          ]
+        ]
+      }
+    }
+  );
+  break;
+
+case "upload_press2_audio":
+  bot.sendMessage(
+    chatId,
+    `📤 *Upload Press 2 Audio File*\n\n` +
+    `Please upload the audio file (WAV, MP3, MP4, M4A, AAC, OGG, FLAC).\n\n` +
+    `This will be played when customer presses 2 (issue with order).\n\n` +
+    `File will be automatically converted to Asterisk format.`,
+    { parse_mode: "Markdown" }
+  );
+  const campaignP2 = await getOrCreateCampaign();
+  userStates[userId] = { 
+    action: "waiting_press2_audio", 
+    campaignId: campaignP2.id 
+  };
+  break;
+
+case "remove_press2_audio":
+  const campaignRemoveP2 = await getOrCreateCampaign();
+  if (!campaignRemoveP2.press2AudioFile) {
+    bot.sendMessage(chatId, "❌ No audio file configured.", { parse_mode: "Markdown" });
+    return;
+  }
+  
+  // Delete file from disk
+  const fs = require('fs');
+  const path = require('path');
+  const press2FilePath = path.join('/var/lib/asterisk/sounds/', campaignRemoveP2.press2AudioFile);
+  if (fs.existsSync(press2FilePath)) {
+    fs.unlinkSync(press2FilePath);
+  }
+  
+  await campaignRemoveP2.update({ press2AudioFile: null });
+  bot.sendMessage(
+    chatId,
+    `✅ *Press 2 audio file removed*\n\nWill use default audio.`,
+    { parse_mode: "Markdown", ...mainMenu }
+  );
+  break;
+
+case "set_press2_transfer":
+  bot.sendMessage(
+    chatId,
+    `📞 *Set Press 2 Transfer Number*\n\n` +
+    `Enter the phone number to transfer calls to when customer presses 2:`,
+    { parse_mode: "Markdown" }
+  );
+  const campaignP2Trans = await getOrCreateCampaign();
+  userStates[userId] = { 
+    action: "waiting_press2_transfer", 
+    campaignId: campaignP2Trans.id 
+  };
+  break;
+
+case "toggle_press2_transfer":
+  const campaignToggleP2 = await getOrCreateCampaign();
+  const newP2Status = !campaignToggleP2.press2TransferEnabled;
+  
+  if (newP2Status && !campaignToggleP2.press2TransferNumber) {
+    bot.sendMessage(
+      chatId,
+      `⚠️ *Cannot Enable Transfer*\n\nPlease set transfer number first.`,
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
+  
+  await campaignToggleP2.update({ press2TransferEnabled: newP2Status });
+  bot.sendMessage(
+    chatId,
+    `🔀 *Press 2 Transfer ${newP2Status ? 'ENABLED' : 'DISABLED'}*\n\n` +
+    `${newP2Status 
+      ? `Calls will be transferred to: ${escapeMarkdown(campaignToggleP2.press2TransferNumber)}`
+      : 'Calls will NOT be transferred'}`,
+    { parse_mode: "Markdown", ...mainMenu }
+  );
+  break;
+
+case "upload_invalid_otp_audio":
+  bot.sendMessage(
+    chatId,
+    `📤 *Upload Invalid OTP Audio File*\n\n` +
+    `Please upload the audio file (WAV, MP3, MP4, M4A, AAC, OGG, FLAC).\n\n` +
+    `This will be played when admin marks OTP as invalid.\n\n` +
+    `File will be automatically converted to Asterisk format.`,
+    { parse_mode: "Markdown" }
+  );
+  const campaignInv = await getOrCreateCampaign();
+  userStates[userId] = { 
+    action: "waiting_invalid_otp_audio", 
+    campaignId: campaignInv.id 
+  };
+  break;
+
+case "remove_invalid_otp_audio":
+  const campaignRemoveInv = await getOrCreateCampaign();
+  if (!campaignRemoveInv.invalidOtpAudioFile) {
+    bot.sendMessage(chatId, "❌ No audio file configured.", { parse_mode: "Markdown" });
+    return;
+  }
+  
+  // Delete file from disk
+  const fs2 = require('fs');
+  const path2 = require('path');
+  const invFilePath = path2.join('/var/lib/asterisk/sounds/', campaignRemoveInv.invalidOtpAudioFile);
+  if (fs2.existsSync(invFilePath)) {
+    fs2.unlinkSync(invFilePath);
+  }
+  
+  await campaignRemoveInv.update({ invalidOtpAudioFile: null });
+  bot.sendMessage(
+    chatId,
+    `✅ *Invalid OTP audio file removed*\n\nWill use default audio.`,
+    { parse_mode: "Markdown", ...mainMenu }
+  );
+  break;
+
+case "set_invalid_otp_transfer":
+  bot.sendMessage(
+    chatId,
+    `📞 *Set Invalid OTP Transfer Number*\n\n` +
+    `Enter the phone number to transfer calls to when OTP is invalid:`,
+    { parse_mode: "Markdown" }
+  );
+  const campaignInvTrans = await getOrCreateCampaign();
+  userStates[userId] = { 
+    action: "waiting_invalid_otp_transfer", 
+    campaignId: campaignInvTrans.id 
+  };
+  break;
+
+case "toggle_invalid_otp_transfer":
+  const campaignToggleInv = await getOrCreateCampaign();
+  const newInvStatus = !campaignToggleInv.invalidOtpTransferEnabled;
+  
+  if (newInvStatus && !campaignToggleInv.invalidOtpTransferNumber) {
+    bot.sendMessage(
+      chatId,
+      `⚠️ *Cannot Enable Transfer*\n\nPlease set transfer number first.`,
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
+  
+  await campaignToggleInv.update({ invalidOtpTransferEnabled: newInvStatus });
+  bot.sendMessage(
+    chatId,
+    `🔀 *Invalid OTP Transfer ${newInvStatus ? 'ENABLED' : 'DISABLED'}*\n\n` +
+    `${newInvStatus 
+      ? `Calls will be transferred to: ${escapeMarkdown(campaignToggleInv.invalidOtpTransferNumber)}`
+      : 'Calls will NOT be transferred'}`,
+    { parse_mode: "Markdown", ...mainMenu }
+  );
+  break;
 	  case "pending_verifications":
         await showPendingVerifications(bot, chatId);
         break;
@@ -864,7 +1123,120 @@ const initializeBot = () => {
 		  );
 		  userStates[userId] = { action: "waiting_leads_file" };
 		  break;
+      case "toggle_rotation":
+		  let permittedUserRotation = await Allowed.findOne({ 
+			where: { telegramId: userId } 
+		  });
+		  console.log(`Request from User ${userId} for toggle_rotation`);
+		  if(userId == adminId){
+			permittedUserRotation = true;
+		  }
+		  if (!permittedUserRotation) {
+			console.log("❌ Admin access required to toggle_rotation!", userId);
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const campaignForRotation = await getOrCreateCampaign();
+		  const currentRotation = campaignForRotation.callerIdRotation || false;
+		  const newRotation = !currentRotation;
+		  
+		  await campaignForRotation.update({ 
+			callerIdRotation: newRotation,
+			// If enabling rotation, set prefix from current caller ID
+			callerIdPrefix: newRotation && campaignForRotation.callerId && campaignForRotation.callerId.length >= 4
+			  ? campaignForRotation.callerId.substring(0, campaignForRotation.callerId.length - 4)
+			  : campaignForRotation.callerIdPrefix
+		  });
+		  
+		  bot.sendMessage(
+			chatId,
+			`🔄 *Caller ID Rotation ${newRotation ? 'ENABLED' : 'DISABLED'}*\n\n` +
+			`${newRotation 
+			  ? `✅ Caller ID will rotate every 100 calls\n` +
+				`📋 Prefix: ${escapeMarkdown(campaignForRotation.callerIdPrefix || 'Not set')}\n` +
+				`🔢 Last 4 digits will be randomized\n\n` +
+				`Example: ${escapeMarkdown(campaignForRotation.callerIdPrefix || 'XXXXXX')}XXXX`
+			  : `❌ Static caller ID will be used: ${escapeMarkdown(campaignForRotation.callerId || 'Not set')}`
+			}`,
+			{ parse_mode: "Markdown", ...mainMenu }
+		  );
+		  break;
+	  case "set_transfer_number":
+		  let permittedUserTransfer = await Allowed.findOne({ 
+			where: { telegramId: userId } 
+		  });
+		  console.log(`Request from User ${userId} for set_transfer_number`);
+		  if(userId == adminId){
+			permittedUserTransfer = true;
+		  }
+		  if (!permittedUserTransfer) {
+			console.log("❌ Admin access required to set_transfer_number!", userId);
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const campaignForTransfer = await getOrCreateCampaign();
+		  const currentTransferNum = campaignForTransfer.transferNumber || 'Not set';
+		  bot.sendMessage(
+			chatId,
+			`📞 *Set Transfer Number*\n\n` +
+			`Current Transfer Number: ${escapeMarkdown(currentTransferNum)}\n` +
+			`Transfer Status: ${campaignForTransfer.transferEnabled ? '✅ Enabled' : '❌ Disabled'}\n\n` +
+			`Enter the phone number to transfer confirmed orders to:\n\n` +
+			`Examples:\n` +
+			`• 18001234567 (US number)\n` +
+			`• 442012345678 (UK number)\n` +
+			`• 1000 (Extension)`,
+			{ parse_mode: "Markdown" }
+		  );
+		  userStates[userId] = { action: "waiting_transfer_number", campaignId: campaignForTransfer.id };
+		  break;
 
+		case "toggle_transfer":
+		  let permittedUserToggleTrans = await Allowed.findOne({ 
+			where: { telegramId: userId } 
+		  });
+		  console.log(`Request from User ${userId} for toggle_transfer`);
+		  if(userId == adminId){
+			permittedUserToggleTrans = true;
+		  }
+		  if (!permittedUserToggleTrans) {
+			console.log("❌ Admin access required to toggle_transfer!", userId);
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const campaignToggleTrans = await getOrCreateCampaign();
+		  const currentTransferStatus = campaignToggleTrans.transferEnabled || false;
+		  const newTransferStatus = !currentTransferStatus;
+		  
+		  if (newTransferStatus && !campaignToggleTrans.transferNumber) {
+			bot.sendMessage(
+			  chatId,
+			  `⚠️ *Cannot Enable Transfer*\n\n` +
+			  `Please set a transfer number first using "Set Transfer Number" option.`,
+			  { parse_mode: "Markdown", ...mainMenu }
+			);
+			return;
+		  }
+		  
+		  await campaignToggleTrans.update({ transferEnabled: newTransferStatus });
+		  
+		  bot.sendMessage(
+			chatId,
+			`🔀 *Call Transfer ${newTransferStatus ? 'ENABLED' : 'DISABLED'}*\n\n` +
+			`${newTransferStatus 
+			  ? `✅ Confirmed orders will be transferred to:\n` +
+				`📞 ${escapeMarkdown(campaignToggleTrans.transferNumber)}\n\n` +
+				`Flow: Customer presses 1 → Thank you message → Transfer`
+			  : `❌ Confirmed orders will NOT be transferred\n\n` +
+				`Flow: Customer presses 1 → Thank you message → Hangup`
+			}`,
+			{ parse_mode: "Markdown", ...mainMenu }
+		  );
+		  break;
+  
       case "set_caller_id":
 		  let permittedUser = await Allowed.findOne({ 
 			where: { telegramId: userId } 
@@ -1103,6 +1475,12 @@ const initializeBot = () => {
 			`• Name: ${escapeMarkdown(currentCampaignStats.campaignName)}\n` +
 			`• SIP Trunk: ${trunkInfo}\n` +
 			`• Caller ID: ${escapeMarkdown(currentCampaignStats.callerId || 'Not set ⚠️')}\n` +
+			`• Caller ID Rotation: ${currentCampaignStats.callerIdRotation ? '✅ Enabled' : '❌ Disabled'}\n` +
+			`• Transfer (Press 1): ${currentCampaignStats.transferEnabled ? `✅ ${escapeMarkdown(currentCampaignStats.transferNumber)}` : '❌ Disabled'}\n` +
+			`• Press 2 Audio: ${currentCampaignStats.press2AudioFile ? `✅ ${escapeMarkdown(currentCampaignStats.press2AudioFile)}` : '❌ Default'}\n` +
+			`• Press 2 Transfer: ${currentCampaignStats.press2TransferEnabled ? `✅ ${escapeMarkdown(currentCampaignStats.press2TransferNumber)}` : '❌ Disabled'}\n` +
+			`• Invalid OTP Audio: ${currentCampaignStats.invalidOtpAudioFile ? `✅ ${escapeMarkdown(currentCampaignStats.invalidOtpAudioFile)}` : '❌ Default'}\n` +
+			`• Invalid OTP Transfer: ${currentCampaignStats.invalidOtpTransferEnabled ? `✅ ${escapeMarkdown(currentCampaignStats.invalidOtpTransferNumber)}` : '❌ Disabled'}\n` +
 			`• Callback Config: ${callbackInfo}\n` +
 			`• Concurrent Calls: ${currentCampaignStats.concurrentCalls}\n` +
 			`• DTMF Digit: ${currentCampaignStats.dtmfDigit}\n` +
@@ -1147,6 +1525,70 @@ const initializeBot = () => {
     if (!userState) return;
 
     switch (userState.action) {
+		case "waiting_transfer_number":
+		  const transferNum = text.trim().replace(/[^0-9+]/g, '');
+		  
+		  if (!transferNum || transferNum.length < 3) {
+			bot.sendMessage(chatId, "❌ Invalid transfer number. Please enter a valid phone number.");
+			return;
+		  }
+		  
+		  const campaignTransferNum = await Campaign.findByPk(userState.campaignId);
+		  await campaignTransferNum.update({ transferNumber: transferNum });
+		  
+		  bot.sendMessage(
+			chatId,
+			`✅ *Transfer Number Set Successfully!*\n\n` +
+			`📞 Transfer Number: ${escapeMarkdown(transferNum)}\n` +
+			`🔀 Transfer Status: ${campaignTransferNum.transferEnabled ? 'Enabled ✅' : 'Disabled ❌'}\n\n` +
+			`${!campaignTransferNum.transferEnabled ? 'Use "Toggle Transfer" to enable call transfer.' : 'Confirmed orders will be transferred to this number.'}`,
+			{ parse_mode: "Markdown", ...mainMenu }
+		  );
+		  delete userStates[userId];
+		  break;
+		  
+		case "waiting_press2_transfer":
+  const press2TransNum = text.trim().replace(/[^0-9+]/g, '');
+  
+  if (!press2TransNum || press2TransNum.length < 3) {
+    bot.sendMessage(chatId, "❌ Invalid number. Please try again.");
+    return;
+  }
+  
+  const campaignP2TransNum = await Campaign.findByPk(userState.campaignId);
+  await campaignP2TransNum.update({ press2TransferNumber: press2TransNum });
+  
+  bot.sendMessage(
+    chatId,
+    `✅ *Press 2 Transfer Number Set*\n\n` +
+    `📞 Number: ${escapeMarkdown(press2TransNum)}\n` +
+    `Status: ${campaignP2TransNum.press2TransferEnabled ? 'Enabled ✅' : 'Disabled ❌'}`,
+    { parse_mode: "Markdown", ...mainMenu }
+  );
+  delete userStates[userId];
+  break;
+
+case "waiting_invalid_otp_transfer":
+  const invTransNum = text.trim().replace(/[^0-9+]/g, '');
+  
+  if (!invTransNum || invTransNum.length < 3) {
+    bot.sendMessage(chatId, "❌ Invalid number. Please try again.");
+    return;
+  }
+  
+  const campaignInvTransNum = await Campaign.findByPk(userState.campaignId);
+  await campaignInvTransNum.update({ invalidOtpTransferNumber: invTransNum });
+  
+  bot.sendMessage(
+    chatId,
+    `✅ *Invalid OTP Transfer Number Set*\n\n` +
+    `📞 Number: ${escapeMarkdown(invTransNum)}\n` +
+    `Status: ${campaignInvTransNum.invalidOtpTransferEnabled ? 'Enabled ✅' : 'Disabled ❌'}`,
+    { parse_mode: "Markdown", ...mainMenu }
+  );
+  delete userStates[userId];
+  break;
+  
 		case "waiting_callback_trunk_number":
 		  const callbackTrunkNum = text.trim();
 		  
@@ -1899,9 +2341,9 @@ const initializeBot = () => {
 			console.log('waiting_ivr_file', baseFileName, ivrFileName);
 			
 			// Paths
-			const soundsPath = "/var/lib/asterisk/sounds/";
+			const soundsPath1 = "/var/lib/asterisk/sounds/";
 			const tempPath = `/tmp/${Date.now()}_${fileName}`;
-			const finalPath = path.join(soundsPath, ivrFileName);
+			const finalPath = path.join(soundsPath1, ivrFileName);
 			
 			console.log('[IVR] File paths:', {
 			  tempPath,
@@ -1938,7 +2380,7 @@ const initializeBot = () => {
 				chatId,
 				`✅ IVR ${userState.ivrType} file uploaded and converted successfully!\n\n` +
 				`📁 File: ${ivrFileName}\n` +
-				`📍 Location: ${soundsPath}`,
+				`📍 Location: ${soundsPath1}`,
 				mainMenu
 			  );
 			  
@@ -1954,7 +2396,164 @@ const initializeBot = () => {
 			  bot.sendMessage(chatId, `❌ Failed to process IVR file: ${err.message}`);
 			}
 			break;
-		
+		case "waiting_press2_audio":
+  console.log('[Press2 Audio] Processing audio file');
+  
+  // Check file extension
+  if (!fileName.toLowerCase().match(/\.(wav|mp3|mp4|m4a|aac|ogg|flac)$/)) {
+    bot.sendMessage(chatId, "❌ Please upload an audio file (WAV, MP3, MP4, M4A, AAC, OGG, or FLAC).");
+    return;
+  }
+  
+  // Sanitize filename
+  const press2FileName = `press2_${userState.campaignId}_${Date.now()}.wav`;
+  
+  // Paths
+  const soundsPath = "/var/lib/asterisk/sounds/";
+  const tempPath1 = `/tmp/${Date.now()}_${fileName}`;
+  const finalPath1 = path.join(soundsPath, press2FileName);
+  
+  console.log('[Press2 Audio] File paths:', {
+    tempPath1,
+    finalPath1,
+    press2FileName
+  });
+  
+  try {
+    // Save uploaded file temporarily
+    fs.writeFileSync(tempPath1, fileBuffer);
+    console.log('[Press2 Audio] Temp file saved');
+    
+    bot.sendMessage(chatId, "🔄 Converting audio file to Asterisk format...");
+    
+    // Convert audio using ffmpeg
+    await convertAudioFile(tempPath1, finalPath1);
+    console.log('[Press2 Audio] Audio converted');
+    
+    // Clean up temp file
+    if (fs.existsSync(tempPath1)) {
+      fs.unlinkSync(tempPath1);
+    }
+    
+    // Update campaign with the filename (without extension for Asterisk)
+    const campaignP2Audio = await Campaign.findByPk(userState.campaignId);
+    const oldFile = campaignP2Audio.press2AudioFile;
+    
+    await campaignP2Audio.update({ press2AudioFile: press2FileName });
+    
+    // Delete old file if it exists
+    if (oldFile) {
+      const oldFilePath = path.join(soundsPath, oldFile);
+      if (fs.existsSync(oldFilePath)) {
+        fs.unlinkSync(oldFilePath);
+        console.log('[Press2 Audio] Old file deleted:', oldFile);
+      }
+    }
+    
+    console.log('[Press2 Audio] Campaign updated');
+    
+    bot.sendMessage(
+      chatId,
+      `✅ *Press 2 Audio File Uploaded*\n\n` +
+      `📁 File: ${escapeMarkdown(press2FileName)}\n` +
+      `📍 Location: ${soundsPath}\n` +
+      `🎵 Status: Active\n\n` +
+      `This audio will play when customers press 2.`,
+      mainMenu
+    );
+    
+    delete userStates[userId];
+    console.log('[Press2 Audio] Process completed successfully');
+    
+  } catch (err) {
+    console.error('[Press2 Audio] Processing error:', err);
+    // Clean up temp file if exists
+    if (fs.existsSync(tempPath)) {
+      fs.unlinkSync(tempPath);
+    }
+    bot.sendMessage(chatId, `❌ Failed to process audio file: ${err.message}`);
+  }
+  break;
+
+case "waiting_invalid_otp_audio":
+  console.log('[Invalid OTP Audio] Processing audio file');
+  
+  // Check file extension
+  if (!fileName.toLowerCase().match(/\.(wav|mp3|mp4|m4a|aac|ogg|flac)$/)) {
+    bot.sendMessage(chatId, "❌ Please upload an audio file (WAV, MP3, MP4, M4A, AAC, OGG, or FLAC).");
+    return;
+  }
+  
+  // Sanitize filename
+  const invOtpFileName = `invalid_otp_${userState.campaignId}_${Date.now()}.wav`;
+  
+  // Paths
+  const soundsPathInv = "/var/lib/asterisk/sounds/";
+  const tempPathInv = `/tmp/${Date.now()}_${fileName}`;
+  const finalPathInv = path.join(soundsPathInv, invOtpFileName);
+  
+  console.log('[Invalid OTP Audio] File paths:', {
+    tempPathInv,
+    finalPathInv,
+    invOtpFileName
+  });
+  
+  try {
+    // Save uploaded file temporarily
+    fs.writeFileSync(tempPathInv, fileBuffer);
+    console.log('[Invalid OTP Audio] Temp file saved');
+    
+    bot.sendMessage(chatId, "🔄 Converting audio file to Asterisk format...");
+    
+    // Convert audio using ffmpeg
+    await convertAudioFile(tempPathInv, finalPathInv);
+    console.log('[Invalid OTP Audio] Audio converted');
+    
+    // Clean up temp file
+    if (fs.existsSync(tempPathInv)) {
+      fs.unlinkSync(tempPathInv);
+    }
+    
+    // Update campaign with the filename
+    const campaignInvAudio = await Campaign.findByPk(userState.campaignId);
+    const oldInvFile = campaignInvAudio.invalidOtpAudioFile;
+    
+    await campaignInvAudio.update({ invalidOtpAudioFile: invOtpFileName });
+    
+    // Delete old file if it exists
+    if (oldInvFile) {
+      const oldInvFilePath = path.join(soundsPathInv, oldInvFile);
+      if (fs.existsSync(oldInvFilePath)) {
+        fs.unlinkSync(oldInvFilePath);
+        console.log('[Invalid OTP Audio] Old file deleted:', oldInvFile);
+      }
+    }
+    
+    console.log('[Invalid OTP Audio] Campaign updated');
+    
+    bot.sendMessage(
+      chatId,
+      `✅ *Invalid OTP Audio File Uploaded*\n\n` +
+      `📁 File: ${escapeMarkdown(invOtpFileName)}\n` +
+      `📍 Location: ${soundsPathInv}\n` +
+      `🎵 Status: Active\n\n` +
+      `This audio will play when OTP is marked as invalid.`,
+      mainMenu
+    );
+    
+    delete userStates[userId];
+    console.log('[Invalid OTP Audio] Process completed successfully');
+    
+  } catch (err) {
+    console.error('[Invalid OTP Audio] Processing error:', err);
+    // Clean up temp file if exists
+    if (fs.existsSync(tempPathInv)) {
+      fs.unlinkSync(tempPathInv);
+    }
+    bot.sendMessage(chatId, `❌ Failed to process audio file: ${err.message}`);
+  }
+  break;
+  
 		  case "scheduling_numbers":
         // Handle scheduling numbers upload
         console.log('[Scheduling] Processing numbers file for scheduling');

@@ -425,62 +425,97 @@ ami.on("managerevent", async (data) => {
 
   // Handle hangup events with proper cleanup
   if (data?.event === "Hangup") {
-    const channel = data?.channel;
-    let phoneNumber = data?.exten;
-    
-    // Try to get phone number from channel mapping if exten is not available
-    if (!phoneNumber && channel) {
-      phoneNumber = channelToPhoneMap.get(channel);
-    }
-    
-    if (phoneNumber) {
-      console.log(`Call hangup for ${phoneNumber} on channel ${channel}`);
-      
-      // Clean up channel mapping
-      if (channel) {
-        channelToPhoneMap.delete(channel);
-      }
-      
-      // Clean up call tracking
-      if (activeCalls.has(phoneNumber)) {
-        const callInfo = activeCalls.get(phoneNumber);
-        console.log(`Call ended for ${phoneNumber}, final status: ${callInfo.status}`);
-        
-        // Remove from active calls
-        activeCalls.delete(phoneNumber);
-        
-        // If there's a pending verification, clean it up
-        for (const [callId, verification] of pendingVerifications.entries()) {
-          if (verification.phoneNumber === phoneNumber) {
-            console.log(`Cleaning up pending verification for ${phoneNumber}, Call ID: ${callId}`);
-            pendingVerifications.delete(callId);
-            
-            // Notify admin that call ended during verification process
-            if (verification.status !== 'completed') {
-              telegramQueue.sendMessage(
-                settings.notifications_chat_id,
-                `⚠️ <b>Call Ended During Verification</b>\n\n` +
-                `📞 Phone: ${escapeHtml(phoneNumber)}\n` +
-                `🆔 Call ID: <code>${escapeHtml(callId)}</code>\n` +
-                `📋 Status: ${escapeHtml(verification.status)}\n` +
-                `⏰ Ended: ${escapeHtml(new Date().toLocaleString())}`,
-                { parse_mode: "HTML" }
-              );
-            }
-            break;
-          }
-        }
-      }
-      
-      call_ended(phoneNumber, 'Success');
-      console.log(
-        `Call to ${phoneNumber} from +${data?.calleridnum} has ended with reason ${data["cause-txt"]}`
-      );
-      require("./call")(pop_unprocessed_line());
-    } else {
-      console.log(`Hangup event but could not determine phone number for channel ${channel}`);
-    }
-  }
+	  const channel = data?.channel;
+	  let phoneNumber = data?.exten;
+	  const cause = data?.cause;
+	  const causeTxt = data["cause-txt"];
+	  
+	  // Try to get phone number from channel mapping if exten is not available
+	  if (!phoneNumber && channel) {
+		phoneNumber = channelToPhoneMap.get(channel);
+	  }
+	  
+	  if (phoneNumber) {
+		console.log(`Call hangup for ${phoneNumber} on channel ${channel}, cause: ${cause} (${causeTxt})`);
+		
+		// Determine if this was a user hangup or system hangup
+		const isUserHangup = cause === '16' || causeTxt === 'Normal Clearing';
+		const isNoAnswer = cause === '19' || causeTxt === 'No Answer';
+		const isBusy = cause === '17' || causeTxt === 'User busy';
+		
+		// Clean up channel mapping
+		if (channel) {
+		  channelToPhoneMap.delete(channel);
+		}
+		
+		// Clean up call tracking
+		if (activeCalls.has(phoneNumber)) {
+		  const callInfo = activeCalls.get(phoneNumber);
+		  const callDuration = (new Date() - callInfo.startTime) / 1000; // in seconds
+		  
+		  console.log(`Call ended for ${phoneNumber}, final status: ${callInfo.status}, duration: ${callDuration}s`);
+		  
+		  // Update call record in database with proper status
+		  const updateData = {
+			callEnded: new Date(),
+			callStatus: callInfo.pressedOne ? 'success' : 'failed'
+		  };
+		  
+		  // Mark as voicemail if no answer or very short call
+		  if (isNoAnswer || (callDuration < 5 && !callInfo.dtmfPressed)) {
+			updateData.callStatus = 'failed';
+			updateData.voicemail = 'yes';
+			
+			// Increment voicemail counter
+			if (settings.campaign_id) {
+			  Campaign.increment('voicemailCalls', { where: { id: settings.campaign_id } });
+			}
+		  }
+		  
+		  // Update the call record
+		  Call.update(updateData, {
+			where: {
+			  phoneNumber: `+${phoneNumber}`,
+			  campaignId: settings.campaign_id
+			}
+		  });
+		  
+		  // Remove from active calls
+		  activeCalls.delete(phoneNumber);
+		  
+		  // If there's a pending verification, clean it up
+		  for (const [callId, verification] of pendingVerifications.entries()) {
+			if (verification.phoneNumber === phoneNumber) {
+			  console.log(`Cleaning up pending verification for ${phoneNumber}, Call ID: ${callId}`);
+			  pendingVerifications.delete(callId);
+			  
+			  // Notify admin that call ended during verification process
+			  if (verification.status !== 'completed') {
+				telegramQueue.sendMessage(
+				  settings.notifications_chat_id,
+				  `⚠️ <b>Call Ended During Verification</b>\n\n` +
+				  `📞 Phone: ${escapeHtml(phoneNumber)}\n` +
+				  `🆔 Call ID: <code>${escapeHtml(callId)}</code>\n` +
+				  `📋 Status: ${escapeHtml(verification.status)}\n` +
+				  `⏰ Duration: ${callDuration.toFixed(1)}s\n` +
+				  `🔚 Cause: ${escapeHtml(causeTxt)}`,
+				  { parse_mode: "HTML" }
+				);
+			  }
+			  break;
+			}
+		  }
+		}
+		
+		call_ended(phoneNumber, isUserHangup ? 'User Hangup' : causeTxt);
+		console.log(
+		  `Call to ${phoneNumber} has ended with cause ${cause}: ${causeTxt}`
+		);
+		require("./call")(pop_unprocessed_line());
+	  } else {
+		console.log(`Hangup event but could not determine phone number for channel ${channel}`);
+	  }
+	}
 });
 
 function waitForConnection() {
