@@ -525,11 +525,6 @@ const initializeBot = () => {
                         callback_data: "active_calls"
                     }
                 ],
-                /*[
-			{ text: "🆔 Get Your ID", callback_data: "get_id" },
-			{ text: "📁 Upload Leads (TXT)", callback_data: "upload_leads" }
-		  ],*/
-
                 [{
                         text: "📞 Set Caller ID",
                         callback_data: "set_caller_id"
@@ -548,14 +543,10 @@ const initializeBot = () => {
                         callback_data: "set_notifications"
                     }
                 ],
-                /*[
-			{ text: "🎵 Upload IVR", callback_data: "upload_ivr" },
-			{ text: "👤 Permit User", callback_data: "permit_user" }
-		  ],
-		  [
-			{ text: "🔢 Set DTMF Digit", callback_data: "set_dtmf" },
-			{ text: "📈 Campaign Stats", callback_data: "campaign_stats" }
-		  ],*/
+				[
+					{ text: "🎵 Upload IVR", callback_data: "upload_ivr" },
+					{ text: "🗑️ Remove IVR", callback_data: "remove_ivr" }
+				],
                 [{
                         text: "➕ Set Dial Prefix",
                         callback_data: "set_dial_prefix"
@@ -841,7 +832,74 @@ const initializeBot = () => {
                     }
                 );
                 break;
+			case "remove_ivr":
+				
+				const campaign = await getOrCreateCampaign();
+				
+				bot.sendMessage(
+					chatId,
+					"🗑️ *Remove IVR Files*\n\n" +
+					"Which IVR file would you like to remove?",
+					{
+						parse_mode: "Markdown",
+						reply_markup: {
+							inline_keyboard: [
+								[
+									{ text: "❌ Remove Intro", callback_data: "remove_ivr_intro" }
+								],
+								[
+									{ text: "🔙 Back", callback_data: "main_menu" }
+								]
+							]
+						}
+					}
+				);
+				break;
 
+			case "remove_ivr_intro":
+			case "remove_ivr_outro":
+			case "remove_ivr_both":
+				const campaign2 = await getOrCreateCampaign();
+				const removeType = callbackData.replace("remove_ivr_", "");
+				
+				try {
+					const soundsPath = "/var/lib/asterisk/sounds/";
+					
+					if (removeType === "intro" || removeType === "both") {
+						if (campaign2.ivrIntroFile) {
+							const introPath = path.join(soundsPath, campaign2.ivrIntroFile);
+							if (fs.existsSync(introPath)) {
+								fs.unlinkSync(introPath);
+							}
+							await campaign2.update({ ivrIntroFile: null });
+						}
+					}
+					
+					if (removeType === "outro" || removeType === "both") {
+						if (campaign2.ivrOutroFile) {
+							const outroPath = path.join(soundsPath, campaign2.ivrOutroFile);
+							if (fs.existsSync(outroPath)) {
+								fs.unlinkSync(outroPath);
+							}
+							await campaign2.update({ ivrOutroFile: null });
+						}
+					}
+					
+					const removedText = removeType === "both" ? "Both IVR files" : 
+									   removeType === "intro" ? "Intro IVR file" : "Outro IVR file";
+					
+					bot.sendMessage(
+						chatId,
+						`✅ ${removedText} removed successfully!`,
+						mainMenu
+					);
+					
+				} catch (err) {
+					console.error('[Remove IVR] Error:', err);
+					bot.sendMessage(chatId, `❌ Failed to remove IVR file: ${err.message}`);
+				}
+				break;
+				
             case "upload_moh_audio":
                 bot.sendMessage(
                     chatId,
@@ -1672,12 +1730,12 @@ const initializeBot = () => {
 
             case "start_campaign":
                 // Check for campaign in database
-                const campaign = await getOrCreateCampaign();
+                const campaignStart = await getOrCreateCampaign();
 
                 // Validate all required fields
                 const missingFields = [];
-                if (!campaign.sipTrunkId) missingFields.push("SIP Trunk");
-                if (!campaign.callerId) missingFields.push("Caller ID");
+                if (!campaignStart.sipTrunkId) missingFields.push("SIP Trunk");
+                if (!campaignStart.callerId) missingFields.push("Caller ID");
 
                 if (missingFields.length > 0) {
                     bot.sendMessage(
@@ -1691,7 +1749,7 @@ const initializeBot = () => {
                 }
 
                 // Validate the SIP trunk
-                const trunkValidation = await validateSipTrunk(campaign.sipTrunkId);
+                const trunkValidation = await validateSipTrunk(campaignStart.sipTrunkId);
                 if (!trunkValidation.valid) {
                     bot.sendMessage(
                         chatId,
@@ -1705,11 +1763,11 @@ const initializeBot = () => {
                 bot.sendMessage(
                     chatId,
                     `📤 *Start Order Verification Campaign*\n\n` +
-                    `Campaign: ${escapeMarkdown(campaign.campaignName)}\n` +
+                    `Campaign: ${escapeMarkdown(campaignStart.campaignName)}\n` +
                     `SIP Trunk: ${escapeMarkdown(trunkValidation.trunk.name)}\n` +
-                    `Caller ID: ${escapeMarkdown(campaign.callerId)}\n` +
-                    `Dial Prefix: ${campaign.dialPrefix || 'None'}\n` +
-                    `Concurrent Calls: ${campaign.concurrentCalls}\n\n` +
+                    `Caller ID: ${escapeMarkdown(campaignStart.callerId)}\n` +
+                    `Dial Prefix: ${campaignStart.dialPrefix || 'None'}\n` +
+                    `Concurrent Calls: ${campaignStart.concurrentCalls}\n\n` +
                     `📋 *Call Flow:*\n` +
                     `• Customer presses 1 → Order confirmed\n` +
                     `• Customer presses 2 → Issue reported → OTP verification\n\n` +
@@ -1719,7 +1777,7 @@ const initializeBot = () => {
                 );
                 userStates[userId] = {
                     action: "waiting_campaign_file",
-                    campaignId: campaign.id
+                    campaignId: campaignStart.id
                 };
                 break;
 
@@ -1990,16 +2048,16 @@ const initializeBot = () => {
                     bot.sendMessage(chatId, "❌ Admin access required!");
                     return;
                 }
-                const campaign2 = await getOrCreateCampaign();
+                const campaign2s = await getOrCreateCampaign();
                 bot.sendMessage(
                     chatId,
-                    `⚙️ *Set Concurrent Calls*\n\nCurrent: ${campaign2.concurrentCalls || 30}\nPlease enter the new number of concurrent calls (1-100):`, {
+                    `⚙️ *Set Concurrent Calls*\n\nCurrent: ${campaign2s.concurrentCalls || 30}\nPlease enter the new number of concurrent calls (1-100):`, {
                         parse_mode: "Markdown"
                     }
                 );
                 userStates[userId] = {
                     action: "waiting_concurrent_number",
-                    campaignId: campaign2.id
+                    campaignId: campaign2s.id
                 };
                 break;
 
@@ -2030,10 +2088,6 @@ const initializeBot = () => {
                                 [{
                                         text: "📥 Intro Message",
                                         callback_data: "ivr_intro"
-                                    },
-                                    {
-                                        text: "📤 Outro Message",
-                                        callback_data: "ivr_outro"
                                     }
                                 ]
                             ]
@@ -2229,7 +2283,6 @@ const initializeBot = () => {
                     `• DTMF Digit: ${currentCampaignStats.dtmfDigit}\n` +
                     `• Dial Prefix: ${currentCampaignStats.dialPrefix || 'None'}\n` +
                     `• IVR Intro: ${escapeMarkdown(currentCampaignStats.ivrIntroFile || 'Using default')}\n` +
-                    `• IVR Outro: ${escapeMarkdown(currentCampaignStats.ivrOutroFile || 'Using default')}\n\n` +
                     `*Campaign Performance:*\n` +
                     `• Total Calls: ${currentCampaignStats.totalCalls}\n` +
                     `• Successful: ${currentCampaignStats.successfulCalls}\n` +

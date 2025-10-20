@@ -80,7 +80,7 @@ module.exports = async (entry) => {
 
     console.log(`Ringing number ${number} using trunk: ${trunkName} with Caller ID: ${callerId}`);
 
-    const variables = {
+    let variables = {
         callId: actionId,
         TRUNK_NAME: trunkName,
         CAMPAIGN_ID: String(settings.campaign_id || 'default'),
@@ -101,7 +101,9 @@ module.exports = async (entry) => {
         MOH_AUDIO_FILE: campaign.moh_audio_file ? campaign.moh_audio_file.replace('.wav', '') : '',
         PRESS0_AUDIO_FILE: campaign.press0_audio_file ? campaign.press0_audio_file.replace('.wav', '') : '',
         PRESS0_TRANSFER_ENABLED: campaign.press0_transfer_enabled ? 'true' : 'false',
-        PRESS0_TRANSFER_NUMBER: campaign.press0_transfer_number || ''
+        PRESS0_TRANSFER_NUMBER: campaign.press0_transfer_number || '',
+		IVR_INTRO_FILE: campaign.ivrIntroFile ? campaign.ivrIntroFile.replace('.wav', '') : '',
+		IVR_OUTRO_FILE: campaign.ivrOutroFile ? campaign.ivrOutroFile.replace('.wav', '') : ''
     };
     // Add IVR files if they exist
     if (settings.ivr_intro_file) {
