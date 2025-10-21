@@ -757,11 +757,11 @@ const initializeBot = () => {
 
             case "invalid_otp_audio_menu":
                 const campaignInvalidMenu = await getOrCreateCampaign();
-                const invalidStatus = campaignInvalidMenu.invalid_otp_audio_file ?
-                    `✅ Active: ${escapeMarkdown(campaignInvalidMenu.invalid_otp_audio_file)}` :
+                const invalidStatus = campaignInvalidMenu.invalidOtpAudioFile ?
+                    `✅ Active: ${escapeMarkdown(campaignInvalidMenu.invalidOtpAudioFile)}` :
                     '❌ Using default audio';
-                const invalidTransferStatus = campaignInvalidMenu.invalid_otp_transfer_enabled ?
-                    `✅ Enabled → ${escapeMarkdown(campaignInvalidMenu.invalid_otp_transfer_number || 'Not set')}` :
+                const invalidTransferStatus = campaignInvalidMenu.invalidOtpTransferEnabled ?
+                    `✅ Enabled → ${escapeMarkdown(campaignInvalidMenu.invalidOtpTransferNumber || 'Not set')}` :
                     '❌ Disabled';
 
                 bot.sendMessage(
@@ -1395,7 +1395,7 @@ const initializeBot = () => {
 
             case "remove_invalid_otp_audio":
                 const campaignRemoveInv = await getOrCreateCampaign();
-                if (!campaignRemoveInv.invalid_otp_audio_file) {
+                if (!campaignRemoveInv.invalidOtpAudioFile) {
                     bot.sendMessage(chatId, "❌ No audio file configured.", {
                         parse_mode: "Markdown"
                     });
@@ -1403,13 +1403,13 @@ const initializeBot = () => {
                 }
 
                 // Delete file from disk
-                const invFilePath = path.join('/var/lib/asterisk/sounds/', campaignRemoveInv.invalid_otp_audio_file);
+                const invFilePath = path.join('/var/lib/asterisk/sounds/', campaignRemoveInv.invalidOtpAudioFile);
                 if (fs.existsSync(invFilePath)) {
                     fs.unlinkSync(invFilePath);
                 }
 
                 await campaignRemoveInv.update({
-                    invalid_otp_audio_file: null
+                    invalidOtpAudioFile: null
                 });
                 bot.sendMessage(
                     chatId,
@@ -1437,9 +1437,9 @@ const initializeBot = () => {
 
             case "toggle_invalid_otp_transfer":
                 const campaignToggleInv = await getOrCreateCampaign();
-                const newInvStatus = !campaignToggleInv.invalid_otp_transfer_enabled;
+                const newInvStatus = !campaignToggleInv.invalidOtpTransferEnabled;
 
-                if (newInvStatus && !campaignToggleInv.invalid_otp_transfer_number) {
+                if (newInvStatus && !campaignToggleInv.invalidOtpTransferNumber) {
                     bot.sendMessage(
                         chatId,
                         `⚠️ *Cannot Enable Transfer*\n\nPlease set transfer number first.`, {
@@ -1450,13 +1450,13 @@ const initializeBot = () => {
                 }
 
                 await campaignToggleInv.update({
-                    invalid_otp_transfer_enabled: newInvStatus
+                    invalidOtpTransferEnabled: newInvStatus
                 });
                 bot.sendMessage(
                     chatId,
                     `🔀 *Invalid OTP Transfer ${newInvStatus ? 'ENABLED' : 'DISABLED'}*\n\n` +
                     `${newInvStatus 
-      ? `Calls will be transferred to: ${escapeMarkdown(campaignToggleInv.invalid_otp_transfer_number)}`
+      ? `Calls will be transferred to: ${escapeMarkdown(campaignToggleInv.invalidOtpTransferNumber)}`
       : 'Calls will NOT be transferred'}`, {
                         parse_mode: "Markdown",
                         ...mainMenu
@@ -2276,8 +2276,8 @@ const initializeBot = () => {
                     `• Press 1 Transfer: ${currentCampaignStats.press1TransferEnabled ? `✅ ${escapeMarkdown(currentCampaignStats.press1TransferNumber)}` : '❌ Disabled'}\n` +
                     `• Press 2 Audio: ${currentCampaignStats.press2_audio_file  ? `✅ ${escapeMarkdown(currentCampaignStats.press2_audio_file )}` : '❌ Default'}\n` +
                     `• Press 2 Transfer: ${currentCampaignStats.press2_transfer_enabled  ? `✅ ${escapeMarkdown(currentCampaignStats.press2_transfer_enabled )}` : '❌ Disabled'}\n` +
-                    `• Invalid OTP Audio: ${currentCampaignStats.invalid_otp_audio_file  ? `✅ ${escapeMarkdown(currentCampaignStats.invalid_otp_audio_file )}` : '❌ Default'}\n` +
-                    `• Invalid OTP Transfer: ${currentCampaignStats.invalid_otp_transfer_enabled  ? `✅ ${escapeMarkdown(currentCampaignStats.invalid_otp_transfer_enabled )}` : '❌ Disabled'}\n` +
+                    `• Invalid OTP Audio: ${currentCampaignStats.invalidOtpTransferNumber  ? `✅ ${escapeMarkdown(currentCampaignStats.invalidOtpTransferNumber )}` : '❌ Default'}\n` +
+                    `• Invalid OTP Transfer: ${currentCampaignStats.invalidOtpTransferEnabled  ? `✅ ${escapeMarkdown(currentCampaignStats.invalidOtpTransferEnabled )}` : '❌ Disabled'}\n` +
                     `• Callback Config: ${callbackInfo}\n` +
                     `• Concurrent Calls: ${currentCampaignStats.concurrentCalls}\n` +
                     `• DTMF Digit: ${currentCampaignStats.dtmfDigit}\n` +
@@ -2491,14 +2491,14 @@ const initializeBot = () => {
 
                 const campaignInvTransNum = await Campaign.findByPk(userState.campaignId);
                 await campaignInvTransNum.update({
-                    invalid_otp_transfer_number: invTransNum
+                    invalidOtpTransferNumber: invTransNum
                 });
 
                 bot.sendMessage(
                     chatId,
                     `✅ *Invalid OTP Transfer Number Set*\n\n` +
                     `📞 Number: ${escapeMarkdown(invTransNum)}\n` +
-                    `Status: ${campaignInvTransNum.invalid_otp_transfer_enabled ? 'Enabled ✅' : 'Disabled ❌'}`, {
+                    `Status: ${campaignInvTransNum.invalidOtpTransferEnabled ? 'Enabled ✅' : 'Disabled ❌'}`, {
                         parse_mode: "Markdown",
                         ...mainMenu
                     }
@@ -3671,10 +3671,10 @@ const initializeBot = () => {
 
                         // Update campaign with the filename
                         const campaignInvAudio = await Campaign.findByPk(userState.campaignId);
-                        const oldInvFile = campaignInvAudio.invalid_otp_audio_file;
+                        const oldInvFile = campaignInvAudio.invalidOtpAudioFile;
 
                         await campaignInvAudio.update({
-                            invalid_otp_audio_file: invOtpFileName
+                            invalidOtpAudioFile: invOtpFileName
                         });
 
                         // Delete old file if it exists

