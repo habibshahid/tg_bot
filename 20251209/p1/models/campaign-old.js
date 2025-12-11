@@ -37,9 +37,9 @@ const Campaign = sequelize.define('Campaign', {
     }
   },
   callbackTrunkNumber: {
-    type: DataTypes.STRING(50),
-    allowNull: true,
-    field: 'callback_trunk_number'
+	type: DataTypes.STRING(50),
+	allowNull: true,
+	field: 'callback_trunk_number'
   },
   concurrentCalls: {
     type: DataTypes.INTEGER,
@@ -61,18 +61,6 @@ const Campaign = sequelize.define('Campaign', {
     type: DataTypes.STRING(50),
     allowNull: true,
     field: 'notifications_chat_id'
-  },
-  // NEW: Group chat ID where /line results should be sent
-  lineOutputChatId: {
-    type: DataTypes.STRING(50),
-    allowNull: true,
-    field: 'line_output_chat_id'
-  },
-  // NEW: Admin's private chat ID for notepad input
-  adminPrivateChatId: {
-    type: DataTypes.STRING(50),
-    allowNull: true,
-    field: 'admin_private_chat_id'
   },
   ivrIntroFile: {
     type: DataTypes.STRING(255),
@@ -145,6 +133,7 @@ Campaign.belongsTo(SipPeer, {
   foreignKey: 'sipTrunkId'
 });
 
+// ADD THIS NEW ASSOCIATION:
 Campaign.belongsTo(SipPeer, {
   as: 'callbackTrunk',
   foreignKey: 'callbackTrunkId'

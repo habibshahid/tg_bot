@@ -39,6 +39,15 @@ function sanitizeFilename(filename) {
   return sanitized.replace(/_+/g, '_').toLowerCase();
 }
 
+// Helper: Escape HTML special characters
+function escapeHtml(text) {
+  if (!text) return '';
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 function escapeMarkdown(text) {
   if (!text) return '';
   // Convert to string in case it's not
@@ -64,6 +73,44 @@ function escapeMarkdown(text) {
     .replace(/\}/g, '\\}')   // Curly brace close
     .replace(/\./g, '\\.')   // Period
     .replace(/!/g, '\\!');   // Exclamation
+}
+
+// Helper: Check if user is admin (creator or has admin permission)
+async function isAdmin(userId) {
+  if (String(userId) === String(config.creator_telegram_id)) return true;
+  
+  const allowed = await Allowed.findOne({ 
+    where: { telegramId: String(userId) } 
+  });
+  
+  return allowed && allowed.permissionLevel === 'admin';
+}
+
+// Helper: Check if user has any access (admin or user level)
+async function hasAccess(userId) {
+  if (String(userId) === String(config.creator_telegram_id)) return true;
+  
+  const allowed = await Allowed.findOne({ 
+    where: { telegramId: String(userId) } 
+  });
+  
+  return !!allowed;
+}
+
+// Helper: Check if user can only use /line (whitelisted but not admin)
+async function isLineOnlyUser(userId) {
+  if (String(userId) === String(config.creator_telegram_id)) return false;
+  
+  const allowed = await Allowed.findOne({ 
+    where: { telegramId: String(userId) } 
+  });
+  
+  return allowed && allowed.permissionLevel === 'user';
+}
+
+// Helper: Check if chat is private (DM)
+function isPrivateChat(msg) {
+  return msg.chat.type === 'private';
 }
 
 async function convertAudioFile(inputPath, outputPath) {
@@ -533,23 +580,54 @@ const initializeBot = () => {
 		  ],
 		  [
 			{ text: "📲 Initiate Callback", callback_data: "initiate_callback" }
-		  ]
+		  ],
+		  [
+			{ text: "📍 Set Line Output Group", callback_data: "set_line_output" },
+			{ text: "📝 Set Private Notepad", callback_data: "set_private_notepad" }
+		  ],
 		]
 	  }
 	};
 
   // Start command - show main menu
-  bot.onText(/\/start/, (msg) => {
-    const chatId = msg.chat.id;
-    bot.sendMessage(
-      chatId, 
-      "🤖 *Welcome to Call Campaign Bot!*\n\nSelect an option from the menu below:",
-      { 
-        ...mainMenu,
-        parse_mode: "Markdown"
-      }
-    );
-  });
+  bot.onText(/\/start/, async (msg) => {
+	  const chatId = msg.chat.id;
+	  const userId = msg.from.id;
+	  
+	  // Check if user is line-only (show restricted menu)
+	  if (await isLineOnlyUser(userId)) {
+		bot.sendMessage(
+		  chatId,
+		  `🤖 <b>Call Campaign Bot</b>\n\n` +
+		  `You have limited access. Available commands:\n\n` +
+		  `• /line - Get next P1 line\n` +
+		  `• /line &lt;number&gt; - Lookup specific number\n` +
+		  `• /linecount - Show P1 statistics`,
+		  { parse_mode: "HTML" }
+		);
+		return;
+	  }
+	  
+	  // Check if has any access
+	  if (!(await hasAccess(userId))) {
+		bot.sendMessage(
+		  chatId,
+		  `❌ <b>Access Denied</b>\n\nYou are not authorized to use this bot.\n\nContact the administrator for access.`,
+		  { parse_mode: "HTML" }
+		);
+		return;
+	  }
+	  
+	  // Show full menu for admins
+	  bot.sendMessage(
+		chatId, 
+		"🤖 *Welcome to Call Campaign Bot!*\n\nSelect an option from the menu below:",
+		{ 
+		  ...mainMenu,
+		  parse_mode: "Markdown"
+		}
+	  );
+	});
 
   // Handle callback queries
   bot.on("callback_query", async (query) => {
@@ -561,6 +639,59 @@ const initializeBot = () => {
     bot.answerCallbackQuery(query.id);
 
     switch (callbackData) {
+		case "set_line_output":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  bot.sendMessage(
+			chatId,
+			`📍 <b>Set Line Output Group</b>\n\n` +
+			`Current chat ID: <code>${chatId}</code>\n\n` +
+			`Options:\n` +
+			`1️⃣ Use this chat as line output (reply "this")\n` +
+			`2️⃣ Enter a different group chat ID\n\n` +
+			`The /line command results will be sent to the configured group.`,
+			{ parse_mode: "HTML" }
+		  );
+		  userStates[userId] = { action: "waiting_line_output_chat" };
+		  break;
+
+		case "set_private_notepad":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  if (!isPrivateChat(query.message)) {
+			const botInfo = await bot.getMe();
+			bot.sendMessage(
+			  chatId,
+			  `📝 <b>Private Notepad Setup</b>\n\n` +
+			  `⚠️ Please message me in DM (private chat) to set up your private notepad.\n\n` +
+			  `Click here: @${botInfo.username}`,
+			  { parse_mode: "HTML" }
+			);
+			return;
+		  }
+		  
+		  // In DM - set this as private notepad chat
+		  const campaignForNotepad = await getOrCreateCampaign();
+		  await campaignForNotepad.update({ adminPrivateChatId: String(chatId) });
+		  
+		  bot.sendMessage(
+			chatId,
+			`✅ <b>Private Notepad Configured!</b>\n\n` +
+			`This DM is now your private notepad.\n\n` +
+			`📌 Lines you input here stay private.\n` +
+			`📌 Use /setgroup to choose output group.\n` +
+			`📌 Group users can only use /line to get lines one at a time.`,
+			{ parse_mode: "HTML" }
+		  );
+		  break;
+
+		  
 		case "set_callback_trunk":
 		  let permittedUserCallback = await Allowed.findOne({ 
 			where: { telegramId: userId } 
@@ -1076,17 +1207,23 @@ const initializeBot = () => {
         break;
 
       case "permit_user":
-        if (userId != adminId) {
-          bot.sendMessage(chatId, "❌ Admin access required!");
-          return;
-        }
-        bot.sendMessage(
-          chatId,
-          "👤 *Permit User*\n\nEnter the Telegram ID of the user to permit:",
-          { parse_mode: "Markdown" }
-        );
-        userStates[userId] = { action: "waiting_permit_id" };
-        break;
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  bot.sendMessage(
+			chatId,
+			`👤 <b>Permit User</b>\n\n` +
+			`Enter the Telegram ID and permission level:\n\n` +
+			`Format: <code>ID</code> or <code>ID admin</code>\n\n` +
+			`Examples:\n` +
+			`• <code>123456789</code> - User level (only /line)\n` +
+			`• <code>123456789 admin</code> - Full access\n\n` +
+			`Default is user level (can only use /line)`,
+			{ parse_mode: "HTML" }
+		  );
+		  userStates[userId] = { action: "waiting_permit_id" };
+		  break;
 
       case "campaign_stats":
 		  const campaignStats = await getCallStats();
@@ -1163,6 +1300,33 @@ const initializeBot = () => {
     if (!userState) return;
 
     switch (userState.action) {
+		case "waiting_line_output_chat":
+		  const lineOutputInput = text.trim().toLowerCase();
+		  const campaignLineOutput = await getOrCreateCampaign();
+		  
+		  if (lineOutputInput === 'this') {
+			await campaignLineOutput.update({ lineOutputChatId: String(chatId) });
+			bot.sendMessage(
+			  chatId,
+			  `✅ This chat is now set as the line output group.`,
+			  mainMenu
+			);
+		  } else {
+			// Validate it's a number (chat ID)
+			if (!/^-?\d+$/.test(text.trim())) {
+			  bot.sendMessage(chatId, "❌ Invalid chat ID. Please enter a valid number or 'this'.");
+			  return;
+			}
+			await campaignLineOutput.update({ lineOutputChatId: text.trim() });
+			bot.sendMessage(
+			  chatId,
+			  `✅ Line output group set to: <code>${escapeHtml(text.trim())}</code>`,
+			  { parse_mode: "HTML", ...mainMenu }
+			);
+		  }
+		  delete userStates[userId];
+		  break;
+		  
 		case "waiting_callback_trunk_number":
 		  const callbackTrunkNum = text.trim();
 		  
@@ -1473,26 +1637,47 @@ const initializeBot = () => {
         break;
 
       case "waiting_permit_id":
-        const permitId = text.trim();
-        if (!/^\d+$/.test(permitId)) {
-          bot.sendMessage(chatId, "❌ Invalid ID. Please enter numbers only.");
-          return;
-        }
-        try {
-          const existing = await Allowed.findOne({ 
-            where: { telegramId: permitId } 
-          });
-          if (existing) {
-            bot.sendMessage(chatId, "⚠️ User already permitted.");
-          } else {
-            await Allowed.create({ telegramId: permitId });
-            bot.sendMessage(chatId, `✅ User ${permitId} permitted!`, mainMenu);
-          }
-        } catch (error) {
-          bot.sendMessage(chatId, `❌ Error: ${error.message}`);
-        }
-        delete userStates[userId];
-        break;
+		  const permitParts = text.trim().split(/\s+/);
+		  const permitId = permitParts[0];
+		  const permLevel = permitParts[1]?.toLowerCase() === 'admin' ? 'admin' : 'user';
+		  
+		  if (!/^\d+$/.test(permitId)) {
+			bot.sendMessage(chatId, "❌ Invalid ID. Please enter numbers only.");
+			return;
+		  }
+		  
+		  try {
+			const existing = await Allowed.findOne({ 
+			  where: { telegramId: permitId } 
+			});
+			
+			if (existing) {
+			  // Update existing user's permission
+			  await existing.update({ permissionLevel: permLevel });
+			  bot.sendMessage(
+				chatId, 
+				`✅ User ${permitId} updated to ${permLevel} level.`,
+				mainMenu
+			  );
+			} else {
+			  await Allowed.create({ 
+				telegramId: permitId,
+				permissionLevel: permLevel
+			  });
+			  const accessNote = permLevel === 'user' 
+				? '📌 They can only use /line command.' 
+				: '📌 They have full access.';
+			  bot.sendMessage(
+				chatId, 
+				`✅ User ${permitId} permitted with ${permLevel} level!\n\n${accessNote}`,
+				mainMenu
+			  );
+			}
+		  } catch (error) {
+			bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+		  }
+		  delete userStates[userId];
+		  break;
     }
   });
 
@@ -1911,174 +2096,386 @@ const initializeBot = () => {
    
   // Add these commands to the telegram bot initialization
 
-// /line command - get last pressed DTMF entries
-bot.onText(/\/line(?:\s+info)?/, async (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const text = msg.text.trim();
-  const isInfo = text === '/line info';
-  
-  try {
-    // Get current campaign with callback trunk
-    const campaign = await Campaign.findOne({
-      where: { botToken: config.telegram_bot_token },
-      include: [
-        { model: SipPeer, as: 'sipTrunk' },
-        { model: SipPeer, as: 'callbackTrunk' }
-      ]
-    });
-    
-    // Get last 10 calls that pressed DTMF
-    const recentDTMF = await Call.findAll({
-      where: {
-        campaignId: campaign.id,
-        pressedDigit: { [Op.ne]: null }
-      },
-      order: [['updatedAt', 'DESC']],
-      limit: 10
-    });
-    
-    if (recentDTMF.length === 0) {
-      bot.sendMessage(
-        chatId,
-        `📋 *No DTMF Responses Yet*\n\nNo callers have pressed ${campaign.dtmfDigit} in this campaign.`,
-        { parse_mode: "Markdown" }
-      );
-      return;
-    }
-    
-    let message = `📋 *Recent DTMF Responses (${campaign.dtmfDigit})*\n\n`;
-    recentDTMF.forEach((call, index) => {
-      const time = call.updatedAt.toLocaleString();
-      message += `${index + 1}. ${escapeMarkdown(call.phoneNumber)}\n`;
-      message += `   Time: ${time}\n`;
-      if (call.rawLine) {
-        message += `   Raw: ${escapeMarkdown(call.rawLine)}\n`;
-      }
-      message += '\n';
-    });
-    
-    // Add callback info ONLY if /line info was used
-    //if (isInfo) {
-      message += `\n*Callback Configuration:*\n`;
-      
-      if (campaign.callbackTrunkId && campaign.callbackTrunk) {
-        message += `✅ Callback Trunk: ${escapeMarkdown(campaign.callbackTrunk.name)}\n`;
-        message += `📱 Callback Number: ${escapeMarkdown(campaign.callbackTrunkNumber || 'Not set')}\n`;
-        message += `📞 Regular Trunk: ${escapeMarkdown(campaign.sipTrunk.name)}\n`;
-        message += `🆔 Caller ID: ${escapeMarkdown(campaign.callerId || 'Not set')}\n\n`;
-        
-        if (campaign.callbackTrunkNumber) {
-          message += `To initiate callback to all ${recentDTMF.length} numbers above, type: *yes*\n`;
-          message += `To cancel, type anything else or use /menu`;
-          
-          userStates[userId] = { 
-            action: "waiting_callback_confirmation", 
-            campaignId: campaign.id,
-            dtmfNumbers: recentDTMF.map(call => call.phoneNumber)
-          };
-        } else {
-          message += `⚠️ Please set callback trunk number before initiating callbacks.`;
-        }
-      } else {
-        message += `❌ Callback Trunk: Not configured\n`;
-        message += `\nTo use callback feature, set both callback trunk and number from the main menu.`;
-      }
-    //}
-    
-    bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
-    
-  } catch (error) {
-    bot.sendMessage(chatId, `❌ Error: ${error.message}`);
-  }
-});
+	// /line command - get last pressed DTMF entries
+	bot.onText(/\/lines(?:\s+info)?/, async (msg) => {
+	  const chatId = msg.chat.id;
+	  const userId = msg.from.id;
+	  const text = msg.text.trim();
+	  
+	  // Check access
+	  if (!(await hasAccess(userId))) {
+		bot.sendMessage(chatId, "❌ You don't have permission to use this command.");
+		return;
+	  }
+	  
+	  try {
+		const campaign = await Campaign.findOne({
+		  where: { botToken: config.telegram_bot_token },
+		  include: [
+			{ model: SipPeer, as: 'sipTrunk' },
+			{ model: SipPeer, as: 'callbackTrunk' }
+		  ]
+		});
+		
+		if (!campaign) {
+		  bot.sendMessage(chatId, "❌ No campaign configured.");
+		  return;
+		}
+		
+		// Get last 10 calls that pressed DTMF
+		const recentDTMF = await Call.findAll({
+		  where: {
+			campaignId: campaign.id,
+			pressedDigit: { [Op.ne]: null }
+		  },
+		  order: [['updatedAt', 'DESC']],
+		  limit: 10
+		});
+		
+		if (recentDTMF.length === 0) {
+		  bot.sendMessage(
+			chatId,
+			`📋 <b>No DTMF Responses Yet</b>\n\nNo callers have pressed ${campaign.dtmfDigit} in this campaign.`,
+			{ parse_mode: "HTML" }
+		  );
+		  return;
+		}
+		
+		let message = `📋 <b>Recent DTMF Responses (${campaign.dtmfDigit})</b>\n\n`;
+		recentDTMF.forEach((call, index) => {
+		  const time = call.updatedAt.toLocaleString();
+		  const retrieved = call.lineRetrieved ? '✅' : '🆕';
+		  message += `${index + 1}. ${retrieved} <code>${escapeHtml(call.phoneNumber)}</code>\n`;
+		  message += `   Time: ${time}\n`;
+		  if (call.rawLine) {
+			const truncated = call.rawLine.substring(0, 50);
+			message += `   Raw: ${escapeHtml(truncated)}${call.rawLine.length > 50 ? '...' : ''}\n`;
+		  }
+		  message += '\n';
+		});
+		
+		message += `\n<b>Callback Configuration:</b>\n`;
+		
+		if (campaign.callbackTrunkId && campaign.callbackTrunk) {
+		  message += `✅ Callback Trunk: ${escapeHtml(campaign.callbackTrunk.name)}\n`;
+		  message += `📱 Callback Number: ${escapeHtml(campaign.callbackTrunkNumber || 'Not set')}\n`;
+		  message += `📞 Regular Trunk: ${escapeHtml(campaign.sipTrunk ? campaign.sipTrunk.name : 'N/A')}\n`;
+		  message += `🆔 Caller ID: ${escapeHtml(campaign.callerId || 'Not set')}\n\n`;
+		  
+		  if (campaign.callbackTrunkNumber) {
+			message += `To initiate callback to all ${recentDTMF.length} numbers above, type: <b>yes</b>\n`;
+			message += `To cancel, type anything else or use /menu`;
+			
+			userStates[userId] = { 
+			  action: "waiting_callback_confirmation", 
+			  campaignId: campaign.id,
+			  dtmfNumbers: recentDTMF.map(call => call.phoneNumber)
+			};
+		  } else {
+			message += `⚠️ Please set callback trunk number before initiating callbacks.`;
+		  }
+		} else {
+		  message += `❌ Callback Trunk: Not configured\n`;
+		  message += `\nTo use callback feature, set both callback trunk and number from the main menu.`;
+		}
+		
+		bot.sendMessage(chatId, message, { parse_mode: "HTML" });
+		
+	  } catch (error) {
+		console.error('/lines error:', error);
+		bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+	  }
+	});
 
-// /stats command - detailed statistics
-bot.onText(/\/stats/, async (msg) => {
-  const chatId = msg.chat.id;
-  
-  try {
-    const campaign = await getOrCreateCampaign();
-    const stats = await getCallStats(campaign.id);
-    
-    // Get hourly breakdown for last 24 hours
-    const hourlyStats = await sequelize.query(`
-      SELECT 
-        DATE_FORMAT(created_at, '%Y-%m-%d %H:00') as hour,
-        COUNT(*) as total_calls,
-        SUM(CASE WHEN call_status = 'success' THEN 1 ELSE 0 END) as successful,
-        SUM(CASE WHEN pressed_digit IS NOT NULL THEN 1 ELSE 0 END) as dtmf_responses
-      FROM calls
-      WHERE campaign_id = :campaignId
-        AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-      GROUP BY hour
-      ORDER BY hour DESC
-      LIMIT 24
-    `, {
-      replacements: { campaignId: campaign.id },
-      type: sequelize.QueryTypes.SELECT
-    });
-    
-    let message = `📊 *Detailed Campaign Statistics*\n\n`;
-    message += `*Overall Performance:*\n`;
-    message += `├ Total Calls: ${stats.total}\n`;
-    message += `├ Successful: ${stats.successful}\n`;
-    message += `├ Failed: ${stats.failed}\n`;
-	message += `├ Voicemail: ${stats.voicemail}\n`;
-    message += `├ DTMF (${campaign.dtmfDigit}): ${stats.dtmf_responses}\n`;
-    message += `├ Success Rate: ${stats.success_rate}%\n`;
-    message += `└ Response Rate: ${stats.response_rate}%\n\n`;
-    
-    if (hourlyStats.length > 0) {
-      message += `*Last 24 Hours:*\n`;
-      hourlyStats.slice(0, 5).forEach(hour => {
-        message += `${hour.hour}: ${hour.total_calls} calls, ${hour.dtmf_responses} responses\n`;
-      });
-    }
-    
-    bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
-    
-  } catch (error) {
-    bot.sendMessage(chatId, `❌ Error: ${error.message}`);
-  }
-});
+	bot.onText(/\/line(?:\s+(.+))?$/, async (msg, match) => {
+	  const chatId = msg.chat.id;
+	  const userId = msg.from.id;
+	  const messageId = msg.message_id;
+	  const argument = match[1] ? match[1].trim() : null;
+	  
+	  // Skip if this is /lines command
+	  if (msg.text.startsWith('/lines')) return;
+	  
+	  // Check access - even line-only users can use this
+	  if (!(await hasAccess(userId))) {
+		bot.sendMessage(chatId, "❌ You don't have permission to use this command.", {
+		  reply_to_message_id: messageId
+		});
+		return;
+	  }
+	  
+	  try {
+		const campaign = await Campaign.findOne({
+		  where: { botToken: config.telegram_bot_token }
+		});
+		
+		if (!campaign) {
+		  bot.sendMessage(chatId, "❌ No campaign configured.", {
+			reply_to_message_id: messageId
+		  });
+		  return;
+		}
+		
+		// If argument provided, lookup specific number
+		if (argument) {
+		  const searchNumber = argument.replace(/\D/g, ''); // Remove non-digits
+		  
+		  // Search for the number (try with and without + prefix)
+		  const call = await Call.findOne({
+			where: {
+			  campaignId: campaign.id,
+			  [Op.or]: [
+				{ phoneNumber: searchNumber },
+				{ phoneNumber: `+${searchNumber}` },
+				{ phoneNumber: { [Op.like]: `%${searchNumber}%` } }
+			  ]
+			}
+		  });
+		  
+		  if (!call) {
+			bot.sendMessage(chatId, `❌ No record found for number: ${argument}`, {
+			  reply_to_message_id: messageId
+			});
+			return;
+		  }
+		  
+		  // Format the lead data using HTML
+		  let response = `📋 <b>Lead Information</b>\n\n`;
+		  response += `📞 Phone: <code>${escapeHtml(call.phoneNumber)}</code>\n`;
+		  
+		  if (call.leadName) {
+			response += `👤 Name: ${escapeHtml(call.leadName)}\n`;
+		  }
+		  if (call.leadEmail) {
+			response += `📧 Email: ${escapeHtml(call.leadEmail)}\n`;
+		  }
+		  if (call.pressedDigit) {
+			response += `🔢 Pressed: ${call.pressedDigit}\n`;
+		  }
+		  response += `📊 Status: ${call.callStatus}\n`;
+		  
+		  if (call.rawLine) {
+			response += `\n📝 <b>Raw Data:</b>\n<pre>${escapeHtml(call.rawLine)}</pre>`;
+		  }
+		  
+		  // Parse additional lead data if exists
+		  if (call.leadData) {
+			try {
+			  const extraData = JSON.parse(call.leadData);
+			  response += `\n📎 <b>Additional Info:</b>\n`;
+			  for (const [key, value] of Object.entries(extraData)) {
+				response += `• ${escapeHtml(key)}: ${escapeHtml(String(value))}\n`;
+			  }
+			} catch (e) {
+			  response += `\n📎 Extra: ${escapeHtml(call.leadData)}`;
+			}
+		  }
+		  
+		  response += `\n⏰ Updated: ${call.updatedAt.toLocaleString()}`;
+		  
+		  bot.sendMessage(chatId, response, {
+			parse_mode: "HTML",
+			reply_to_message_id: messageId
+		  });
+		  return;
+		}
+		
+		// No argument - get next unretrieved P1 line
+		const nextLine = await Call.findOne({
+		  where: {
+			campaignId: campaign.id,
+			pressedDigit: { [Op.ne]: null },  // Has pressed DTMF
+			lineRetrieved: false              // Not yet retrieved
+		  },
+		  order: [['updatedAt', 'ASC']]  // Oldest first (FIFO)
+		});
+		
+		if (!nextLine) {
+		  bot.sendMessage(chatId, `📭 No new P1 lines available.\n\nAll DTMF responses have been retrieved.`, {
+			reply_to_message_id: messageId
+		  });
+		  return;
+		}
+		
+		// Mark as retrieved
+		await nextLine.update({
+		  lineRetrieved: true,
+		  retrievedBy: String(userId),
+		  retrievedAt: new Date()
+		});
+		
+		// Count remaining
+		const remainingCount = await Call.count({
+		  where: {
+			campaignId: campaign.id,
+			pressedDigit: { [Op.ne]: null },
+			lineRetrieved: false
+		  }
+		});
+		
+		// Send the raw line EXACTLY as stored (preserving formatting)
+		// NO parse_mode to preserve exact formatting from user's notepad!
+		let response = '';
+		
+		if (nextLine.rawLine) {
+		  // Send raw line as-is without any parsing to preserve exact formatting
+		  response = nextLine.rawLine;
+		} else {
+		  // Fallback if no raw line stored
+		  response = `📞 ${nextLine.phoneNumber}`;
+		  if (nextLine.leadName) response += `\n👤 ${nextLine.leadName}`;
+		  if (nextLine.leadEmail) response += `\n📧 ${nextLine.leadEmail}`;
+		}
+		
+		// Add footer with remaining count
+		response += `\n\n━━━━━━━━━━━━━━━\n📊 Remaining P1s: ${remainingCount}`;
+		
+		// NO parse_mode here - this preserves EXACT formatting including emojis, spaces, etc.
+		bot.sendMessage(chatId, response, {
+		  reply_to_message_id: messageId
+		});
+		
+	  } catch (error) {
+		console.error('/line error:', error);
+		bot.sendMessage(chatId, `❌ Error: ${error.message}`, {
+		  reply_to_message_id: messageId
+		});
+	  }
+	});
 
-// /reset command - reset campaign statistics (admin only)
-bot.onText(/\/reset/, async (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  
-  if (userId != adminId) {
-    bot.sendMessage(chatId, "❌ Admin access required!");
-    return;
-  }
-  
-  try {
-    const campaign = await getOrCreateCampaign();
-    
-    await campaign.update({
-      totalCalls: 0,
-      successfulCalls: 0,
-      failedCalls: 0,
-	  voicemailCalls: 0,
-      dtmfResponses: 0,
-      callCounter: 0
-    });
-    
-    // Clear pressed numbers
-    const { ami } = require("../asterisk/instance");
-    ami.emit('clear_pressed_numbers');
-    
-    bot.sendMessage(
-      chatId,
-      `✅ *Campaign Statistics Reset*\n\nAll counters have been reset to 0.`,
-      { parse_mode: "Markdown", ...mainMenu }
-    );
-    
-  } catch (error) {
-    bot.sendMessage(chatId, `❌ Error: ${error.message}`);
-  }
-});
+
+
+	// /stats command - detailed statistics
+	bot.onText(/\/stats/, async (msg) => {
+	  const chatId = msg.chat.id;
+	  
+	  try {
+		const campaign = await getOrCreateCampaign();
+		const stats = await getCallStats(campaign.id);
+		
+		// Get hourly breakdown for last 24 hours
+		const hourlyStats = await sequelize.query(`
+		  SELECT 
+			DATE_FORMAT(created_at, '%Y-%m-%d %H:00') as hour,
+			COUNT(*) as total_calls,
+			SUM(CASE WHEN call_status = 'success' THEN 1 ELSE 0 END) as successful,
+			SUM(CASE WHEN pressed_digit IS NOT NULL THEN 1 ELSE 0 END) as dtmf_responses
+		  FROM calls
+		  WHERE campaign_id = :campaignId
+			AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+		  GROUP BY hour
+		  ORDER BY hour DESC
+		  LIMIT 24
+		`, {
+		  replacements: { campaignId: campaign.id },
+		  type: sequelize.QueryTypes.SELECT
+		});
+		
+		let message = `📊 *Detailed Campaign Statistics*\n\n`;
+		message += `*Overall Performance:*\n`;
+		message += `├ Total Calls: ${stats.total}\n`;
+		message += `├ Successful: ${stats.successful}\n`;
+		message += `├ Failed: ${stats.failed}\n`;
+		message += `├ Voicemail: ${stats.voicemail}\n`;
+		message += `├ DTMF (${campaign.dtmfDigit}): ${stats.dtmf_responses}\n`;
+		message += `├ Success Rate: ${stats.success_rate}%\n`;
+		message += `└ Response Rate: ${stats.response_rate}%\n\n`;
+		
+		if (hourlyStats.length > 0) {
+		  message += `*Last 24 Hours:*\n`;
+		  hourlyStats.slice(0, 5).forEach(hour => {
+			message += `${hour.hour}: ${hour.total_calls} calls, ${hour.dtmf_responses} responses\n`;
+		  });
+		}
+		
+		bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
+		
+	  } catch (error) {
+		bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+	  }
+	});
+
+	// /reset command - reset campaign statistics (admin only)
+	bot.onText(/\/resetlines/, async (msg) => {
+	  const chatId = msg.chat.id;
+	  const userId = msg.from.id;
+	  
+	  if (!(await isAdmin(userId))) {
+		bot.sendMessage(chatId, "❌ Admin access required!");
+		return;
+	  }
+	  
+	  try {
+		const campaign = await getOrCreateCampaign();
+		
+		// Reset all line_retrieved flags for this campaign
+		const [updatedCount] = await Call.update(
+		  { 
+			lineRetrieved: false,
+			retrievedBy: null,
+			retrievedAt: null
+		  },
+		  {
+			where: {
+			  campaignId: campaign.id,
+			  pressedDigit: { [Op.ne]: null }
+			}
+		  }
+		);
+		
+		bot.sendMessage(
+		  chatId,
+		  `✅ <b>Lines Reset</b>\n\n${updatedCount} P1 lines have been marked as unretrieved.\n\nThey can now be retrieved again via /line.`,
+		  { parse_mode: "HTML" }
+		);
+		
+	  } catch (error) {
+		bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+	  }
+	});
+
+	bot.onText(/\/linecount/, async (msg) => {
+	  const chatId = msg.chat.id;
+	  const userId = msg.from.id;
+	  
+	  if (!(await hasAccess(userId))) {
+		bot.sendMessage(chatId, "❌ Access denied.");
+		return;
+	  }
+	  
+	  try {
+		const campaign = await getOrCreateCampaign();
+		
+		const totalP1s = await Call.count({
+		  where: {
+			campaignId: campaign.id,
+			pressedDigit: { [Op.ne]: null }
+		  }
+		});
+		
+		const retrievedP1s = await Call.count({
+		  where: {
+			campaignId: campaign.id,
+			pressedDigit: { [Op.ne]: null },
+			lineRetrieved: true
+		  }
+		});
+		
+		const availableP1s = totalP1s - retrievedP1s;
+		
+		bot.sendMessage(
+		  chatId,
+		  `📊 <b>P1 Line Statistics</b>\n\n` +
+		  `📞 Total P1s: ${totalP1s}\n` +
+		  `✅ Retrieved: ${retrievedP1s}\n` +
+		  `🆕 Available: ${availableP1s}`,
+		  { parse_mode: "HTML" }
+		);
+		
+	  } catch (error) {
+		bot.sendMessage(chatId, `❌ Error: ${error.message}`);
+	  }
+	});
 
 };
 

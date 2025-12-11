@@ -21,23 +21,6 @@ const Call = sequelize.define('Call', {
     allowNull: true,
     field: 'raw_line'
   },
-  // Lead data fields
-  leadName: {
-    type: DataTypes.STRING(100),
-    allowNull: true,
-    field: 'lead_name'
-  },
-  leadEmail: {
-    type: DataTypes.STRING(255),
-    allowNull: true,
-    field: 'lead_email'
-  },
-  leadData: {
-    type: DataTypes.TEXT,
-    allowNull: true,
-    field: 'lead_data',
-    comment: 'JSON string with additional lead info'
-  },
   callerId: {
     type: DataTypes.STRING(50),
     allowNull: true,
@@ -81,24 +64,6 @@ const Call = sequelize.define('Call', {
     type: DataTypes.ENUM('yes', 'no'),
     defaultValue: 'no',
     field: 'voicemail'
-  },
-  // NEW: Track if this P1 line has been retrieved via /line command
-  lineRetrieved: {
-    type: DataTypes.BOOLEAN,
-    defaultValue: false,
-    field: 'line_retrieved'
-  },
-  // NEW: Who retrieved this line (Telegram user ID)
-  retrievedBy: {
-    type: DataTypes.STRING(50),
-    allowNull: true,
-    field: 'retrieved_by'
-  },
-  // NEW: When was this line retrieved
-  retrievedAt: {
-    type: DataTypes.DATE,
-    allowNull: true,
-    field: 'retrieved_at'
   },
   createdAt: {
     type: DataTypes.DATE,

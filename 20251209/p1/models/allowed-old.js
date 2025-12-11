@@ -16,24 +16,6 @@ const Allowed = sequelize.define('Allowed', {
     unique: true,
     field: 'telegram_id'
   },
-  // Permission level:
-  // 'admin' - full access to all commands
-  // 'user' - only /line command access
-  permissionLevel: {
-    type: DataTypes.ENUM('admin', 'user'),
-    defaultValue: 'user',
-    field: 'permission_level'
-  },
-  username: {
-    type: DataTypes.STRING(100),
-    allowNull: true,
-    field: 'username'
-  },
-  displayName: {
-    type: DataTypes.STRING(100),
-    allowNull: true,
-    field: 'display_name'
-  },
   createdAt: {
     type: DataTypes.DATE,
     defaultValue: DataTypes.NOW,
