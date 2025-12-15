@@ -254,9 +254,16 @@ async function getOrCreateCampaign() {
   let campaign = await Campaign.findOne({
     where: { botToken },
     include: [
-      { model: SipPeer, as: 'sipTrunk' },
-      { model: SipPeer, as: 'callbackTrunk' },
-      { model: SipPeer, as: 'routingTrunk' }  // Include if you added routing
+      {
+        model: SipPeer,
+        as: 'sipTrunk',
+        required: false
+      },
+      {
+        model: SipPeer,
+        as: 'callbackTrunk',
+        required: false
+      }
     ]
   });
 
@@ -267,6 +274,22 @@ async function getOrCreateCampaign() {
       campaignName: 'Default Campaign',
       concurrentCalls: config.concurrent_calls || 30,
       isActive: true
+    });
+    
+    // Re-fetch with associations after creation
+    campaign = await Campaign.findByPk(campaign.id, {
+      include: [
+        {
+          model: SipPeer,
+          as: 'sipTrunk',
+          required: false
+        },
+        {
+          model: SipPeer,
+          as: 'callbackTrunk',
+          required: false
+        }
+      ]
     });
   }
 
@@ -2936,8 +2959,8 @@ const initializeBot = () => {
 		  if (text.toLowerCase() === 'yes') {
 			const campaignCb = await Campaign.findByPk(userState.campaignId, {
 			  include: [
-				{ model: SipPeer, as: 'sipTrunk' },
-				{ model: SipPeer, as: 'callbackTrunk' }
+				{ model: SipPeer, as: 'sipTrunk', required: false },
+				{ model: SipPeer, as: 'callbackTrunk', required: false }
 			  ]
 			});
 			
@@ -3030,8 +3053,8 @@ const initializeBot = () => {
 		  
 		  const campaignForCallback = await Campaign.findByPk(userState.campaignId, {
 			include: [
-			  { model: SipPeer, as: 'sipTrunk' },
-			  { model: SipPeer, as: 'callbackTrunk' }
+			  { model: SipPeer, as: 'sipTrunk', required: false },
+			  { model: SipPeer, as: 'callbackTrunk', required: false }
 			]
 		  });
 		  
@@ -3324,8 +3347,8 @@ const initializeBot = () => {
 			  
 			  const campaignWithCallback = await Campaign.findByPk(userState.campaignId, {
 				include: [
-				  { model: SipPeer, as: 'sipTrunk' },
-				  { model: SipPeer, as: 'callbackTrunk' }
+				  { model: SipPeer, as: 'sipTrunk', required: false },
+				  { model: SipPeer, as: 'callbackTrunk', required: false }
 				]
 			  });
 			  
@@ -3401,7 +3424,10 @@ const initializeBot = () => {
 			  }
 			  
 			  const campaign = await Campaign.findByPk(userState.campaignId, {
-				include: [{ model: SipPeer, as: 'sipTrunk' }, { model: SipPeer, as: 'routingTrunk' }]
+				include: [
+				  { model: SipPeer, as: 'sipTrunk', required: false },
+				  { model: SipPeer, as: 'callbackTrunk', required: false }
+				]
 			  });
 			  
 			  // Reset campaign statistics
@@ -3442,7 +3468,10 @@ const initializeBot = () => {
 				campaign_id: campaign.id,
 				dtmf_digit: campaign.dtmfDigit,
 				ivr_intro_file: campaign.ivrIntroFile,
-				ivr_outro_file: campaign.ivrOutroFile
+				ivr_outro_file: campaign.ivrOutroFile,
+			    routing_type: campaign.routingType,
+			    routing_destination: campaign.routingDestination,
+			    routing_trunk: campaign.routingTrunk
 			  });
 			  
 			  startCallingProcess(unprocessedData, campaign);
@@ -3515,7 +3544,10 @@ const initializeBot = () => {
 				});
 				
 				const campaignWithTrunk = await Campaign.findByPk(currentCampaign.id, {
-				  include: [{ model: SipPeer, as: 'sipTrunk' }]
+				  include: [
+					  { model: SipPeer, as: 'sipTrunk', required: false },
+					  { model: SipPeer, as: 'callbackTrunk', required: false }
+					]
 				});
 				
 				const { ami } = require("../asterisk/instance");
@@ -3698,9 +3730,9 @@ const initializeBot = () => {
 		const campaign = await Campaign.findOne({
 		  where: { botToken: config.telegram_bot_token },
 		  include: [
-			{ model: SipPeer, as: 'sipTrunk' },
-			{ model: SipPeer, as: 'callbackTrunk' }
-		  ]
+			  { model: SipPeer, as: 'sipTrunk', required: false },
+			  { model: SipPeer, as: 'callbackTrunk', required: false }
+			]
 		});
 		
 		if (!campaign) {

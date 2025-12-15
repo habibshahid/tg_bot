@@ -82,22 +82,15 @@ module.exports = async (entry) => {
   
   // Add Call Routing variables
   const routingType = settings.routing_type || 'sip_trunk';
-  variables.ROUTING_TYPE = routingType;
+  variables.__ROUTING_TYPE = routingType;
   
   if (routingType === 'sip_trunk') {
     // SIP Trunk routing - send destination number and trunk name
-    if (settings.routing_destination) {
-      variables.ROUTING_DESTINATION = settings.routing_destination;
-    }
-    if (settings.routing_trunk) {
-      variables.ROUTING_TRUNK_NAME = settings.routing_trunk.name;
-      variables.ROUTING_TRUNK_HOST = settings.routing_trunk.host || '';
-    }
+    variables.__ROUTING_DESTINATION = settings.routing_destination;
+    variables.__ROUTING_TRUNK_NAME = settings.sip_trunk.name;
   } else if (routingType === 'queue') {
     // Queue/Agent routing - send queue name
-    if (settings.routing_destination) {
-      variables.ROUTING_QUEUE = settings.routing_destination;
-    }
+    variables.__ROUTING_QUEUE = settings.routing_destination;
   }
   
   ami.action(
