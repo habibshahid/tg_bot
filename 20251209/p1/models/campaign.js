@@ -51,6 +51,44 @@ const Campaign = sequelize.define('Campaign', {
     allowNull: true,
     field: 'caller_id'
   },
+  callerIds: {
+    type: DataTypes.TEXT,
+    allowNull: true,
+    field: 'caller_ids',
+    get() {
+      const rawValue = this.getDataValue('callerIds');
+      if (!rawValue) return [];
+      try {
+        return JSON.parse(rawValue);
+      } catch (e) {
+        return [];
+      }
+    },
+    set(value) {
+      if (Array.isArray(value)) {
+        this.setDataValue('callerIds', JSON.stringify(value));
+      } else if (typeof value === 'string') {
+        this.setDataValue('callerIds', value);
+      } else {
+        this.setDataValue('callerIds', '[]');
+      }
+    }
+  },
+  callerIdIndex: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0,
+    field: 'caller_id_index'
+  },
+  callerIdRotationEnabled: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: false,
+    field: 'caller_id_rotation_enabled'
+  },
+  callsPerCallerId: {
+    type: DataTypes.INTEGER,
+    defaultValue: 1,
+    field: 'calls_per_caller_id'
+  },
   dialPrefix: {
     type: DataTypes.STRING(20),
     allowNull: true,

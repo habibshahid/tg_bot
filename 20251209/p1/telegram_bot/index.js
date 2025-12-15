@@ -20,7 +20,7 @@ const sequelize = require("../config/database");
 const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
-
+const { parseCallerIds, getNextCallerId } = require("../utils/aniRotation");
 
 // State management for user interactions
 const userStates = {};
@@ -551,9 +551,8 @@ const initializeBot = () => {
 			{ text: "📁 Upload Leads (TXT)", callback_data: "upload_leads" }
 		  ],
 		  [{
-				text: "🔄 Toggle Rotation",
-				callback_data: "toggle_rotation"
-		  }],
+				text: "🔄 Toggle Rotation", callback_data: "toggle_rotation"
+		  },{ text: "📞 Caller ID Settings", callback_data: "caller_id_menu" }],
 		  [
 			{ text: "⚙️ Set Concurrent Calls", callback_data: "set_concurrent" },
 			{ text: "📞 Set Caller ID", callback_data: "set_caller_id" }
@@ -585,6 +584,9 @@ const initializeBot = () => {
 			{ text: "📍 Set Line Output Group", callback_data: "set_line_output" },
 			{ text: "📝 Set Private Notepad", callback_data: "set_private_notepad" }
 		  ],
+		  [
+			{ text: "🗑️ Clear Database", callback_data: "clear_database" }
+		  ]
 		]
 	  }
 	};
@@ -639,6 +641,235 @@ const initializeBot = () => {
     bot.answerCallbackQuery(query.id);
 
     switch (callbackData) {
+		case "clear_database":
+			// Check if user is admin
+			let permittedUserClearDB = await Allowed.findOne({
+				where: {
+					telegramId: userId
+				}
+			});
+			console.log(`Request from User ${userId} for clear_database`);
+
+			if (userId == adminId) {
+				permittedUserClearDB = true;
+			}
+
+			if (!permittedUserClearDB) {
+				console.log("❌ Admin access required to clear_database!", userId);
+				bot.sendMessage(chatId, "❌ Admin access required!");
+				return;
+			}
+
+			// Get current call count
+			const callCount = await Call.count();
+
+			bot.sendMessage(
+				chatId,
+				`🗑️ *Clear Call Database*\n\n` +
+				`⚠️ *WARNING: This action cannot be undone!*\n\n` +
+				`This will permanently delete:\n` +
+				`• All ${callCount} call records\n` +
+				`• All phone numbers\n` +
+				`• All call history\n` +
+				`• All DTMF responses\n\n` +
+				`Campaign statistics will NOT be affected.\n\n` +
+				`Are you sure you want to continue?`, {
+					parse_mode: "Markdown",
+					reply_markup: {
+						inline_keyboard: [
+							[{
+									text: "✅ Yes, Clear Database",
+									callback_data: "confirm_clear_database"
+								},
+								{
+									text: "❌ Cancel",
+									callback_data: "back_to_menu"
+								}
+							]
+						]
+					}
+				}
+			);
+			break;
+			
+		case "confirm_clear_database":
+			// Double check admin access
+			let permittedUserConfirmClear = await Allowed.findOne({
+				where: {
+					telegramId: userId
+				}
+			});
+
+			if (userId == adminId) {
+				permittedUserConfirmClear = true;
+			}
+
+			if (!permittedUserConfirmClear) {
+				console.log("❌ Admin access required to confirm_clear_database!", userId);
+				bot.sendMessage(chatId, "❌ Admin access required!");
+				return;
+			}
+
+			try {
+				// Get count before deletion
+				const totalCalls = await Call.count();
+
+				console.log(`[Clear DB] User ${userId} is clearing calls table (${totalCalls} records)`);
+
+				// Truncate the calls table
+				await Call.destroy({
+					where: {},
+					truncate: true,
+					cascade: true
+				});
+
+				console.log(`[Clear DB] Successfully cleared ${totalCalls} call records`);
+
+				bot.sendMessage(
+					chatId,
+					`✅ *Database Cleared Successfully!*\n\n` +
+					`Deleted: ${totalCalls} call records\n\n` +
+					`The calls table has been completely cleared.\n` +
+					`You can now start fresh with new campaigns.`, {
+						parse_mode: "Markdown",
+						...mainMenu
+					}
+				);
+
+			} catch (error) {
+				console.error('[Clear DB] Error:', error);
+				bot.sendMessage(
+					chatId,
+					`❌ *Error Clearing Database*\n\n` +
+					`Error: ${escapeMarkdown(error.message)}\n\n` +
+					`Please check the logs and try again.`, {
+						parse_mode: "Markdown",
+						...mainMenu
+					}
+				);
+			}
+			break;
+			
+		case "caller_id_menu":
+			if (!(await isAdmin(userId))) {
+			  bot.sendMessage(chatId, "❌ Admin access required!");
+			  return;
+			}
+			
+			const campaignCID = await getOrCreateCampaign();
+			const cids = campaignCID.callerIds || [];
+			const rotStatus = campaignCID.callerIdRotationEnabled ? '✅ ON' : '❌ OFF';
+			
+			let cidInfo = `📞 <b>Caller ID Settings</b>\n\n`;
+			cidInfo += `<b>Rotation:</b> ${rotStatus}\n`;
+			cidInfo += `<b>Calls per ID:</b> ${campaignCID.callsPerCallerId || 1}\n`;
+			cidInfo += `<b>Total:</b> ${cids.length}\n\n`;
+			
+			if (cids.length > 0) {
+			  cids.forEach((c, i) => {
+				const marker = i === campaignCID.callerIdIndex ? '➡️' : '  ';
+				cidInfo += `${marker} ${i + 1}. <code>${escapeHtml(c)}</code>\n`;
+			  });
+			} else {
+			  cidInfo += `⚠️ No caller IDs configured.`;
+			}
+			
+			bot.sendMessage(chatId, cidInfo, {
+			  parse_mode: "HTML",
+			  reply_markup: {
+				inline_keyboard: [
+				  [
+					{ text: "➕ Add Caller IDs", callback_data: "add_caller_ids" },
+					{ text: "🗑️ Remove", callback_data: "remove_caller_id" }
+				  ],
+				  [
+					{ text: "🔄 Toggle Rotation", callback_data: "toggle_cid_rotation" },
+					{ text: "⚙️ Calls Per ID", callback_data: "set_calls_per_id" }
+				  ],
+				  [
+					{ text: "🧹 Clear All", callback_data: "clear_caller_ids" },
+					{ text: "🔁 Reset Index", callback_data: "reset_cid_index" }
+				  ],
+				  [{ text: "🔙 Back", callback_data: "back_to_menu" }]
+				]
+			  }
+			});
+			break;
+
+		  case "add_caller_ids":
+			if (!(await isAdmin(userId))) {
+			  bot.sendMessage(chatId, "❌ Admin access required!");
+			  return;
+			}
+			const campAdd = await getOrCreateCampaign();
+			bot.sendMessage(chatId,
+			  `➕ <b>Add Caller IDs</b>\n\nEnter caller ID(s) - one per line or comma-separated:\n\n` +
+			  `Example:\n<code>12025551234\n12025555678\n12025559012</code>`,
+			  { parse_mode: "HTML" }
+			);
+			userStates[userId] = { action: "waiting_add_caller_ids", campaignId: campAdd.id };
+			break;
+
+		  case "toggle_cid_rotation":
+			if (!(await isAdmin(userId))) {
+			  bot.sendMessage(chatId, "❌ Admin access required!");
+			  return;
+			}
+			const campToggle = await getOrCreateCampaign();
+			const newState = !campToggle.callerIdRotationEnabled;
+			await campToggle.update({ callerIdRotationEnabled: newState });
+			bot.sendMessage(chatId, `🔄 Caller ID Rotation: <b>${newState ? 'ENABLED' : 'DISABLED'}</b>`, { parse_mode: "HTML" });
+			break;
+
+		  case "set_calls_per_id":
+			if (!(await isAdmin(userId))) {
+			  bot.sendMessage(chatId, "❌ Admin access required!");
+			  return;
+			}
+			const campCalls = await getOrCreateCampaign();
+			bot.sendMessage(chatId,
+			  `⚙️ <b>Calls Per Caller ID</b>\n\nCurrent: ${campCalls.callsPerCallerId || 1}\n\nEnter number (1-1000):`,
+			  { parse_mode: "HTML" }
+			);
+			userStates[userId] = { action: "waiting_calls_per_id", campaignId: campCalls.id };
+			break;
+
+		  case "remove_caller_id":
+			if (!(await isAdmin(userId))) {
+			  bot.sendMessage(chatId, "❌ Admin access required!");
+			  return;
+			}
+			const campRem = await getOrCreateCampaign();
+			const remIds = campRem.callerIds || [];
+			if (remIds.length === 0) {
+			  bot.sendMessage(chatId, "❌ No caller IDs to remove.");
+			  return;
+			}
+			let remMsg = `🗑️ Enter number to remove:\n\n`;
+			remIds.forEach((c, i) => { remMsg += `${i + 1}. <code>${escapeHtml(c)}</code>\n`; });
+			bot.sendMessage(chatId, remMsg, { parse_mode: "HTML" });
+			userStates[userId] = { action: "waiting_remove_caller_id", campaignId: campRem.id };
+			break;
+
+		  case "clear_caller_ids":
+			if (!(await isAdmin(userId))) {
+			  bot.sendMessage(chatId, "❌ Admin access required!");
+			  return;
+			}
+			const campClear = await getOrCreateCampaign();
+			await campClear.update({ callerIds: [], callerIdIndex: 0 });
+			bot.sendMessage(chatId, "✅ All caller IDs cleared.");
+			break;
+
+		  case "reset_cid_index":
+			if (!(await isAdmin(userId))) {
+			  bot.sendMessage(chatId, "❌ Admin access required!");
+			  return;
+			}
+			const campReset = await getOrCreateCampaign();
+			await campReset.update({ callerIdIndex: 0 });
+			bot.sendMessage(chatId, "✅ Rotation index reset to 0.");
+			break;
 		case "set_line_output":
 		  if (!(await isAdmin(userId))) {
 			bot.sendMessage(chatId, "❌ Admin access required!");
@@ -1300,6 +1531,48 @@ const initializeBot = () => {
     if (!userState) return;
 
     switch (userState.action) {
+		case "waiting_add_caller_ids":
+			const addRes = parseCallerIds(text);
+			if (!addRes.valid) {
+			  bot.sendMessage(chatId, `❌ ${addRes.message}`);
+			  delete userStates[userId];
+			  return;
+			}
+			const campAddIds = await Campaign.findByPk(userState.campaignId);
+			const existing = campAddIds.callerIds || [];
+			const combined = [...new Set([...existing, ...addRes.callerIds])];
+			await campAddIds.update({ callerIds: combined, callerId: combined[0] });
+			bot.sendMessage(chatId, `✅ Added ${addRes.callerIds.length} caller ID(s). Total: ${combined.length}`);
+			delete userStates[userId];
+			break;
+
+		  case "waiting_calls_per_id":
+			const cpiNum = parseInt(text);
+			if (isNaN(cpiNum) || cpiNum < 1 || cpiNum > 1000) {
+			  bot.sendMessage(chatId, "❌ Enter a number between 1-1000.");
+			  return;
+			}
+			const campCpi = await Campaign.findByPk(userState.campaignId);
+			await campCpi.update({ callsPerCallerId: cpiNum });
+			bot.sendMessage(chatId, `✅ Caller ID will rotate every ${cpiNum} call(s).`);
+			delete userStates[userId];
+			break;
+
+		  case "waiting_remove_caller_id":
+			const remIdx = parseInt(text) - 1;
+			const campRemId = await Campaign.findByPk(userState.campaignId);
+			const currIds = campRemId.callerIds || [];
+			if (isNaN(remIdx) || remIdx < 0 || remIdx >= currIds.length) {
+			  bot.sendMessage(chatId, `❌ Enter 1-${currIds.length}.`);
+			  return;
+			}
+			const removed = currIds[remIdx];
+			const newIds = currIds.filter((_, i) => i !== remIdx);
+			let newIdx = campRemId.callerIdIndex >= newIds.length ? 0 : campRemId.callerIdIndex;
+			await campRemId.update({ callerIds: newIds, callerIdIndex: newIdx, callerId: newIds[0] || null });
+			bot.sendMessage(chatId, `✅ Removed: ${removed}`);
+			delete userStates[userId];
+			break;
 		case "waiting_line_output_chat":
 		  const lineOutputInput = text.trim().toLowerCase();
 		  const campaignLineOutput = await getOrCreateCampaign();
