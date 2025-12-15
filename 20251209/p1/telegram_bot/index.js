@@ -21,6 +21,8 @@ const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
 const { parseCallerIds, getNextCallerId } = require("../utils/aniRotation");
+const Queue = require("../models/queue");
+const QueueMember = require("../models/queueMember");
 
 // State management for user interactions
 const userStates = {};
@@ -251,10 +253,11 @@ async function getOrCreateCampaign() {
   
   let campaign = await Campaign.findOne({
     where: { botToken },
-    include: [{
-      model: SipPeer,
-      as: 'sipTrunk'
-    }]
+    include: [
+      { model: SipPeer, as: 'sipTrunk' },
+      { model: SipPeer, as: 'callbackTrunk' },
+      { model: SipPeer, as: 'routingTrunk' }  // Include if you added routing
+    ]
   });
 
   if (!campaign) {
@@ -469,6 +472,63 @@ async function filterProcessedNumbers(data, campaignId = null) {
   });
 }
 
+// Get available queues from database
+async function getQueues() {
+  return await Queue.findAll({
+    order: [['name', 'ASC']]
+  });
+}
+
+// Get queue members (agents) for a queue
+async function getQueueMembers(queueName) {
+  return await QueueMember.findAll({
+    where: { queue_name: queueName }
+  });
+}
+
+// Get all queue memberships for an agent
+async function getAgentQueues(agentName) {
+  return await QueueMember.findAll({
+    where: { 
+      [Op.or]: [
+        { membername: agentName },
+        { interface: `SIP/${agentName}` }
+      ]
+    }
+  });
+}
+
+// Get available agents (SIP peers that are not trunks)
+async function getAvailableAgents() {
+  return await SipPeer.findAll({
+    where: { 
+      category: { [Op.ne]: 'trunk' },
+      status: 1
+    },
+    order: [['name', 'ASC']]
+  });
+}
+
+// Get all agents (including inactive)
+async function getAllAgents() {
+  return await SipPeer.findAll({
+    where: { 
+      category: { [Op.ne]: 'trunk' }
+    },
+    order: [['name', 'ASC']]
+  });
+}
+
+// Generate random SIP password
+function generateSipPassword(length = 16) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < length; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+
 // Get call statistics
 async function getCallStats(campaignId = null) {
   if (campaignId) {
@@ -483,7 +543,7 @@ async function getCallStats(campaignId = null) {
 			success_rate: campaign.totalCalls > 0 ? (((campaign.successfulCalls) / campaign.totalCalls) * 100).toFixed(2) : 0,
 			response_rate: campaign.successfulCalls > 0 ? ((campaign.dtmfResponses / (campaign.successfulCalls)) * 100).toFixed(2) : 0
 		};
-		console.log('##############', campaignStats)
+		
 		return campaignStats;
     }
   }
@@ -578,14 +638,16 @@ const initializeBot = () => {
 			{ text: "📱 Set Callback Number", callback_data: "set_callback_number" }
 		  ],
 		  [
-			{ text: "📲 Initiate Callback", callback_data: "initiate_callback" }
+			{ text: "📲 Initiate Callback", callback_data: "initiate_callback" },
+			{ text: "🗑️ Clear Database", callback_data: "clear_database" }
 		  ],
 		  [
 			{ text: "📍 Set Line Output Group", callback_data: "set_line_output" },
 			{ text: "📝 Set Private Notepad", callback_data: "set_private_notepad" }
 		  ],
 		  [
-			{ text: "🗑️ Clear Database", callback_data: "clear_database" }
+		    { text: "🔀 Call Routing", callback_data: "call_routing_menu" },
+		    { text: "👥 Agent Management", callback_data: "agent_management_menu" }
 		  ]
 		]
 	  }
@@ -641,6 +703,510 @@ const initializeBot = () => {
     bot.answerCallbackQuery(query.id);
 
     switch (callbackData) {
+		case "call_routing_menu":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const campaignRouting = await getOrCreateCampaign();
+		  const currentRouting = campaignRouting.routingType || 'sip_trunk';
+		  const routingDest = campaignRouting.routingDestination || 'Not set';
+		  
+		  let routingInfo = `🔀 <b>Call Routing Configuration</b>\n\n`;
+		  routingInfo += `<b>Current Mode:</b> ${currentRouting === 'sip_trunk' ? '📞 SIP Trunk' : '👥 Agent Queue'}\n`;
+		  routingInfo += `<b>Destination:</b> ${escapeHtml(routingDest)}\n`;
+		  
+		  if (currentRouting === 'sip_trunk' && campaignRouting.routingTrunkId) {
+			const routingTrunk = await SipPeer.findByPk(campaignRouting.routingTrunkId);
+			if (routingTrunk) {
+			  routingInfo += `<b>Routing Trunk:</b> ${escapeHtml(routingTrunk.name)}\n`;
+			}
+		  }
+		  
+		  bot.sendMessage(chatId, routingInfo, {
+			parse_mode: "HTML",
+			reply_markup: {
+			  inline_keyboard: [
+				[
+				  { text: "📞 Route to SIP Trunk", callback_data: "routing_sip_trunk" },
+				  { text: "👥 Route to Queue", callback_data: "routing_queue" }
+				],
+				[
+				  { text: "📊 View Current Config", callback_data: "routing_view_config" }
+				],
+				[{ text: "🔙 Back", callback_data: "back_to_menu" }]
+			  ]
+			}
+		  });
+		  break;
+
+		case "routing_sip_trunk":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const routingTrunks = await getSipTrunks();
+		  
+		  if (routingTrunks.length === 0) {
+			bot.sendMessage(chatId, `❌ No SIP Trunks Found. Please configure SIP trunks first.`);
+			return;
+		  }
+		  
+		  let trunkListRouting = "📞 <b>Select SIP Trunk for Call Routing:</b>\n\n";
+		  routingTrunks.forEach((trunk, index) => {
+			trunkListRouting += `${index + 1}. <b>${escapeHtml(trunk.name)}</b>\n`;
+			trunkListRouting += `   📍 Host: ${escapeHtml(trunk.host)}\n`;
+			trunkListRouting += `   🔌 Status: ${trunk.status ? '✅ Active' : '❌ Inactive'}\n\n`;
+		  });
+		  trunkListRouting += "Enter the number of the trunk:";
+		  
+		  const campaignForRouting = await getOrCreateCampaign();
+		  bot.sendMessage(chatId, trunkListRouting, { parse_mode: "HTML" });
+		  userStates[userId] = { 
+			action: "waiting_routing_trunk_selection", 
+			sipTrunks: routingTrunks,
+			campaignId: campaignForRouting.id 
+		  };
+		  break;
+
+		case "routing_queue":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const queues = await getQueues();
+		  
+		  if (queues.length === 0) {
+			bot.sendMessage(
+			  chatId,
+			  `❌ <b>No Queues Found</b>\n\nNo agent queues are configured. Create one first.`,
+			  { 
+				parse_mode: "HTML",
+				reply_markup: {
+				  inline_keyboard: [
+					[{ text: "➕ Create New Queue", callback_data: "create_queue" }],
+					[{ text: "🔙 Back", callback_data: "call_routing_menu" }]
+				  ]
+				}
+			  }
+			);
+			return;
+		  }
+		  
+		  let queueList = "👥 <b>Select Queue for Call Routing:</b>\n\n";
+		  for (let i = 0; i < queues.length; i++) {
+			const queue = queues[i];
+			const members = await getQueueMembers(queue.name);
+			queueList += `${i + 1}. <b>${escapeHtml(queue.name)}</b>\n`;
+			queueList += `   👥 Members: ${members.length}\n`;
+			queueList += `   📋 Strategy: ${escapeHtml(queue.strategy || 'wrandom')}\n\n`;
+		  }
+		  queueList += "Enter the number of the queue:";
+		  
+		  const campaignForQueue = await getOrCreateCampaign();
+		  bot.sendMessage(chatId, queueList, { parse_mode: "HTML" });
+		  userStates[userId] = { 
+			action: "waiting_routing_queue_selection", 
+			queues: queues,
+			campaignId: campaignForQueue.id 
+		  };
+		  break;
+
+		case "routing_view_config":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const campaignConfig = await getOrCreateCampaign();
+		  let configMsg = `📊 <b>Current Call Routing Configuration</b>\n\n`;
+		  configMsg += `<b>Routing Type:</b> ${campaignConfig.routingType === 'sip_trunk' ? '📞 SIP Trunk' : '👥 Agent Queue'}\n`;
+		  configMsg += `<b>Destination:</b> ${escapeHtml(campaignConfig.routingDestination || 'Not configured')}\n`;
+		  
+		  if (campaignConfig.routingType === 'sip_trunk') {
+			if (campaignConfig.routingTrunkId) {
+			  const rTrunk = await SipPeer.findByPk(campaignConfig.routingTrunkId);
+			  configMsg += `<b>Routing Trunk:</b> ${rTrunk ? escapeHtml(rTrunk.name) : 'Not found'}\n`;
+			  if (rTrunk) {
+				configMsg += `<b>Trunk Host:</b> ${escapeHtml(rTrunk.host)}\n`;
+			  }
+			}
+		  } else if (campaignConfig.routingType === 'queue') {
+			if (campaignConfig.routingDestination) {
+			  const members = await getQueueMembers(campaignConfig.routingDestination);
+			  configMsg += `<b>Queue Members:</b> ${members.length}\n`;
+			  if (members.length > 0) {
+				configMsg += `<b>Agents:</b>\n`;
+				members.forEach(m => {
+				  configMsg += `  • ${escapeHtml(m.membername || m.interface)}\n`;
+				});
+			  }
+			}
+		  }
+		  
+		  configMsg += `\n<b>IVR Intro:</b> ${escapeHtml(campaignConfig.ivrIntroFile || 'Default')}\n`;
+		  configMsg += `<b>IVR Outro:</b> ${escapeHtml(campaignConfig.ivrOutroFile || 'Default')}\n`;
+		  
+		  bot.sendMessage(chatId, configMsg, { 
+			parse_mode: "HTML",
+			reply_markup: {
+			  inline_keyboard: [
+				[{ text: "🔙 Back to Routing", callback_data: "call_routing_menu" }]
+			  ]
+			}
+		  });
+		  break;
+
+		// ==========================================
+		// AGENT MANAGEMENT MENU
+		// ==========================================
+		case "agent_management_menu":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const allAgents = await getAllAgents();
+		  const activeAgents = allAgents.filter(a => a.status);
+		  const allQueues = await getQueues();
+		  
+		  let agentMenuMsg = `👥 <b>Agent Management</b>\n\n`;
+		  agentMenuMsg += `📊 <b>Overview:</b>\n`;
+		  agentMenuMsg += `• Total Agents: ${allAgents.length}\n`;
+		  agentMenuMsg += `• Active: ${activeAgents.length}\n`;
+		  agentMenuMsg += `• Inactive: ${allAgents.length - activeAgents.length}\n`;
+		  agentMenuMsg += `• Queues: ${allQueues.length}\n`;
+		  
+		  bot.sendMessage(chatId, agentMenuMsg, {
+			parse_mode: "HTML",
+			reply_markup: {
+			  inline_keyboard: [
+				[
+				  { text: "📋 View Agents", callback_data: "view_agents" },
+				  { text: "➕ Create Agent", callback_data: "create_agent" }
+				],
+				[
+				  { text: "📁 Manage Queues", callback_data: "manage_queues" },
+				  { text: "➕ Create Queue", callback_data: "create_queue" }
+				],
+				[
+				  { text: "🔗 Assign Agent to Queue", callback_data: "assign_agent_to_queue" },
+				  { text: "🔓 Unassign Agent", callback_data: "unassign_agent_from_queue" }
+				],
+				[
+				  { text: "📊 View All Assignments", callback_data: "view_all_assignments" }
+				],
+				[{ text: "🔙 Back", callback_data: "back_to_menu" }]
+			  ]
+			}
+		  });
+		  break;
+
+		// ==========================================
+		// VIEW AGENTS
+		// ==========================================
+		case "view_agents":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const agentsList = await getAllAgents();
+		  
+		  if (agentsList.length === 0) {
+			bot.sendMessage(
+			  chatId,
+			  `📋 <b>No Agents Found</b>\n\nNo agents are configured yet.`,
+			  { 
+				parse_mode: "HTML",
+				reply_markup: {
+				  inline_keyboard: [
+					[{ text: "➕ Create Agent", callback_data: "create_agent" }],
+					[{ text: "🔙 Back", callback_data: "agent_management_menu" }]
+				  ]
+				}
+			  }
+			);
+			return;
+		  }
+		  
+		  let agentListMsg = `📋 <b>All Agents (${agentsList.length})</b>\n\n`;
+		  for (let i = 0; i < agentsList.length; i++) {
+			const agent = agentsList[i];
+			const agentQs = await getAgentQueues(agent.name);
+			const statusIcon = agent.status ? '🟢' : '🔴';
+			agentListMsg += `${i + 1}. ${statusIcon} <b>${escapeHtml(agent.name)}</b>\n`;
+			if (agent.first_name || agent.last_name) {
+			  agentListMsg += `   👤 ${escapeHtml(agent.first_name || '')} ${escapeHtml(agent.last_name || '')}\n`;
+			}
+			if (agent.extension_no) {
+			  agentListMsg += `   📞 Ext: ${escapeHtml(agent.extension_no)}\n`;
+			}
+			agentListMsg += `   📁 Queues: ${agentQs.length > 0 ? agentQs.map(q => q.queue_name).join(', ') : 'None'}\n\n`;
+		  }
+		  
+		  agentListMsg += `\nEnter agent number for details:`;
+		  
+		  bot.sendMessage(chatId, agentListMsg, { 
+			parse_mode: "HTML",
+			reply_markup: {
+			  inline_keyboard: [
+				[
+				  { text: "➕ Create Agent", callback_data: "create_agent" },
+				  { text: "🔄 Refresh", callback_data: "view_agents" }
+				],
+				[{ text: "🔙 Back", callback_data: "agent_management_menu" }]
+			  ]
+			}
+		  });
+		  userStates[userId] = { action: "waiting_agent_selection_for_details", agents: agentsList };
+		  break;
+
+		// ==========================================
+		// CREATE AGENT
+		// ==========================================
+		case "create_agent":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  bot.sendMessage(
+			chatId,
+			`➕ <b>Create New Agent</b>\n\n` +
+			`Enter agent details in this format:\n\n` +
+			`<code>extension:firstname:lastname</code>\n\n` +
+			`<b>Examples:</b>\n` +
+			`• <code>1001:John:Doe</code>\n` +
+			`• <code>1002:Jane:Smith</code>\n` +
+			`• <code>agent01:Mike:Johnson</code>\n\n` +
+			`The extension will be used as the SIP username.\n` +
+			`A random secure password will be generated.`,
+			{ parse_mode: "HTML" }
+		  );
+		  userStates[userId] = { action: "waiting_new_agent_details" };
+		  break;
+
+		// ==========================================
+		// MANAGE QUEUES
+		// ==========================================
+		case "manage_queues":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const queuesList = await getQueues();
+		  
+		  if (queuesList.length === 0) {
+			bot.sendMessage(
+			  chatId,
+			  `📁 <b>No Queues Found</b>\n\nCreate a queue to organize agents.`,
+			  { 
+				parse_mode: "HTML",
+				reply_markup: {
+				  inline_keyboard: [
+					[{ text: "➕ Create Queue", callback_data: "create_queue" }],
+					[{ text: "🔙 Back", callback_data: "agent_management_menu" }]
+				  ]
+				}
+			  }
+			);
+			return;
+		  }
+		  
+		  let queueListMsg = `📁 <b>All Queues (${queuesList.length})</b>\n\n`;
+		  for (let i = 0; i < queuesList.length; i++) {
+			const queue = queuesList[i];
+			const members = await getQueueMembers(queue.name);
+			queueListMsg += `${i + 1}. <b>${escapeHtml(queue.name)}</b>\n`;
+			queueListMsg += `   👥 Members: ${members.length}\n`;
+			queueListMsg += `   📋 Strategy: ${escapeHtml(queue.strategy || 'ringall')}\n`;
+			queueListMsg += `   ⏱ Timeout: ${queue.timeout || 25}s\n\n`;
+		  }
+		  
+		  queueListMsg += `\nEnter queue number for details:`;
+		  
+		  bot.sendMessage(chatId, queueListMsg, { 
+			parse_mode: "HTML",
+			reply_markup: {
+			  inline_keyboard: [
+				[
+				  { text: "➕ Create Queue", callback_data: "create_queue" },
+				  { text: "🔄 Refresh", callback_data: "manage_queues" }
+				],
+				[{ text: "🔙 Back", callback_data: "agent_management_menu" }]
+			  ]
+			}
+		  });
+		  userStates[userId] = { action: "waiting_queue_selection_for_details", queues: queuesList };
+		  break;
+
+		// ==========================================
+		// CREATE QUEUE
+		// ==========================================
+		case "create_queue":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  bot.sendMessage(
+			chatId,
+			`➕ <b>Create New Queue</b>\n\n` +
+			`Enter queue details in this format:\n\n` +
+			`<code>name:strategy</code>\n\n` +
+			`<b>Available strategies:</b>\n` +
+			`• <code>ringall</code> - Ring all agents simultaneously\n` +
+			`• <code>roundrobin</code> - Distribute calls evenly\n` +
+			`• <code>leastrecent</code> - Agent with longest idle time\n` +
+			`• <code>fewestcalls</code> - Agent with fewest calls\n` +
+			`• <code>random</code> - Random agent\n\n` +
+			`<b>Examples:</b>\n` +
+			`• <code>sales:ringall</code>\n` +
+			`• <code>support:roundrobin</code>\n` +
+			`• <code>vip:leastrecent</code>`,
+			{ parse_mode: "HTML" }
+		  );
+		  userStates[userId] = { action: "waiting_new_queue_details" };
+		  break;
+
+		// ==========================================
+		// ASSIGN AGENT TO QUEUE
+		// ==========================================
+		case "assign_agent_to_queue":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const agentsForAssign = await getAvailableAgents();
+		  
+		  if (agentsForAssign.length === 0) {
+			bot.sendMessage(chatId, `❌ No active agents available. Create agents first.`, {
+			  reply_markup: {
+				inline_keyboard: [
+				  [{ text: "➕ Create Agent", callback_data: "create_agent" }],
+				  [{ text: "🔙 Back", callback_data: "agent_management_menu" }]
+				]
+			  }
+			});
+			return;
+		  }
+		  
+		  let assignAgentMsg = `🔗 <b>Assign Agent to Queue</b>\n\n`;
+		  assignAgentMsg += `<b>Step 1:</b> Select an agent:\n\n`;
+		  agentsForAssign.forEach((agent, i) => {
+			assignAgentMsg += `${i + 1}. ${escapeHtml(agent.name)}`;
+			if (agent.first_name) assignAgentMsg += ` (${escapeHtml(agent.first_name)} ${escapeHtml(agent.last_name || '')})`;
+			assignAgentMsg += `\n`;
+		  });
+		  assignAgentMsg += `\nEnter agent number:`;
+		  
+		  bot.sendMessage(chatId, assignAgentMsg, { parse_mode: "HTML" });
+		  userStates[userId] = { action: "waiting_agent_for_assignment", agents: agentsForAssign };
+		  break;
+
+		// ==========================================
+		// UNASSIGN AGENT FROM QUEUE
+		// ==========================================
+		case "unassign_agent_from_queue":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const queuesForUnassign = await getQueues();
+		  
+		  if (queuesForUnassign.length === 0) {
+			bot.sendMessage(chatId, `❌ No queues found.`, {
+			  reply_markup: {
+				inline_keyboard: [
+				  [{ text: "🔙 Back", callback_data: "agent_management_menu" }]
+				]
+			  }
+			});
+			return;
+		  }
+		  
+		  let unassignMsg = `🔓 <b>Unassign Agent from Queue</b>\n\n`;
+		  unassignMsg += `<b>Step 1:</b> Select a queue:\n\n`;
+		  for (let i = 0; i < queuesForUnassign.length; i++) {
+			const q = queuesForUnassign[i];
+			const mems = await getQueueMembers(q.name);
+			unassignMsg += `${i + 1}. ${escapeHtml(q.name)} (${mems.length} members)\n`;
+		  }
+		  unassignMsg += `\nEnter queue number:`;
+		  
+		  bot.sendMessage(chatId, unassignMsg, { parse_mode: "HTML" });
+		  userStates[userId] = { action: "waiting_queue_for_unassignment", queues: queuesForUnassign };
+		  break;
+
+		// ==========================================
+		// VIEW ALL ASSIGNMENTS
+		// ==========================================
+		case "view_all_assignments":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const allQueuesAssign = await getQueues();
+		  let assignMsg = `📊 <b>All Queue Assignments</b>\n\n`;
+		  
+		  if (allQueuesAssign.length === 0) {
+			assignMsg += `<i>No queues configured.</i>`;
+		  } else {
+			for (const queue of allQueuesAssign) {
+			  const members = await getQueueMembers(queue.name);
+			  assignMsg += `<b>📁 ${escapeHtml(queue.name)}</b> (${escapeHtml(queue.strategy || 'ringall')})\n`;
+			  if (members.length === 0) {
+				assignMsg += `   <i>No agents assigned</i>\n`;
+			  } else {
+				members.forEach(m => {
+				  const pauseIcon = m.paused ? '⏸' : '▶️';
+				  assignMsg += `   ${pauseIcon} ${escapeHtml(m.membername || m.interface)}\n`;
+				});
+			  }
+			  assignMsg += `\n`;
+			}
+		  }
+		  
+		  // Also show unassigned agents
+		  const allAgentsCheck = await getAllAgents();
+		  const unassignedAgents = [];
+		  for (const agent of allAgentsCheck) {
+			const agentQs = await getAgentQueues(agent.name);
+			if (agentQs.length === 0) {
+			  unassignedAgents.push(agent);
+			}
+		  }
+		  
+		  if (unassignedAgents.length > 0) {
+			assignMsg += `\n<b>⚠️ Unassigned Agents:</b>\n`;
+			unassignedAgents.forEach(a => {
+			  const statusIcon = a.status ? '🟢' : '🔴';
+			  assignMsg += `   ${statusIcon} ${escapeHtml(a.name)}\n`;
+			});
+		  }
+		  
+		  bot.sendMessage(chatId, assignMsg, { 
+			parse_mode: "HTML",
+			reply_markup: {
+			  inline_keyboard: [
+				[{ text: "🔗 Assign Agent", callback_data: "assign_agent_to_queue" }],
+				[{ text: "🔄 Refresh", callback_data: "view_all_assignments" }],
+				[{ text: "🔙 Back", callback_data: "agent_management_menu" }]
+			  ]
+			}
+		  });
+		  break;
+
+
+
 		case "clear_database":
 			// Check if user is admin
 			let permittedUserClearDB = await Allowed.findOne({
@@ -1516,6 +2082,167 @@ const initializeBot = () => {
           }
         );
         break;
+		
+	  default:
+		  // Toggle agent active/inactive status
+		  if (callbackData.startsWith('toggle_agent_')) {
+			if (!(await isAdmin(userId))) {
+			  bot.sendMessage(chatId, "❌ Admin access required!");
+			  return;
+			}
+			const agentId = parseInt(callbackData.replace('toggle_agent_', ''));
+			const agent = await SipPeer.findByPk(agentId);
+			if (agent) {
+			  await agent.update({ status: !agent.status });
+			  bot.sendMessage(
+				chatId, 
+				`✅ Agent ${escapeHtml(agent.name)} is now <b>${agent.status ? 'Active' : 'Inactive'}</b>`,
+				{ parse_mode: "HTML" }
+			  );
+			}
+		  }
+		  
+		  // Delete agent confirmation
+		  else if (callbackData.startsWith('delete_agent_')) {
+			if (!(await isAdmin(userId))) {
+			  bot.sendMessage(chatId, "❌ Admin access required!");
+			  return;
+			}
+			const agentId = parseInt(callbackData.replace('delete_agent_', ''));
+			const agent = await SipPeer.findByPk(agentId);
+			if (!agent) {
+			  bot.sendMessage(chatId, "❌ Agent not found.");
+			  return;
+			}
+			userStates[userId] = { action: "confirm_delete_agent", agentId: agentId };
+			bot.sendMessage(
+			  chatId,
+			  `⚠️ <b>Confirm Delete</b>\n\n` +
+			  `Are you sure you want to delete agent <b>${escapeHtml(agent.name)}</b>?\n\n` +
+			  `This will also remove them from all queues.\n\n` +
+			  `Type <code>DELETE</code> to confirm:`,
+			  { parse_mode: "HTML" }
+			);
+		  }
+		  
+		  // Delete queue confirmation
+		  else if (callbackData.startsWith('delete_queue_')) {
+			if (!(await isAdmin(userId))) {
+			  bot.sendMessage(chatId, "❌ Admin access required!");
+			  return;
+			}
+			const queueId = parseInt(callbackData.replace('delete_queue_', ''));
+			const queue = await Queue.findByPk(queueId);
+			if (!queue) {
+			  bot.sendMessage(chatId, "❌ Queue not found.");
+			  return;
+			}
+			userStates[userId] = { action: "confirm_delete_queue", queueId: queueId };
+			bot.sendMessage(
+			  chatId,
+			  `⚠️ <b>Confirm Delete</b>\n\n` +
+			  `Are you sure you want to delete queue <b>${escapeHtml(queue.name)}</b>?\n\n` +
+			  `All agent assignments to this queue will be removed.\n\n` +
+			  `Type <code>DELETE</code> to confirm:`,
+			  { parse_mode: "HTML" }
+			);
+		  }
+		  
+		  // Add agent to specific queue (from queue details)
+		  else if (callbackData.startsWith('queue_add_agent_')) {
+			if (!(await isAdmin(userId))) {
+			  bot.sendMessage(chatId, "❌ Admin access required!");
+			  return;
+			}
+			const queueName = callbackData.replace('queue_add_agent_', '');
+			const agents = await getAvailableAgents();
+			const currentMembers = await getQueueMembers(queueName);
+			const availableAgents = agents.filter(a => !currentMembers.find(m => m.interface === `SIP/${a.name}`));
+			
+			if (availableAgents.length === 0) {
+			  bot.sendMessage(chatId, "❌ All active agents are already in this queue.");
+			  return;
+			}
+			
+			let addMsg = `➕ <b>Add Agent to ${escapeHtml(queueName)}</b>\n\n`;
+			availableAgents.forEach((a, i) => {
+			  addMsg += `${i + 1}. ${escapeHtml(a.name)}`;
+			  if (a.first_name) addMsg += ` (${escapeHtml(a.first_name)})`;
+			  addMsg += `\n`;
+			});
+			addMsg += `\nEnter agent number:`;
+			
+			bot.sendMessage(chatId, addMsg, { parse_mode: "HTML" });
+			userStates[userId] = { 
+			  action: "waiting_agent_to_add_to_queue", 
+			  queueName: queueName,
+			  agents: availableAgents 
+			};
+		  }
+		  
+		  // Remove agent from specific queue (from queue details)
+		  else if (callbackData.startsWith('queue_remove_agent_')) {
+			if (!(await isAdmin(userId))) {
+			  bot.sendMessage(chatId, "❌ Admin access required!");
+			  return;
+			}
+			const queueName = callbackData.replace('queue_remove_agent_', '');
+			const members = await getQueueMembers(queueName);
+			
+			if (members.length === 0) {
+			  bot.sendMessage(chatId, "❌ No agents in this queue.");
+			  return;
+			}
+			
+			let removeMsg = `➖ <b>Remove Agent from ${escapeHtml(queueName)}</b>\n\n`;
+			members.forEach((m, i) => {
+			  removeMsg += `${i + 1}. ${escapeHtml(m.membername || m.interface)}\n`;
+			});
+			removeMsg += `\nEnter agent number:`;
+			
+			bot.sendMessage(chatId, removeMsg, { parse_mode: "HTML" });
+			userStates[userId] = { 
+			  action: "waiting_member_for_unassignment", 
+			  queueName: queueName,
+			  members: members 
+			};
+		  }
+		  
+		  // Remove agent from queues (from agent details)
+		  else if (callbackData.startsWith('agent_remove_queues_')) {
+			if (!(await isAdmin(userId))) {
+			  bot.sendMessage(chatId, "❌ Admin access required!");
+			  return;
+			}
+			const agentId = parseInt(callbackData.replace('agent_remove_queues_', ''));
+			const agent = await SipPeer.findByPk(agentId);
+			if (!agent) {
+			  bot.sendMessage(chatId, "❌ Agent not found.");
+			  return;
+			}
+			
+			const agentQueues = await getAgentQueues(agent.name);
+			
+			if (agentQueues.length === 0) {
+			  bot.sendMessage(chatId, `❌ ${escapeHtml(agent.name)} is not assigned to any queue.`, { parse_mode: "HTML" });
+			  return;
+			}
+			
+			let removeQMsg = `🔓 <b>Remove ${escapeHtml(agent.name)} from Queue</b>\n\n`;
+			removeQMsg += `Select a queue:\n\n`;
+			agentQueues.forEach((q, i) => {
+			  removeQMsg += `${i + 1}. ${escapeHtml(q.queue_name)}\n`;
+			});
+			removeQMsg += `\nEnter queue number:`;
+			
+			bot.sendMessage(chatId, removeQMsg, { parse_mode: "HTML" });
+			userStates[userId] = { 
+			  action: "waiting_queue_removal_for_agent", 
+			  agent: agent,
+			  queues: agentQueues 
+			};
+		  }
+		  break;
     }
   });
 
@@ -1531,6 +2258,589 @@ const initializeBot = () => {
     if (!userState) return;
 
     switch (userState.action) {
+		case "waiting_routing_trunk_selection":
+		  const trunkIdxRouting = parseInt(text) - 1;
+		  if (isNaN(trunkIdxRouting) || trunkIdxRouting < 0 || trunkIdxRouting >= userState.sipTrunks.length) {
+			bot.sendMessage(chatId, "❌ Invalid selection. Please try again.");
+			return;
+		  }
+		  
+		  const selectedRoutingTrunk = userState.sipTrunks[trunkIdxRouting];
+		  
+		  bot.sendMessage(
+			chatId,
+			`📞 <b>Selected Trunk: ${escapeHtml(selectedRoutingTrunk.name)}</b>\n\n` +
+			`Now enter the destination number for call routing:\n\n` +
+			`This is the number that will be dialed when a caller presses the DTMF digit.\n\n` +
+			`Example: 18001234567`,
+			{ parse_mode: "HTML" }
+		  );
+		  userStates[userId] = { 
+			action: "waiting_routing_destination", 
+			routingType: 'sip_trunk',
+			trunkId: selectedRoutingTrunk.id,
+			trunkName: selectedRoutingTrunk.name,
+			campaignId: userState.campaignId 
+		  };
+		  break;
+
+		case "waiting_routing_destination":
+		  const routingDestInput = text.trim();
+		  if (!routingDestInput) {
+			bot.sendMessage(chatId, "❌ Please enter a valid destination number.");
+			return;
+		  }
+		  
+		  const campaignRoutingUpdate = await Campaign.findByPk(userState.campaignId);
+		  await campaignRoutingUpdate.update({
+			routingType: userState.routingType,
+			routingDestination: routingDestInput,
+			routingTrunkId: userState.trunkId || null
+		  });
+		  
+		  let routingSuccessMsg = `✅ <b>Call Routing Configured!</b>\n\n`;
+		  routingSuccessMsg += `<b>Type:</b> ${userState.routingType === 'sip_trunk' ? '📞 SIP Trunk' : '👥 Agent Queue'}\n`;
+		  routingSuccessMsg += `<b>Destination:</b> ${escapeHtml(routingDestInput)}\n`;
+		  if (userState.trunkName) {
+			routingSuccessMsg += `<b>Trunk:</b> ${escapeHtml(userState.trunkName)}\n`;
+		  }
+		  
+		  bot.sendMessage(chatId, routingSuccessMsg, { parse_mode: "HTML", ...mainMenu });
+		  delete userStates[userId];
+		  break;
+
+		case "waiting_routing_queue_selection":
+		  const queueIdxRouting = parseInt(text) - 1;
+		  if (isNaN(queueIdxRouting) || queueIdxRouting < 0 || queueIdxRouting >= userState.queues.length) {
+			bot.sendMessage(chatId, "❌ Invalid selection. Please try again.");
+			return;
+		  }
+		  
+		  const selectedQueueRouting = userState.queues[queueIdxRouting];
+		  const campaignQueueUpdate = await Campaign.findByPk(userState.campaignId);
+		  await campaignQueueUpdate.update({
+			routingType: 'queue',
+			routingDestination: selectedQueueRouting.name,
+			routingTrunkId: null
+		  });
+		  
+		  const queueMembersRouting = await getQueueMembers(selectedQueueRouting.name);
+		  
+		  let queueRoutingMsg = `✅ <b>Call Routing Configured!</b>\n\n`;
+		  queueRoutingMsg += `<b>Type:</b> 👥 Agent Queue\n`;
+		  queueRoutingMsg += `<b>Queue:</b> ${escapeHtml(selectedQueueRouting.name)}\n`;
+		  queueRoutingMsg += `<b>Members:</b> ${queueMembersRouting.length}\n`;
+		  
+		  if (queueMembersRouting.length > 0) {
+			queueRoutingMsg += `\n<b>Agents in queue:</b>\n`;
+			queueMembersRouting.forEach(m => {
+			  queueRoutingMsg += `  • ${escapeHtml(m.membername || m.interface)}\n`;
+			});
+		  } else {
+			queueRoutingMsg += `\n⚠️ No agents in this queue. Add agents to receive calls.`;
+		  }
+		  
+		  bot.sendMessage(chatId, queueRoutingMsg, { parse_mode: "HTML", ...mainMenu });
+		  delete userStates[userId];
+		  break;
+
+		// ==========================================
+		// AGENT MANAGEMENT TEXT HANDLERS
+		// ==========================================
+		
+		// Create new agent
+		case "waiting_new_agent_details":
+		  const agentParts = text.trim().split(':');
+		  if (agentParts.length < 1) {
+			bot.sendMessage(chatId, "❌ Invalid format. Use: extension:firstname:lastname");
+			return;
+		  }
+		  
+		  const extension = agentParts[0].trim();
+		  const firstName = agentParts[1] ? agentParts[1].trim() : '';
+		  const lastName = agentParts[2] ? agentParts[2].trim() : '';
+		  
+		  if (!extension || !/^[a-zA-Z0-9_-]+$/.test(extension)) {
+			bot.sendMessage(chatId, "❌ Invalid extension. Use only letters, numbers, underscore, or hyphen.");
+			return;
+		  }
+		  
+		  // Check if agent already exists
+		  const existingAgent = await SipPeer.findOne({ where: { name: extension } });
+		  if (existingAgent) {
+			bot.sendMessage(chatId, `❌ Agent with extension "${extension}" already exists.`);
+			return;
+		  }
+		  
+		  // Generate SIP password
+		  const sipPassword = generateSipPassword();
+		  
+		  // Create the agent
+		  const newAgent = await SipPeer.create({
+			name: extension,
+			username: extension,
+			defaultuser: extension,
+			secret: sipPassword,
+			sippasswd: sipPassword,
+			first_name: firstName,
+			last_name: lastName,
+			extension_no: extension,
+			context: 'from-internal',
+			host: 'dynamic',
+			type: 'friend',
+			category: 'sip',
+			nat: 'force_rport,comedia',
+			qualify: 'yes',
+			disallow: 'all',
+			allow: 'alaw;ulaw;gsm',
+			directmedia: 'no',
+			canreinvite: 'no',
+			status: 1
+		  });
+		  
+		  let newAgentMsg = `✅ <b>Agent Created Successfully!</b>\n\n`;
+		  newAgentMsg += `<b>Extension:</b> <code>${escapeHtml(extension)}</code>\n`;
+		  newAgentMsg += `<b>Name:</b> ${escapeHtml(firstName)} ${escapeHtml(lastName)}\n`;
+		  newAgentMsg += `<b>SIP Password:</b> <code>${escapeHtml(sipPassword)}</code>\n\n`;
+		  newAgentMsg += `⚠️ <b>Save the password now!</b> It won't be shown again.\n\n`;
+		  newAgentMsg += `<b>SIP Registration:</b>\n`;
+		  newAgentMsg += `• Username: <code>${escapeHtml(extension)}</code>\n`;
+		  newAgentMsg += `• Password: <code>${escapeHtml(sipPassword)}</code>\n`;
+		  newAgentMsg += `• Domain: Your Asterisk server IP`;
+		  
+		  bot.sendMessage(chatId, newAgentMsg, { 
+			parse_mode: "HTML",
+			reply_markup: {
+			  inline_keyboard: [
+				[{ text: "🔗 Assign to Queue", callback_data: "assign_agent_to_queue" }],
+				[{ text: "🔙 Back to Agents", callback_data: "view_agents" }]
+			  ]
+			}
+		  });
+		  delete userStates[userId];
+		  break;
+
+		// Create new queue
+		case "waiting_new_queue_details":
+		  const queueParts = text.trim().split(':');
+		  const queueName = queueParts[0].trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+		  const strategy = queueParts[1] ? queueParts[1].trim().toLowerCase() : 'ringall';
+		  
+		  if (!queueName || queueName.length < 2) {
+			bot.sendMessage(chatId, "❌ Queue name must be at least 2 characters.");
+			return;
+		  }
+		  
+		  const validStrategies = ['ringall', 'roundrobin', 'leastrecent', 'fewestcalls', 'random', 'rrmemory', 'linear', 'wrandom'];
+		  if (!validStrategies.includes(strategy)) {
+			bot.sendMessage(chatId, `❌ Invalid strategy. Use: ${validStrategies.join(', ')}`);
+			return;
+		  }
+		  
+		  const existingQueueCheck = await Queue.findOne({ where: { name: queueName } });
+		  if (existingQueueCheck) {
+			bot.sendMessage(chatId, `❌ Queue "${queueName}" already exists.`);
+			return;
+		  }
+		  
+		  await Queue.create({
+			name: queueName,
+			strategy: strategy,
+			timeout: 25,
+			retry: 5,
+			maxlen: 0,
+			joinempty: 'yes',
+			leavewhenempty: 'no'
+		  });
+		  
+		  bot.sendMessage(
+			chatId,
+			`✅ <b>Queue Created!</b>\n\n` +
+			`<b>Name:</b> ${escapeHtml(queueName)}\n` +
+			`<b>Strategy:</b> ${escapeHtml(strategy)}\n` +
+			`<b>Timeout:</b> 25s\n\n` +
+			`Now add agents to this queue.`,
+			{ 
+			  parse_mode: "HTML",
+			  reply_markup: {
+				inline_keyboard: [
+				  [{ text: "🔗 Add Agents", callback_data: "assign_agent_to_queue" }],
+				  [{ text: "🔙 Back to Queues", callback_data: "manage_queues" }]
+				]
+			  }
+			}
+		  );
+		  delete userStates[userId];
+		  break;
+
+		// Agent selection for details
+		case "waiting_agent_selection_for_details":
+		  const agentDetailIdx = parseInt(text) - 1;
+		  if (isNaN(agentDetailIdx) || agentDetailIdx < 0 || agentDetailIdx >= userState.agents.length) {
+			bot.sendMessage(chatId, "❌ Invalid selection.");
+			delete userStates[userId];
+			return;
+		  }
+		  
+		  const selectedAgentDetail = userState.agents[agentDetailIdx];
+		  const agentQueuesDetail = await getAgentQueues(selectedAgentDetail.name);
+		  
+		  let agentDetailMsg = `👤 <b>Agent Details</b>\n\n`;
+		  agentDetailMsg += `<b>Name/Extension:</b> ${escapeHtml(selectedAgentDetail.name)}\n`;
+		  agentDetailMsg += `<b>First Name:</b> ${escapeHtml(selectedAgentDetail.first_name || 'N/A')}\n`;
+		  agentDetailMsg += `<b>Last Name:</b> ${escapeHtml(selectedAgentDetail.last_name || 'N/A')}\n`;
+		  agentDetailMsg += `<b>Extension:</b> ${escapeHtml(selectedAgentDetail.extension_no || selectedAgentDetail.name)}\n`;
+		  agentDetailMsg += `<b>Status:</b> ${selectedAgentDetail.status ? '🟢 Active' : '🔴 Inactive'}\n`;
+		  agentDetailMsg += `<b>Context:</b> ${escapeHtml(selectedAgentDetail.context || 'default')}\n\n`;
+		  
+		  agentDetailMsg += `<b>Queue Memberships:</b>\n`;
+		  if (agentQueuesDetail.length > 0) {
+			agentQueuesDetail.forEach(q => {
+			  const pauseStatus = q.paused ? '⏸ Paused' : '▶️ Active';
+			  agentDetailMsg += `  • ${escapeHtml(q.queue_name)} - ${pauseStatus}\n`;
+			});
+		  } else {
+			agentDetailMsg += `  <i>Not assigned to any queue</i>\n`;
+		  }
+		  
+		  bot.sendMessage(chatId, agentDetailMsg, {
+			parse_mode: "HTML",
+			reply_markup: {
+			  inline_keyboard: [
+				[
+				  { text: selectedAgentDetail.status ? "🔴 Deactivate" : "🟢 Activate", callback_data: `toggle_agent_${selectedAgentDetail.id}` },
+				  { text: "🗑 Delete", callback_data: `delete_agent_${selectedAgentDetail.id}` }
+				],
+				[
+				  { text: "🔗 Assign to Queue", callback_data: "assign_agent_to_queue" },
+				  { text: "🔓 Remove from Queue", callback_data: `agent_remove_queues_${selectedAgentDetail.id}` }
+				],
+				[{ text: "🔙 Back to Agents", callback_data: "view_agents" }]
+			  ]
+			}
+		  });
+		  delete userStates[userId];
+		  break;
+
+		// Queue selection for details
+		case "waiting_queue_selection_for_details":
+		  const queueDetailIdx = parseInt(text) - 1;
+		  if (isNaN(queueDetailIdx) || queueDetailIdx < 0 || queueDetailIdx >= userState.queues.length) {
+			bot.sendMessage(chatId, "❌ Invalid selection.");
+			delete userStates[userId];
+			return;
+		  }
+		  
+		  const selectedQueueDetail = userState.queues[queueDetailIdx];
+		  const queueMembersDetail = await getQueueMembers(selectedQueueDetail.name);
+		  
+		  let queueDetailMsg = `📁 <b>Queue Details</b>\n\n`;
+		  queueDetailMsg += `<b>Name:</b> ${escapeHtml(selectedQueueDetail.name)}\n`;
+		  queueDetailMsg += `<b>Strategy:</b> ${escapeHtml(selectedQueueDetail.strategy || 'ringall')}\n`;
+		  queueDetailMsg += `<b>Timeout:</b> ${selectedQueueDetail.timeout || 25}s\n`;
+		  queueDetailMsg += `<b>Retry:</b> ${selectedQueueDetail.retry || 5}s\n`;
+		  queueDetailMsg += `<b>Max Length:</b> ${selectedQueueDetail.maxlen || 0} (0=unlimited)\n\n`;
+		  
+		  queueDetailMsg += `<b>Members (${queueMembersDetail.length}):</b>\n`;
+		  if (queueMembersDetail.length > 0) {
+			queueMembersDetail.forEach((m, i) => {
+			  const pauseStatus = m.paused ? '⏸' : '▶️';
+			  queueDetailMsg += `${i + 1}. ${pauseStatus} ${escapeHtml(m.membername || m.interface)}\n`;
+			});
+		  } else {
+			queueDetailMsg += `<i>No members assigned</i>\n`;
+		  }
+		  
+		  bot.sendMessage(chatId, queueDetailMsg, {
+			parse_mode: "HTML",
+			reply_markup: {
+			  inline_keyboard: [
+				[
+				  { text: "➕ Add Agent", callback_data: `queue_add_agent_${selectedQueueDetail.name}` },
+				  { text: "➖ Remove Agent", callback_data: `queue_remove_agent_${selectedQueueDetail.name}` }
+				],
+				[
+				  { text: "🗑 Delete Queue", callback_data: `delete_queue_${selectedQueueDetail.id}` }
+				],
+				[{ text: "🔙 Back to Queues", callback_data: "manage_queues" }]
+			  ]
+			}
+		  });
+		  delete userStates[userId];
+		  break;
+
+		// Agent selection for assignment (Step 1)
+		case "waiting_agent_for_assignment":
+		  const assignAgentIdx = parseInt(text) - 1;
+		  if (isNaN(assignAgentIdx) || assignAgentIdx < 0 || assignAgentIdx >= userState.agents.length) {
+			bot.sendMessage(chatId, "❌ Invalid selection.");
+			delete userStates[userId];
+			return;
+		  }
+		  
+		  const agentForAssign = userState.agents[assignAgentIdx];
+		  const queuesForAgent = await getQueues();
+		  
+		  if (queuesForAgent.length === 0) {
+			bot.sendMessage(chatId, "❌ No queues available. Create a queue first.", {
+			  reply_markup: {
+				inline_keyboard: [
+				  [{ text: "➕ Create Queue", callback_data: "create_queue" }],
+				  [{ text: "🔙 Back", callback_data: "agent_management_menu" }]
+				]
+			  }
+			});
+			delete userStates[userId];
+			return;
+		  }
+		  
+		  // Get queues agent is already in
+		  const agentCurrentQueues = await getAgentQueues(agentForAssign.name);
+		  const agentQueueNames = agentCurrentQueues.map(q => q.queue_name);
+		  
+		  // Filter out queues agent is already in
+		  const availableQueuesForAssign = queuesForAgent.filter(q => !agentQueueNames.includes(q.name));
+		  
+		  if (availableQueuesForAssign.length === 0) {
+			bot.sendMessage(chatId, `❌ ${escapeHtml(agentForAssign.name)} is already assigned to all available queues.`, { parse_mode: "HTML" });
+			delete userStates[userId];
+			return;
+		  }
+		  
+		  let selectQueueMsg = `🔗 <b>Assign ${escapeHtml(agentForAssign.name)} to Queue</b>\n\n`;
+		  selectQueueMsg += `<b>Step 2:</b> Select a queue:\n\n`;
+		  availableQueuesForAssign.forEach((q, i) => {
+			selectQueueMsg += `${i + 1}. ${escapeHtml(q.name)} (${q.strategy || 'ringall'})\n`;
+		  });
+		  selectQueueMsg += `\nEnter queue number:`;
+		  
+		  bot.sendMessage(chatId, selectQueueMsg, { parse_mode: "HTML" });
+		  userStates[userId] = { 
+			action: "waiting_queue_for_agent_assignment", 
+			agent: agentForAssign,
+			queues: availableQueuesForAssign 
+		  };
+		  break;
+
+		// Queue selection for assignment (Step 2)
+		case "waiting_queue_for_agent_assignment":
+		  const assignQueueIdx = parseInt(text) - 1;
+		  if (isNaN(assignQueueIdx) || assignQueueIdx < 0 || assignQueueIdx >= userState.queues.length) {
+			bot.sendMessage(chatId, "❌ Invalid selection.");
+			delete userStates[userId];
+			return;
+		  }
+		  
+		  const queueForAssign = userState.queues[assignQueueIdx];
+		  const agentToAssign = userState.agent;
+		  
+		  // Create queue membership
+		  await QueueMember.create({
+			membername: agentToAssign.name,
+			queue_name: queueForAssign.name,
+			interface: `SIP/${agentToAssign.name}`,
+			penalty: 0,
+			paused: 0
+		  });
+		  
+		  bot.sendMessage(
+			chatId,
+			`✅ <b>Agent Assigned Successfully!</b>\n\n` +
+			`<b>Agent:</b> ${escapeHtml(agentToAssign.name)}\n` +
+			`<b>Queue:</b> ${escapeHtml(queueForAssign.name)}\n\n` +
+			`The agent will now receive calls from this queue.`,
+			{ 
+			  parse_mode: "HTML",
+			  reply_markup: {
+				inline_keyboard: [
+				  [{ text: "🔗 Assign Another", callback_data: "assign_agent_to_queue" }],
+				  [{ text: "📊 View Assignments", callback_data: "view_all_assignments" }],
+				  [{ text: "🔙 Back", callback_data: "agent_management_menu" }]
+				]
+			  }
+			}
+		  );
+		  delete userStates[userId];
+		  break;
+
+		// Queue selection for unassignment (Step 1)
+		case "waiting_queue_for_unassignment":
+		  const unassignQueueIdx = parseInt(text) - 1;
+		  if (isNaN(unassignQueueIdx) || unassignQueueIdx < 0 || unassignQueueIdx >= userState.queues.length) {
+			bot.sendMessage(chatId, "❌ Invalid selection.");
+			delete userStates[userId];
+			return;
+		  }
+		  
+		  const queueForUnassign = userState.queues[unassignQueueIdx];
+		  const membersInQueue = await getQueueMembers(queueForUnassign.name);
+		  
+		  if (membersInQueue.length === 0) {
+			bot.sendMessage(chatId, `❌ No agents assigned to queue "${escapeHtml(queueForUnassign.name)}".`, { parse_mode: "HTML" });
+			delete userStates[userId];
+			return;
+		  }
+		  
+		  let selectMemberMsg = `🔓 <b>Unassign Agent from ${escapeHtml(queueForUnassign.name)}</b>\n\n`;
+		  selectMemberMsg += `<b>Step 2:</b> Select an agent to remove:\n\n`;
+		  membersInQueue.forEach((m, i) => {
+			selectMemberMsg += `${i + 1}. ${escapeHtml(m.membername || m.interface)}\n`;
+		  });
+		  selectMemberMsg += `\nEnter agent number:`;
+		  
+		  bot.sendMessage(chatId, selectMemberMsg, { parse_mode: "HTML" });
+		  userStates[userId] = { 
+			action: "waiting_member_for_unassignment", 
+			queueName: queueForUnassign.name,
+			members: membersInQueue 
+		  };
+		  break;
+
+		// Member selection for unassignment (Step 2)
+		case "waiting_member_for_unassignment":
+		  const unassignMemberIdx = parseInt(text) - 1;
+		  if (isNaN(unassignMemberIdx) || unassignMemberIdx < 0 || unassignMemberIdx >= userState.members.length) {
+			bot.sendMessage(chatId, "❌ Invalid selection.");
+			delete userStates[userId];
+			return;
+		  }
+		  
+		  const memberToUnassign = userState.members[unassignMemberIdx];
+		  
+		  await QueueMember.destroy({
+			where: {
+			  queue_name: userState.queueName,
+			  interface: memberToUnassign.interface
+			}
+		  });
+		  
+		  bot.sendMessage(
+			chatId,
+			`✅ <b>Agent Unassigned Successfully!</b>\n\n` +
+			`<b>Agent:</b> ${escapeHtml(memberToUnassign.membername || memberToUnassign.interface)}\n` +
+			`<b>Queue:</b> ${escapeHtml(userState.queueName)}\n\n` +
+			`The agent will no longer receive calls from this queue.`,
+			{ 
+			  parse_mode: "HTML",
+			  reply_markup: {
+				inline_keyboard: [
+				  [{ text: "🔓 Unassign Another", callback_data: "unassign_agent_from_queue" }],
+				  [{ text: "📊 View Assignments", callback_data: "view_all_assignments" }],
+				  [{ text: "🔙 Back", callback_data: "agent_management_menu" }]
+				]
+			  }
+			}
+		  );
+		  delete userStates[userId];
+		  break;
+
+		// Confirm agent deletion
+		case "confirm_delete_agent":
+		  if (text.trim().toUpperCase() !== 'DELETE') {
+			bot.sendMessage(chatId, "❌ Deletion cancelled.", mainMenu);
+			delete userStates[userId];
+			return;
+		  }
+		  
+		  const agentToDelete = await SipPeer.findByPk(userState.agentId);
+		  if (agentToDelete) {
+			// Remove from all queues first
+			await QueueMember.destroy({
+			  where: {
+				[Op.or]: [
+				  { membername: agentToDelete.name },
+				  { interface: `SIP/${agentToDelete.name}` }
+				]
+			  }
+			});
+			// Delete agent
+			await agentToDelete.destroy();
+			bot.sendMessage(chatId, `✅ Agent ${escapeHtml(agentToDelete.name)} has been deleted.`, { parse_mode: "HTML", ...mainMenu });
+		  } else {
+			bot.sendMessage(chatId, "❌ Agent not found.", mainMenu);
+		  }
+		  delete userStates[userId];
+		  break;
+
+		// Confirm queue deletion
+		case "confirm_delete_queue":
+		  if (text.trim().toUpperCase() !== 'DELETE') {
+			bot.sendMessage(chatId, "❌ Deletion cancelled.", mainMenu);
+			delete userStates[userId];
+			return;
+		  }
+		  
+		  const queueToDelete = await Queue.findByPk(userState.queueId);
+		  if (queueToDelete) {
+			// Remove all members first
+			await QueueMember.destroy({ where: { queue_name: queueToDelete.name } });
+			// Delete queue
+			await queueToDelete.destroy();
+			bot.sendMessage(chatId, `✅ Queue ${escapeHtml(queueToDelete.name)} has been deleted.`, { parse_mode: "HTML", ...mainMenu });
+		  } else {
+			bot.sendMessage(chatId, "❌ Queue not found.", mainMenu);
+		  }
+		  delete userStates[userId];
+		  break;
+
+		// Agent to add to specific queue
+		case "waiting_agent_to_add_to_queue":
+		  const addToQAgentIdx = parseInt(text) - 1;
+		  if (isNaN(addToQAgentIdx) || addToQAgentIdx < 0 || addToQAgentIdx >= userState.agents.length) {
+			bot.sendMessage(chatId, "❌ Invalid selection.");
+			delete userStates[userId];
+			return;
+		  }
+		  
+		  const agentToAddToQ = userState.agents[addToQAgentIdx];
+		  
+		  await QueueMember.create({
+			membername: agentToAddToQ.name,
+			queue_name: userState.queueName,
+			interface: `SIP/${agentToAddToQ.name}`,
+			penalty: 0,
+			paused: 0
+		  });
+		  
+		  bot.sendMessage(
+			chatId,
+			`✅ Added ${escapeHtml(agentToAddToQ.name)} to queue ${escapeHtml(userState.queueName)}`,
+			{ parse_mode: "HTML", ...mainMenu }
+		  );
+		  delete userStates[userId];
+		  break;
+
+		// Queue selection for removing agent from specific agent's queues
+		case "waiting_queue_removal_for_agent":
+		  const removeQIdx = parseInt(text) - 1;
+		  if (isNaN(removeQIdx) || removeQIdx < 0 || removeQIdx >= userState.queues.length) {
+			bot.sendMessage(chatId, "❌ Invalid selection.");
+			delete userStates[userId];
+			return;
+		  }
+		  
+		  const queueToRemoveFrom = userState.queues[removeQIdx];
+		  
+		  await QueueMember.destroy({
+			where: {
+			  queue_name: queueToRemoveFrom.queue_name,
+			  [Op.or]: [
+				{ membername: userState.agent.name },
+				{ interface: `SIP/${userState.agent.name}` }
+			  ]
+			}
+		  });
+		  
+		  bot.sendMessage(
+			chatId,
+			`✅ Removed ${escapeHtml(userState.agent.name)} from ${escapeHtml(queueToRemoveFrom.queue_name)}`,
+			{ parse_mode: "HTML", ...mainMenu }
+		  );
+		  delete userStates[userId];
+		  break;
+		
+		
+		
 		case "waiting_add_caller_ids":
 			const addRes = parseCallerIds(text);
 			if (!addRes.valid) {
@@ -1647,7 +2957,10 @@ const initializeBot = () => {
 			  campaign_id: campaignCb.id,
 			  dtmf_digit: campaignCb.dtmfDigit || '1',
 			  ivr_intro_file: campaignCb.ivrIntroFile,
-			  ivr_outro_file: campaignCb.ivrOutroFile
+			  ivr_outro_file: campaignCb.ivrOutroFile,
+			  routing_type: campaign.routingType,
+			  routing_destination: campaign.routingDestination,
+			  routing_trunk: campaign.routingTrunk
 			});
 			
 			bot.sendMessage(
@@ -1883,7 +3196,7 @@ const initializeBot = () => {
             qualify: 'yes',
             disallow: 'all',
             allow: 'alaw;ulaw;gsm',
-            transport: 'udp',
+            transport: 'udp,tls,ws',
             dtmfmode: 'rfc2833',
             status: 1,
             description: `Created via Telegram bot on ${new Date().toLocaleDateString()}`
@@ -2088,7 +3401,7 @@ const initializeBot = () => {
 			  }
 			  
 			  const campaign = await Campaign.findByPk(userState.campaignId, {
-				include: [{ model: SipPeer, as: 'sipTrunk' }]
+				include: [{ model: SipPeer, as: 'sipTrunk' }, { model: SipPeer, as: 'routingTrunk' }]
 			  });
 			  
 			  // Reset campaign statistics

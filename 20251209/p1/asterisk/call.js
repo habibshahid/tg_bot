@@ -80,6 +80,26 @@ module.exports = async (entry) => {
     variables.__CAMPAIGN_OUTRO = settings.ivr_outro_file;
   }
   
+  // Add Call Routing variables
+  const routingType = settings.routing_type || 'sip_trunk';
+  variables.ROUTING_TYPE = routingType;
+  
+  if (routingType === 'sip_trunk') {
+    // SIP Trunk routing - send destination number and trunk name
+    if (settings.routing_destination) {
+      variables.ROUTING_DESTINATION = settings.routing_destination;
+    }
+    if (settings.routing_trunk) {
+      variables.ROUTING_TRUNK_NAME = settings.routing_trunk.name;
+      variables.ROUTING_TRUNK_HOST = settings.routing_trunk.host || '';
+    }
+  } else if (routingType === 'queue') {
+    // Queue/Agent routing - send queue name
+    if (settings.routing_destination) {
+      variables.ROUTING_QUEUE = settings.routing_destination;
+    }
+  }
+  
   ami.action(
     {
       action: "Originate",
