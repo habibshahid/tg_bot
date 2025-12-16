@@ -922,10 +922,146 @@ const initializeBot = () => {
 				[
 				  { text: "📊 View All Assignments", callback_data: "view_all_assignments" }
 				],
+				[
+				  { text: "🗑️ Delete Agent", callback_data: "delete_agent_select" },
+				  { text: "⚠️ Delete All Agents", callback_data: "delete_all_agents" }
+				],
 				[{ text: "🔙 Back", callback_data: "back_to_menu" }]
 			  ]
 			}
 		  });
+		  break;
+
+		// ==========================================
+		// DELETE AGENT (SELECT FROM LIST)
+		// ==========================================
+		case "delete_agent_select":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const agentsForDelete = await getAllAgents();
+		  
+		  if (agentsForDelete.length === 0) {
+			bot.sendMessage(chatId, "❌ No agents to delete.", {
+			  reply_markup: {
+				inline_keyboard: [
+				  [{ text: "🔙 Back", callback_data: "agent_management_menu" }]
+				]
+			  }
+			});
+			return;
+		  }
+		  
+		  let deleteAgentMsg = `🗑️ <b>Delete Agent</b>\n\nSelect an agent to delete:\n\n`;
+		  agentsForDelete.forEach((agent, i) => {
+			const statusIcon = agent.status ? '🟢' : '🔴';
+			deleteAgentMsg += `${i + 1}. ${statusIcon} ${escapeHtml(agent.name)}`;
+			if (agent.first_name) deleteAgentMsg += ` (${escapeHtml(agent.first_name)})`;
+			deleteAgentMsg += `\n`;
+		  });
+		  deleteAgentMsg += `\nEnter the number of the agent to delete:`;
+		  
+		  bot.sendMessage(chatId, deleteAgentMsg, { parse_mode: "HTML" });
+		  userStates[userId] = { action: "waiting_agent_delete_selection", agents: agentsForDelete };
+		  break;
+
+		// ==========================================
+		// DELETE ALL AGENTS
+		// ==========================================
+		case "delete_all_agents":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  const allAgentsToDelete = await getAllAgents();
+		  
+		  if (allAgentsToDelete.length === 0) {
+			bot.sendMessage(chatId, "❌ No agents to delete.", {
+			  reply_markup: {
+				inline_keyboard: [
+				  [{ text: "🔙 Back", callback_data: "agent_management_menu" }]
+				]
+			  }
+			});
+			return;
+		  }
+		  
+		  bot.sendMessage(
+			chatId,
+			`⚠️ <b>DELETE ALL AGENTS</b>\n\n` +
+			`<b>WARNING: This action cannot be undone!</b>\n\n` +
+			`This will permanently delete:\n` +
+			`• All ${allAgentsToDelete.length} agent(s)\n` +
+			`• All queue memberships for these agents\n\n` +
+			`<b>Agents to be deleted:</b>\n` +
+			allAgentsToDelete.map(a => `• ${escapeHtml(a.name)}`).join('\n') +
+			`\n\nAre you sure you want to continue?`,
+			{
+			  parse_mode: "HTML",
+			  reply_markup: {
+				inline_keyboard: [
+				  [
+					{ text: "✅ Yes, Delete All", callback_data: "confirm_delete_all_agents" },
+					{ text: "❌ Cancel", callback_data: "agent_management_menu" }
+				  ]
+				]
+			  }
+			}
+		  );
+		  break;
+
+		// ==========================================
+		// CONFIRM DELETE ALL AGENTS
+		// ==========================================
+		case "confirm_delete_all_agents":
+		  if (!(await isAdmin(userId))) {
+			bot.sendMessage(chatId, "❌ Admin access required!");
+			return;
+		  }
+		  
+		  try {
+			const agentsToRemove = await getAllAgents();
+			const agentCount = agentsToRemove.length;
+			
+			// Remove all agents from all queues first
+			for (const agent of agentsToRemove) {
+			  await QueueMember.destroy({
+				where: {
+				  [Op.or]: [
+					{ membername: agent.name },
+					{ interface: `SIP/${agent.name}` }
+				  ]
+				}
+			  });
+			}
+			
+			// Delete all agents (non-trunk SIP peers)
+			await SipPeer.destroy({
+			  where: {
+				category: { [Op.ne]: 'trunk' }
+			  }
+			});
+			
+			bot.sendMessage(
+			  chatId,
+			  `✅ <b>All Agents Deleted</b>\n\n` +
+			  `Successfully deleted ${agentCount} agent(s) and removed all queue memberships.`,
+			  { 
+				parse_mode: "HTML",
+				reply_markup: {
+				  inline_keyboard: [
+					[{ text: "🔙 Back to Agent Management", callback_data: "agent_management_menu" }]
+				  ]
+				}
+			  }
+			);
+		  } catch (error) {
+			console.error('Error deleting all agents:', error);
+			bot.sendMessage(chatId, `❌ Error deleting agents: ${error.message}`);
+		  }
 		  break;
 
 		// ==========================================
@@ -2783,6 +2919,38 @@ const initializeBot = () => {
 			bot.sendMessage(chatId, "❌ Agent not found.", mainMenu);
 		  }
 		  delete userStates[userId];
+		  break;
+
+		// Agent selection for deletion (from menu)
+		case "waiting_agent_delete_selection":
+		  const deleteAgentIdx = parseInt(text) - 1;
+		  if (isNaN(deleteAgentIdx) || deleteAgentIdx < 0 || deleteAgentIdx >= userState.agents.length) {
+			bot.sendMessage(chatId, "❌ Invalid selection. Please try again.");
+			return;
+		  }
+		  
+		  const agentToDeleteFromList = userState.agents[deleteAgentIdx];
+		  const agentQueuesForDelete = await getAgentQueues(agentToDeleteFromList.name);
+		  
+		  let confirmDeleteMsg = `⚠️ <b>Confirm Delete Agent</b>\n\n`;
+		  confirmDeleteMsg += `<b>Agent:</b> ${escapeHtml(agentToDeleteFromList.name)}\n`;
+		  if (agentToDeleteFromList.first_name) {
+			confirmDeleteMsg += `<b>Name:</b> ${escapeHtml(agentToDeleteFromList.first_name)} ${escapeHtml(agentToDeleteFromList.last_name || '')}\n`;
+		  }
+		  confirmDeleteMsg += `<b>Status:</b> ${agentToDeleteFromList.status ? '🟢 Active' : '🔴 Inactive'}\n`;
+		  
+		  if (agentQueuesForDelete.length > 0) {
+			confirmDeleteMsg += `\n<b>⚠️ This agent is assigned to ${agentQueuesForDelete.length} queue(s):</b>\n`;
+			agentQueuesForDelete.forEach(q => {
+			  confirmDeleteMsg += `• ${escapeHtml(q.queue_name)}\n`;
+			});
+			confirmDeleteMsg += `\nThey will be removed from all queues.\n`;
+		  }
+		  
+		  confirmDeleteMsg += `\nType <code>DELETE</code> to confirm:`;
+		  
+		  bot.sendMessage(chatId, confirmDeleteMsg, { parse_mode: "HTML" });
+		  userStates[userId] = { action: "confirm_delete_agent", agentId: agentToDeleteFromList.id };
 		  break;
 
 		// Confirm queue deletion
